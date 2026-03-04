@@ -73,7 +73,7 @@ tools/extract_openrazer_map.py ~/dev/openrazer src/device_map.rs
 
 - Workflow: `.github/workflows/update-device-map.yml`
 - Trigger:
-  - Weekly schedule: `17 8 * * 1` (UTC)
+  - Weekly schedule: `0 8 * * 1` (08:00 UTC)
   - Manual dispatch
 - Source: `openrazer/openrazer` `master` branch
 - Behavior:
@@ -84,7 +84,7 @@ tools/extract_openrazer_map.py ~/dev/openrazer src/device_map.rs
   - Push/update branch `ci/device-map-sync`
   - Create/update PR
 
-Berlin local-time note: cron is evaluated in UTC, so this runs around 09:17 CET in winter and 10:17 CEST in summer.
+Berlin local-time note: cron is evaluated in UTC, so this runs around 09:00 CET in winter and 10:00 CEST in summer.
 
 ### Release On Device-ID PR Merge
 
