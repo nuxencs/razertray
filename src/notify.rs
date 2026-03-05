@@ -49,12 +49,59 @@ impl Notifier {
 #[cfg(target_os = "windows")]
 fn send_toast_low_battery(state: &BatteryState) -> anyhow::Result<()> {
     use tauri_winrt_notification::Toast;
+    let app_id = toast_app_id();
 
-    Toast::new(Toast::POWERSHELL_APP_ID)
-        .title("Razer Device Battery Low")
-        .text1(&state.display_name)
-        .text2(&format!("Battery at {}%", state.battery_percent))
+    Toast::new(app_id)
+        .title(&low_battery_title(state))
+        .text1("Battery low")
+        .text2("Plug in charger soon")
         .show()?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn toast_app_id() -> &'static str {
+    use crate::APP_ID;
+    use std::sync::OnceLock;
+    use tauri_winrt_notification::Toast;
+
+    static AUMID_REGISTERED: OnceLock<bool> = OnceLock::new();
+
+    if *AUMID_REGISTERED.get_or_init(|| match register_toast_aumid() {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                "failed registering toast AUMID, falling back to PowerShell sender: {err}"
+            );
+            false
+        }
+    }) {
+        APP_ID
+    } else {
+        Toast::POWERSHELL_APP_ID
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn register_toast_aumid() -> anyhow::Result<()> {
+    use crate::APP_ID;
+    use anyhow::Context;
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+
+    let key_path = format!("SOFTWARE\\Classes\\AppUserModelId\\{APP_ID}");
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu
+        .create_subkey(&key_path)
+        .with_context(|| format!("failed to create/open {key_path}"))?;
+
+    key.set_value("DisplayName", &APP_ID)
+        .context("failed writing DisplayName for toast AUMID")?;
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        let _ = key.set_value("IconUri", &exe_path.display().to_string());
+    }
 
     Ok(())
 }
@@ -64,9 +111,14 @@ fn send_toast_low_battery(_state: &BatteryState) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn low_battery_title(state: &BatteryState) -> String {
+    format!("{}: {}% battery", state.display_name, state.battery_percent)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Notifier;
+    use super::{Notifier, low_battery_title};
     use crate::model::BatteryState;
     use std::time::{Duration, Instant};
 
@@ -83,6 +135,20 @@ mod tests {
         };
 
         assert!(!notifier.maybe_notify_low_battery(&state));
+    }
+
+    #[test]
+    fn title_includes_device_and_percent() {
+        let state = BatteryState {
+            device_key: "test".to_string(),
+            display_name: "Test Mouse".to_string(),
+            pid: 0x0072,
+            battery_percent: 10,
+            is_charging: false,
+            supports_charging_status: true,
+        };
+
+        assert_eq!(low_battery_title(&state), "Test Mouse: 10% battery");
     }
 
     #[test]
