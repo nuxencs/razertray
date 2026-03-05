@@ -11,6 +11,7 @@ Rust Windows tray app that polls battery percentage for connected Razer devices 
 - Low-battery toasts (cooldown + dedup)
 - Autostart toggle via `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`
 - Windows notification details: [`docs/notifications.md`](docs/notifications.md)
+- Release note details: [`docs/releases.md`](docs/releases.md)
 
 ## Config
 
@@ -66,6 +67,7 @@ tools/extract_openrazer_map.py ~/dev/openrazer src/device_map.rs
 - Workflow: `.github/workflows/release-on-tag.yml`
 - Trigger: push tag matching `v*.*.*`
 - Guard: tag must equal `v` + package version in `Cargo.toml`
+- Release notes: GitHub-generated via `.github/release.yml`
 - Output assets:
   - `razertray.exe`
   - `SHA256SUMS.txt`
@@ -95,4 +97,5 @@ Berlin local-time note: cron is evaluated in UTC, so this runs around 09:00 CET 
   - Read package version and compute tag `vX.Y.Z`
   - Fail if tag or release already exists
   - Create/push tag
+  - Generate release notes from merged PR labels/categories
   - Build and publish release assets (`razertray.exe`, `SHA256SUMS.txt`)

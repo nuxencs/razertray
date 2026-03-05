@@ -1,0 +1,173 @@
+name: label-release-notes
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync release note labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+            const title = pr.title.trim();
+
+            const labelDefs = {
+              feat: {
+                color: "0e8a16",
+                description: "Feature change for generated release notes",
+              },
+              fix: {
+                color: "d73a4a",
+                description: "Fix change for generated release notes",
+              },
+              docs: {
+                color: "0075ca",
+                description: "Documentation change for generated release notes",
+              },
+              chore: {
+                color: "6e7781",
+                description: "Maintenance chore for generated release notes",
+              },
+              ci: {
+                color: "5319e7",
+                description: "CI change for generated release notes",
+              },
+              refactor: {
+                color: "fbca04",
+                description: "Refactor change for generated release notes",
+              },
+              build: {
+                color: "1d76db",
+                description: "Build change for generated release notes",
+              },
+              test: {
+                color: "bfdadc",
+                description: "Test-only change for generated release notes",
+              },
+              "skip-changelog": {
+                color: "000000",
+                description: "Exclude pull request from generated release notes",
+              },
+            };
+
+            const managedCategoryLabels = [
+              "enhancement",
+              "feat",
+              "bug",
+              "fix",
+              "documentation",
+              "docs",
+              "chore",
+              "ci",
+              "refactor",
+              "build",
+              "test",
+            ];
+
+            const prefixMatchers = [
+              [/^feat(?:\([^)]+\))?!?:/i, "feat"],
+              [/^fix(?:\([^)]+\))?!?:/i, "fix"],
+              [/^docs(?:\([^)]+\))?!?:/i, "docs"],
+              [/^chore(?:\([^)]+\))?!?:/i, "chore"],
+              [/^ci(?:\([^)]+\))?!?:/i, "ci"],
+              [/^refactor(?:\([^)]+\))?!?:/i, "refactor"],
+              [/^build(?:\([^)]+\))?!?:/i, "build"],
+              [/^test(?:\([^)]+\))?!?:/i, "test"],
+            ];
+
+            let desiredCategoryLabel = null;
+            for (const [pattern, label] of prefixMatchers) {
+              if (pattern.test(title)) {
+                desiredCategoryLabel = label;
+                break;
+              }
+            }
+
+            const isReleasePrep = /^chore(?:\([^)]+\))?!?:\s*release v\d+\.\d+\.\d+$/i.test(title);
+            const desiredLabels = desiredCategoryLabel ? [desiredCategoryLabel] : [];
+            if (isReleasePrep) {
+              desiredLabels.push("skip-changelog");
+            }
+
+            const repoLabels = await github.paginate(github.rest.issues.listLabelsForRepo, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+            const repoLabelNames = new Set(repoLabels.map((label) => label.name));
+
+            for (const [name, def] of Object.entries(labelDefs)) {
+              if (repoLabelNames.has(name)) {
+                continue;
+              }
+
+              await github.rest.issues.createLabel({
+                owner,
+                repo,
+                name,
+                color: def.color,
+                description: def.description,
+              }).catch((error) => {
+                if (error.status !== 422) {
+                  throw error;
+                }
+              });
+            }
+
+            const currentLabels = pr.labels.map((label) => label.name);
+            const labelsToRemove = currentLabels.filter(
+              (label) =>
+                managedCategoryLabels.includes(label) &&
+                label !== desiredCategoryLabel,
+            );
+
+            if (!isReleasePrep && currentLabels.includes("skip-changelog")) {
+              labelsToRemove.push("skip-changelog");
+            }
+
+            for (const label of [...new Set(labelsToRemove)]) {
+              await github.rest.issues.removeLabel({
+                owner,
+                repo,
+                issue_number: pr.number,
+                name: label,
+              }).catch((error) => {
+                if (error.status !== 404) {
+                  throw error;
+                }
+              });
+            }
+
+            const labelsToAdd = desiredLabels.filter(
+              (label) => !currentLabels.includes(label),
+            );
+
+            if (labelsToAdd.length > 0) {
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: pr.number,
+                labels: labelsToAdd,
+              });
+            }
+
+            core.notice(
+              `release-note labels: ${
+                desiredLabels.length > 0 ? desiredLabels.join(", ") : "none"
+              }`,
+            );
