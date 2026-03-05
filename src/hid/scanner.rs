@@ -35,10 +35,14 @@ pub fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
             priority_score: candidate_score(dev.interface_number(), dev.usage_page(), dev.usage()),
         };
 
-        match best_by_key.get(&key) {
-            Some(existing) if existing.priority_score <= discovered.priority_score => {}
-            _ => {
-                best_by_key.insert(key, discovered);
+        match best_by_key.entry(key) {
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                if discovered.priority_score < e.get().priority_score {
+                    e.insert(discovered);
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(discovered);
             }
         }
     }

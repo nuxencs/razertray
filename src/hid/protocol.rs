@@ -52,7 +52,7 @@ impl RazerReport {
         Ok(Self {
             status: data[0],
             transaction_id: data[1],
-            remaining_packets: ((data[2] as u16) << 8) | (data[3] as u16),
+            remaining_packets: u16::from_be_bytes([data[2], data[3]]),
             protocol_type: data[4],
             data_size: data[5],
             command_class: data[6],
@@ -67,8 +67,7 @@ impl RazerReport {
         let mut out = [0u8; REPORT_LENGTH];
         out[0] = self.status;
         out[1] = self.transaction_id;
-        out[2] = (self.remaining_packets >> 8) as u8;
-        out[3] = (self.remaining_packets & 0xFF) as u8;
+        out[2..4].copy_from_slice(&self.remaining_packets.to_be_bytes());
         out[4] = self.protocol_type;
         out[5] = self.data_size;
         out[6] = self.command_class;
@@ -81,11 +80,7 @@ impl RazerReport {
 
     pub fn calculate_crc(&self) -> u8 {
         let bytes = self.to_bytes();
-        let mut crc = 0u8;
-        for byte in bytes.iter().take(88).skip(2) {
-            crc ^= byte;
-        }
-        crc
+        bytes[2..88].iter().fold(0u8, |crc, byte| crc ^ byte)
     }
 
     pub fn is_valid_crc(&self) -> bool {

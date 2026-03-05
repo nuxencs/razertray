@@ -74,20 +74,11 @@ pub fn log_path() -> PathBuf {
     app_data_dir().join(format!("{APP_ID}.log"))
 }
 
-fn ensure_parent_dir(path: &Path) -> Result<()> {
+fn write_atomic(path: &Path, raw: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .with_context(|| format!("missing parent directory for {}", path.display()))?;
     fs::create_dir_all(parent).with_context(|| format!("failed creating {}", parent.display()))?;
-    Ok(())
-}
-
-fn write_atomic(path: &Path, raw: &[u8]) -> Result<()> {
-    ensure_parent_dir(path)?;
-
-    let parent = path
-        .parent()
-        .with_context(|| format!("missing parent directory for {}", path.display()))?;
     let file_name = path
         .file_name()
         .with_context(|| format!("missing file name for {}", path.display()))?

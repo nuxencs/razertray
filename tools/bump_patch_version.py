@@ -10,7 +10,7 @@ from pathlib import Path
 PACKAGE_SECTION_RE = re.compile(r"(?ms)^\[package\]\n(?P<body>.*?)(?=^\[|\Z)")
 VERSION_LINE_RE = re.compile(r'(?m)^version\s*=\s*"(?P<v>\d+)\.(?P<w>\d+)\.(?P<x>\d+)"\s*$')
 LOCK_ROOT_RE = re.compile(
-    r'(?ms)(\[\[package\]\]\nname = "razertray"\nversion = ")(?P<v>\d+)\.(?P<w>\d+)\.(?P<x>\d+)(")'
+    r'(?ms)(\[\[package\]\]\nname = "razertray"\nversion = ")(?P<v>\d+)\.(?P<w>\d+)\.(?P<x>\d+)(?P<suffix>")'
 )
 
 
@@ -56,7 +56,7 @@ def update_cargo_lock(text: str, old_version: str, new_version: str) -> str:
         )
 
     return LOCK_ROOT_RE.sub(
-        lambda match: f'{match.group(1)}{new_version}{match.group(5)}',
+        lambda match: f'{match.group(1)}{new_version}{match.group("suffix")}',
         text,
         count=1,
     )
