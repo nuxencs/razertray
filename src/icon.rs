@@ -79,10 +79,7 @@ fn put(pixels: &mut [u8], x: usize, y: usize, rgba: [u8; 4]) {
     }
 
     let idx = (y * SIZE + x) * 4;
-    pixels[idx] = rgba[0];
-    pixels[idx + 1] = rgba[1];
-    pixels[idx + 2] = rgba[2];
-    pixels[idx + 3] = rgba[3];
+    pixels[idx..idx + 4].copy_from_slice(&rgba);
 }
 
 #[cfg(test)]
