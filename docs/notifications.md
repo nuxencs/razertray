@@ -4,7 +4,7 @@
 
 Low-battery notifications use this collapsed title format:
 
-- `{device_name}: {battery_percent}% battery`
+- `{device_name}: {battery_percent}%`
 
 Toast body lines:
 

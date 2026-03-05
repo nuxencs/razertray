@@ -113,7 +113,7 @@ fn send_toast_low_battery(_state: &BatteryState) -> anyhow::Result<()> {
 
 #[cfg(any(target_os = "windows", test))]
 fn low_battery_title(state: &BatteryState) -> String {
-    format!("{}: {}% battery", state.display_name, state.battery_percent)
+    format!("{}: {}%", state.display_name, state.battery_percent)
 }
 
 #[cfg(test)]
@@ -148,7 +148,7 @@ mod tests {
             supports_charging_status: true,
         };
 
-        assert_eq!(low_battery_title(&state), "Test Mouse: 10% battery");
+        assert_eq!(low_battery_title(&state), "Test Mouse: 10%");
     }
 
     #[test]
