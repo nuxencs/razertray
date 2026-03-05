@@ -23,28 +23,15 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Validate tag matches Cargo version
-        shell: pwsh
+        shell: bash
         run: |
-          $tag = "${{ github.ref_name }}"
-          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
-            throw "Tag '$tag' must match vX.Y.Z"
-          }
-
-          $cargoToml = Get-Content Cargo.toml -Raw
-          $packageSection = [regex]::Match($cargoToml, '(?ms)^\[package\]\s*(?<body>.*?)(?=^\[|\z)')
-          if (-not $packageSection.Success) {
-            throw "Failed to parse [package] section from Cargo.toml"
-          }
-
-          $match = [regex]::Match($packageSection.Groups['body'].Value, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"\s*$')
-          if (-not $match.Success) {
-            throw "Failed to parse package version from Cargo.toml"
-          }
-
-          $expected = "v$($match.Groups['version'].Value)"
-          if ($tag -ne $expected) {
-            throw "Tag '$tag' does not match Cargo.toml version '$expected'"
-          }
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          cargo_version="v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "::error::Tag '$tag' does not match Cargo.toml version '$cargo_version'"
+            exit 1
+          fi
 
       - name: Build release binary
         run: cargo build --release --target x86_64-pc-windows-msvc
@@ -61,16 +48,39 @@ jobs:
           $hash = (Get-FileHash razertray.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  razertray.exe" | Set-Content SHA256SUMS.txt
 
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          prev_tag=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || echo "")
+
+          if [ -n "$prev_tag" ]; then
+            log=$(git log "${prev_tag}..${tag}" --pretty=format:"- %s (%h)" --no-merges)
+          else
+            log=$(git log "$tag" --pretty=format:"- %s (%h)" --no-merges)
+          fi
+
+          {
+            echo 'body<<CHANGELOG_EOF'
+            echo "## What's Changed"
+            echo ""
+            echo "$log"
+            echo ""
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${prev_tag:-$(git rev-list --max-parents=0 HEAD | head -1)}...${tag}"
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: pwsh
+        shell: bash
         run: |
-          $tag = "${{ github.ref_name }}"
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
 
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --title $tag --notes "Automated release for $tag"
-          }
+          gh release view "$tag" > /dev/null 2>&1 || \
+            gh release create "$tag" --title "$tag" --notes "${{ steps.changelog.outputs.body }}"
 
-          gh release upload $tag razertray.exe SHA256SUMS.txt --clobber
+          gh release upload "$tag" razertray.exe SHA256SUMS.txt --clobber
