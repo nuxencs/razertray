@@ -28,6 +28,9 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Install cargo-release
+        run: cargo install cargo-release --locked
+
       - name: Install Linux system dependencies
         run: |
           set -euo pipefail
@@ -62,7 +65,8 @@ jobs:
         if: steps.diff.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          new_version=$(python3 tools/bump_patch_version.py Cargo.toml Cargo.lock)
+          cargo release version patch --execute --no-confirm
+          new_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
 
       - name: Run tests

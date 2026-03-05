@@ -14,6 +14,11 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 tray-icon = "0.21.3"
 
+[package.metadata.release]
+publish = false
+push = false
+tag = false
+
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.7.2"
 winreg = "0.55.0"
