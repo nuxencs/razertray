@@ -1,6 +1,6 @@
 use crate::config::{self, AppConfig};
 use crate::hid::client;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use hidapi::HidApi;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -56,7 +56,7 @@ pub fn run_tray() -> Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 pub fn run_tray() -> Result<()> {
-    bail!("tray mode is only supported on Windows")
+    anyhow::bail!("tray mode is only supported on Windows")
 }
 
 fn init_logging(cfg: &AppConfig) {

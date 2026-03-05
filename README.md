@@ -10,6 +10,7 @@ Rust Windows tray app that polls battery percentage for connected Razer devices 
 - Unknown PID fallback probe (`0x1F -> 0x3F -> 0xFF`) with cache
 - Low-battery toasts (cooldown + dedup)
 - Autostart toggle via `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`
+- Windows notification details: [`docs/notifications.md`](docs/notifications.md)
 
 ## Config
 
