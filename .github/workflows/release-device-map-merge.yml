@@ -79,29 +79,17 @@ jobs:
           $hash = (Get-FileHash razertray.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  razertray.exe" | Set-Content SHA256SUMS.txt
 
-      - name: Generate changelog
-        id: changelog
+      - name: Determine release notes range
+        id: release_notes
         shell: bash
         run: |
           set -euo pipefail
           tag="${{ steps.version.outputs.tag }}"
-          prev_tag=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || echo "")
-
-          if [ -n "$prev_tag" ]; then
-            log=$(git log "${prev_tag}..${tag}" --pretty=format:"- %s (%h)" --no-merges)
+          if prev_tag=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null); then
+            echo "prev_tag=$prev_tag" >> "$GITHUB_OUTPUT"
           else
-            log=$(git log "$tag" --pretty=format:"- %s (%h)" --no-merges)
+            echo "prev_tag=" >> "$GITHUB_OUTPUT"
           fi
-
-          {
-            echo 'body<<CHANGELOG_EOF'
-            echo "## What's Changed"
-            echo ""
-            echo "$log"
-            echo ""
-            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${prev_tag:-$(git rev-list --max-parents=0 HEAD | head -1)}...${tag}"
-            echo 'CHANGELOG_EOF'
-          } >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub release
         env:
@@ -110,7 +98,12 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.version.outputs.tag }}"
-          pr_number="${{ github.event.pull_request.number }}"
+          prev_tag="${{ steps.release_notes.outputs.prev_tag }}"
+          release_args=(--title "$tag" --generate-notes)
+
+          if [ -n "$prev_tag" ]; then
+            release_args+=(--notes-start-tag "$prev_tag")
+          fi
+
           gh release create "$tag" razertray.exe SHA256SUMS.txt \
-            --title "$tag" \
-            --notes "${{ steps.changelog.outputs.body }}"
+            "${release_args[@]}"
