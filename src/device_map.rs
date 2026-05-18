@@ -439,6 +439,20 @@ pub const KNOWN_DEVICE_SUPPORT: &[DeviceSupport] = &[
         name: "Razer Pro Click V2 Wireless",
     },
     DeviceSupport {
+        pid: 0x00D3,
+        transaction_id: 0x1F,
+        supports_charging_status: false,
+        symbol: "USB_DEVICE_ID_RAZER_BASILISK_MOBILE_WIRED",
+        name: "Razer Basilisk Mobile Wired",
+    },
+    DeviceSupport {
+        pid: 0x00D4,
+        transaction_id: 0x1F,
+        supports_charging_status: false,
+        symbol: "USB_DEVICE_ID_RAZER_BASILISK_MOBILE_RECEIVER",
+        name: "Razer Basilisk Mobile Receiver",
+    },
+    DeviceSupport {
         pid: 0x00D6,
         transaction_id: 0x1F,
         supports_charging_status: true,
