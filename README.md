@@ -68,8 +68,6 @@ and isn't charging, Windows shows a notification — for example
 nagging, it only repeats an alert for the same device every couple of hours, and
 alerts stop once you plug in. Each device is tracked separately.
 
-More detail: [`docs/notifications.md`](docs/notifications.md).
-
 ## Supported devices
 
 razertray is built for **Razer wireless mice** — it only looks at Razer-branded
@@ -138,7 +136,5 @@ It reads battery info over HID feature reports using the Razer protocol, mirror-
 ing OpenRazer's mouse driver (`razermouse_driver.c`): per-device transaction IDs,
 the battery/charge commands, and which devices report charging status.
 
-CI keeps the device list in sync with OpenRazer and cuts releases automatically;
-the details (release tagging, the weekly device-map sync, and notifications) are
-in [`docs/releases.md`](docs/releases.md) and
-[`docs/notifications.md`](docs/notifications.md).
+CI keeps the device list in sync with OpenRazer and cuts releases automatically
+— see the workflows in [`.github/workflows/`](.github/workflows/).
