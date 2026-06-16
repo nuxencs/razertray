@@ -139,9 +139,10 @@ checkout:
 tools/extract_openrazer_map.py ~/dev/openrazer src/device_map.rs
 ```
 
-It reads battery info over HID feature reports using the Razer protocol, mirror-
-ing OpenRazer's mouse driver (`razermouse_driver.c`): per-device transaction IDs,
-the battery/charge commands, and which devices report charging status.
+It reads battery info over HID feature reports using the Razer protocol,
+mirroring OpenRazer's mouse driver (`razermouse_driver.c`): per-device
+transaction IDs, the battery/charge commands, and which devices report charging
+status.
 
 CI keeps the device list in sync with OpenRazer and cuts releases automatically
 — see the workflows in [`.github/workflows/`](.github/workflows/).
