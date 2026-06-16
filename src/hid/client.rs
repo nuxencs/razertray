@@ -147,7 +147,10 @@ fn send_request(handle: &mut HidDevice, request: RazerReport) -> Result<RazerRep
 }
 
 fn scale_percent(raw: u8) -> u8 {
-    ((raw as u16 * 100 + 127) / 255) as u8
+    // Match OpenRazer's user-facing conversion, which truncates: the daemon
+    // computes (raw / 255) * 100 as a float and pylib applies int() to it
+    // (floor), so a raw of 254 reads as 99%, not 100%.
+    (raw as u16 * 100 / 255) as u8
 }
 
 #[cfg(test)]
@@ -155,11 +158,15 @@ mod tests {
     use super::scale_percent;
 
     #[test]
-    fn scaling_rounds_like_reference() {
+    fn scaling_truncates_like_reference() {
+        // OpenRazer floors the percentage (int((raw / 255) * 100)); these
+        // include the boundary cases where rounding would disagree (127, 254).
         assert_eq!(scale_percent(0), 0);
         assert_eq!(scale_percent(1), 0);
-        assert_eq!(scale_percent(255), 100);
-        assert_eq!(scale_percent(254), 100);
+        assert_eq!(scale_percent(127), 49);
         assert_eq!(scale_percent(128), 50);
+        assert_eq!(scale_percent(191), 74);
+        assert_eq!(scale_percent(254), 99);
+        assert_eq!(scale_percent(255), 100);
     }
 }
