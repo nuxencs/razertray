@@ -14,6 +14,9 @@ from pathlib import Path
 PID_RE = re.compile(r"^#define\s+(USB_DEVICE_ID_RAZER_[A-Z0-9_]+)\s+0x([0-9A-Fa-f]+)\s*$")
 CASE_RE = re.compile(r"^\s*case\s+(USB_DEVICE_ID_RAZER_[A-Z0-9_]+):")
 TX_RE = re.compile(r"request\.transaction_id\.id\s*=\s*0x([0-9A-Fa-f]+)")
+# Devices that always report "not charging" (AA-battery mice). OpenRazer has
+# returned this via both sprintf() and, since commit 5315b632, sysfs_emit().
+NO_CHARGE_RE = re.compile(r'return\s+(?:sprintf|sysfs_emit)\(buf,\s*"0\\n"\)')
 
 
 def parse_pid_constants(header_text: str) -> dict[str, int]:
@@ -69,7 +72,7 @@ def parse_no_charge_symbols(charge_status_body: str) -> set[str]:
             cases.append(c.group(1))
             continue
 
-        if 'return sprintf(buf, "0\\n")' in line:
+        if NO_CHARGE_RE.search(line):
             no_charge.update(cases)
             cases = []
             continue
@@ -130,6 +133,16 @@ def emit(device_rows: list[tuple[int, int, bool, str, str]]) -> str:
     lines.append("    fn unknown_pid_returns_none() {")
     lines.append("        assert_eq!(known_device_support(0xFFFF), None);")
     lines.append("    }")
+    lines.append("")
+    lines.append("    #[test]")
+    lines.append("    fn charging_support_flag_is_populated_both_ways() {")
+    lines.append("        // Guards against an upstream sysfs return-style change (e.g.")
+    lines.append("        // sprintf -> sysfs_emit) silently zeroing out no-charge detection")
+    lines.append("        // and marking every AA-battery mouse as charging-capable.")
+    lines.append("        let map = super::KNOWN_DEVICE_SUPPORT;")
+    lines.append("        assert!(map.iter().any(|d| d.supports_charging_status));")
+    lines.append("        assert!(map.iter().any(|d| !d.supports_charging_status));")
+    lines.append("    }")
     lines.append("}")
     lines.append("")
     return "\n".join(lines)
@@ -164,6 +177,17 @@ def main() -> int:
 
     tx_by_symbol = parse_tx_map(charge_level_body)
     no_charge_symbols = parse_no_charge_symbols(charge_status_body)
+
+    # Guard: razer_attr_read_charge_status always lists AA-battery mice that
+    # report "not charging". Finding none means the source-of-truth changed its
+    # return style and NO_CHARGE_RE no longer matches, which would silently mark
+    # every device as charging-capable. Fail loudly instead of emitting bad data.
+    if not no_charge_symbols:
+        raise RuntimeError(
+            'no no-charge devices detected in razer_attr_read_charge_status; '
+            'the OpenRazer sysfs return style likely changed (e.g. sprintf -> '
+            'sysfs_emit). Update NO_CHARGE_RE in this script.'
+        )
 
     rows: list[tuple[int, int, bool, str, str]] = []
     for symbol, tx in tx_by_symbol.items():

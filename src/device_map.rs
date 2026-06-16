@@ -84,7 +84,7 @@ pub const KNOWN_DEVICE_SUPPORT: &[DeviceSupport] = &[
     DeviceSupport {
         pid: 0x0062,
         transaction_id: 0x1F,
-        supports_charging_status: true,
+        supports_charging_status: false,
         symbol: "USB_DEVICE_ID_RAZER_ATHERIS_RECEIVER",
         name: "Razer Atheris Receiver",
     },
@@ -161,7 +161,7 @@ pub const KNOWN_DEVICE_SUPPORT: &[DeviceSupport] = &[
     DeviceSupport {
         pid: 0x0083,
         transaction_id: 0xFF,
-        supports_charging_status: true,
+        supports_charging_status: false,
         symbol: "USB_DEVICE_ID_RAZER_BASILISK_X_HYPERSPEED",
         name: "Razer Basilisk X Hyperspeed",
     },
@@ -196,14 +196,14 @@ pub const KNOWN_DEVICE_SUPPORT: &[DeviceSupport] = &[
     DeviceSupport {
         pid: 0x0094,
         transaction_id: 0x1F,
-        supports_charging_status: true,
+        supports_charging_status: false,
         symbol: "USB_DEVICE_ID_RAZER_OROCHI_V2_RECEIVER",
         name: "Razer Orochi V2 Receiver",
     },
     DeviceSupport {
         pid: 0x0095,
         transaction_id: 0x1F,
-        supports_charging_status: true,
+        supports_charging_status: false,
         symbol: "USB_DEVICE_ID_RAZER_OROCHI_V2_BLUETOOTH",
         name: "Razer Orochi V2 Bluetooth",
     },
@@ -217,7 +217,7 @@ pub const KNOWN_DEVICE_SUPPORT: &[DeviceSupport] = &[
     DeviceSupport {
         pid: 0x009C,
         transaction_id: 0x1F,
-        supports_charging_status: true,
+        supports_charging_status: false,
         symbol: "USB_DEVICE_ID_RAZER_DEATHADDER_V2_X_HYPERSPEED",
         name: "Razer Deathadder V2 X Hyperspeed",
     },
@@ -301,7 +301,7 @@ pub const KNOWN_DEVICE_SUPPORT: &[DeviceSupport] = &[
     DeviceSupport {
         pid: 0x00B4,
         transaction_id: 0x1F,
-        supports_charging_status: true,
+        supports_charging_status: false,
         symbol: "USB_DEVICE_ID_RAZER_NAGA_V2_HYPERSPEED_RECEIVER",
         name: "Razer Naga V2 Hyperspeed Receiver",
     },
@@ -322,14 +322,14 @@ pub const KNOWN_DEVICE_SUPPORT: &[DeviceSupport] = &[
     DeviceSupport {
         pid: 0x00B8,
         transaction_id: 0x1F,
-        supports_charging_status: true,
+        supports_charging_status: false,
         symbol: "USB_DEVICE_ID_RAZER_VIPER_V3_HYPERSPEED",
         name: "Razer Viper V3 Hyperspeed",
     },
     DeviceSupport {
         pid: 0x00B9,
         transaction_id: 0x1F,
-        supports_charging_status: true,
+        supports_charging_status: false,
         symbol: "USB_DEVICE_ID_RAZER_BASILISK_V3_X_HYPERSPEED",
         name: "Razer Basilisk V3 X Hyperspeed",
     },
@@ -441,14 +441,14 @@ pub const KNOWN_DEVICE_SUPPORT: &[DeviceSupport] = &[
     DeviceSupport {
         pid: 0x00D3,
         transaction_id: 0x1F,
-        supports_charging_status: true,
+        supports_charging_status: false,
         symbol: "USB_DEVICE_ID_RAZER_BASILISK_MOBILE_WIRED",
         name: "Razer Basilisk Mobile Wired",
     },
     DeviceSupport {
         pid: 0x00D4,
         transaction_id: 0x1F,
-        supports_charging_status: true,
+        supports_charging_status: false,
         symbol: "USB_DEVICE_ID_RAZER_BASILISK_MOBILE_RECEIVER",
         name: "Razer Basilisk Mobile Receiver",
     },
@@ -482,5 +482,15 @@ mod tests {
     #[test]
     fn unknown_pid_returns_none() {
         assert_eq!(known_device_support(0xFFFF), None);
+    }
+
+    #[test]
+    fn charging_support_flag_is_populated_both_ways() {
+        // Guards against an upstream sysfs return-style change (e.g.
+        // sprintf -> sysfs_emit) silently zeroing out no-charge detection
+        // and marking every AA-battery mouse as charging-capable.
+        let map = super::KNOWN_DEVICE_SUPPORT;
+        assert!(map.iter().any(|d| d.supports_charging_status));
+        assert!(map.iter().any(|d| !d.supports_charging_status));
     }
 }
