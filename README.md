@@ -70,15 +70,19 @@ alerts stop once you plug in. Each device is tracked separately.
 
 ## Supported devices
 
-razertray is built for **Razer wireless mice** — it only looks at Razer-branded
-devices. It ships with a built-in list of around 65 known Razer mice and
-wireless receivers (Mamba, Viper, DeathAdder, Naga, Basilisk, Cobra, Pro Click,
-Orochi, Lancehead and more), shown by their proper product names.
+razertray looks at every Razer-branded device you have connected and shows the
+ones that report a battery level — in practice that's **wireless mice**, which is
+what it's built and tested for. It ships with a built-in list of around 65 known
+Razer mice and wireless receivers (Mamba, Viper, DeathAdder, Naga, Basilisk,
+Cobra, Pro Click, Orochi, Lancehead and more), shown by their proper product
+names.
 
 That list is generated from the community [OpenRazer](https://openrazer.github.io/)
 project's device database and refreshed in new releases, so newer mice get added
-over time. If your mouse isn't on the list yet, the app still tries to read its
-battery and shows it under a generic name.
+over time. A device that isn't on the list — a newer mouse, or another Razer
+device that reports its battery the same way (some wireless keyboards do) — still
+gets a reading where possible, shown under its system-reported name. Gear that
+doesn't report a battery this way is simply ignored.
 
 ## Settings
 
@@ -105,7 +109,10 @@ Other files in the same `%APPDATA%\razertray\` folder:
 
 - **Windows only** for the tray app and notifications. (`--once` runs elsewhere
   for a quick reading, but the tray mode does not.)
-- **Razer wireless mice** are the focus — not keyboards, headsets or other gear.
+- **Curated and tested for Razer wireless mice.** It polls every connected Razer
+  device for a battery level, so some other battery-reporting gear (e.g. certain
+  wireless keyboards) may also appear under its system-reported name — but only
+  mice are recognized by name and verified; non-battery devices are ignored.
 - The mouse (or its wireless dongle) must be connected and awake; a sleeping or
   powered-off mouse may show no reading.
 - Battery and charging readings come straight from the device and can
