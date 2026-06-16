@@ -5,6 +5,12 @@ on:
     types:
       - opened
       - synchronize
+    # Skip the Windows build/test for changes that can't affect the binary.
+    # If every changed file matches, the whole workflow is skipped.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".gitignore"
 
 permissions:
   contents: read
