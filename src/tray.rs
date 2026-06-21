@@ -169,8 +169,11 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         let _ = cmd_tx.send(WorkerCommand::Exit);
                         *control_flow = ControlFlow::Exit;
                     } else if menu_id == "autostart" {
-                        let enabled = !menu.autostart_item.is_checked();
-                        menu.autostart_item.set_checked(enabled);
+                        // muda already toggled the checkbox before firing this
+                        // event (see its `menu_selected`), so `is_checked()`
+                        // holds the post-click state. Re-setting it here would
+                        // toggle a second time and make the click a no-op.
+                        let enabled = menu.autostart_item.is_checked();
 
                         if let Err(err) = autostart::set_enabled(&exe_path, enabled) {
                             tracing::warn!("failed to set autostart: {err}");
