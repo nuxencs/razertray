@@ -14,6 +14,21 @@ pub struct AppConfig {
     pub selected_device_id: String,
     pub autostart: bool,
     pub log_level: String,
+    /// Tray display style: "icon" (battery glyph) or "text" (percentage number).
+    #[serde(default = "default_view_mode")]
+    pub view_mode: String,
+}
+
+fn default_view_mode() -> String {
+    "icon".to_string()
+}
+
+impl AppConfig {
+    /// True when the tray should render the percentage as text instead of the
+    /// battery icon.
+    pub fn text_mode(&self) -> bool {
+        self.view_mode.eq_ignore_ascii_case("text")
+    }
 }
 
 impl Default for AppConfig {
@@ -25,6 +40,7 @@ impl Default for AppConfig {
             selected_device_id: String::new(),
             autostart: true,
             log_level: "info".to_string(),
+            view_mode: default_view_mode(),
         }
     }
 }
@@ -184,5 +200,6 @@ mod tests {
         assert_eq!(parsed.selected_device_id, cfg.selected_device_id);
         assert_eq!(parsed.autostart, cfg.autostart);
         assert_eq!(parsed.log_level, cfg.log_level);
+        assert_eq!(parsed.view_mode, cfg.view_mode);
     }
 }

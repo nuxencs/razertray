@@ -31,18 +31,26 @@ struct MenuHandles {
     status_item: MenuItem,
     select_submenu: Submenu,
     refresh_item: MenuItem,
+    view_mode_item: CheckMenuItem,
     autostart_item: CheckMenuItem,
     exit_item: MenuItem,
     device_items: Vec<CheckMenuItem>,
 }
 
 impl MenuHandles {
-    fn build(initial_autostart: bool) -> Result<Self> {
+    fn build(initial_autostart: bool, initial_text_mode: bool) -> Result<Self> {
         let root = Menu::new();
 
         let status_item = MenuItem::new("No supported Razer devices", false, None);
         let select_submenu = Submenu::new("Select Device", true);
         let refresh_item = MenuItem::with_id("refresh", "Refresh now", true, None);
+        let view_mode_item = CheckMenuItem::with_id(
+            "viewmode",
+            "Show percentage as text",
+            true,
+            initial_text_mode,
+            None,
+        );
         let autostart_item =
             CheckMenuItem::with_id("autostart", "Start at login", true, initial_autostart, None);
         let exit_item = MenuItem::with_id("exit", "Exit", true, None);
@@ -52,6 +60,7 @@ impl MenuHandles {
             &status_item,
             &select_submenu,
             &refresh_item,
+            &view_mode_item,
             &autostart_item,
             &separator,
             &exit_item,
@@ -62,6 +71,7 @@ impl MenuHandles {
             status_item,
             select_submenu,
             refresh_item,
+            view_mode_item,
             autostart_item,
             exit_item,
             device_items: Vec::new(),
@@ -147,7 +157,8 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
         cfg.poll_interval_seconds.max(5),
     );
 
-    let mut menu = MenuHandles::build(autostart_enabled)?;
+    let mut text_mode = cfg.text_mode();
+    let mut menu = MenuHandles::build(autostart_enabled, text_mode)?;
     menu.touch_ids();
 
     let initial_icon = icon::neutral_icon()?;
@@ -180,6 +191,25 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         if let Err(err) = config::save_config(&cfg) {
                             tracing::warn!("failed saving config: {err}");
                         }
+                    } else if menu_id == "viewmode" {
+                        // muda already toggled the check mark before firing this
+                        // event, so is_checked() holds the post-click state.
+                        text_mode = menu.view_mode_item.is_checked();
+                        cfg.view_mode = if text_mode { "text" } else { "icon" }.to_string();
+
+                        if let Err(err) = config::save_config(&cfg) {
+                            tracing::warn!("failed saving config: {err}");
+                        }
+
+                        if let Err(err) = refresh_tray_visuals(
+                            &mut tray_icon,
+                            &devices,
+                            &selected_device_id,
+                            &menu.status_item,
+                            text_mode,
+                        ) {
+                            tracing::warn!("failed updating tray visuals: {err}");
+                        }
                     } else if let Some(device_id) = menu_id.strip_prefix("device:") {
                         selected_device_id = device_id.to_string();
                         cfg.selected_device_id = selected_device_id.clone();
@@ -194,6 +224,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                             &devices,
                             &selected_device_id,
                             &menu.status_item,
+                            text_mode,
                         ) {
                             tracing::warn!("failed updating tray visuals: {err}");
                         }
@@ -229,6 +260,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         &devices,
                         &selected_device_id,
                         &menu.status_item,
+                        text_mode,
                     ) {
                         tracing::warn!("failed refreshing visuals: {err}");
                     }
@@ -256,11 +288,16 @@ fn refresh_tray_visuals(
     devices: &[BatteryState],
     selected_device_id: &str,
     status_item: &MenuItem,
+    text_mode: bool,
 ) -> Result<()> {
     let selected = devices.iter().find(|d| d.device_key == selected_device_id);
 
     if let Some(device) = selected {
-        let icon = icon::battery_icon(device.battery_percent, device.is_charging)?;
+        let icon = if text_mode {
+            icon::text_icon(device.battery_percent, device.is_charging)?
+        } else {
+            icon::battery_icon(device.battery_percent, device.is_charging)?
+        };
         tray_icon.set_icon(Some(icon))?;
 
         let tooltip = format!(
