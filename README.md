@@ -95,7 +95,7 @@ poll_interval_seconds = 60        # how often to check the battery (minimum 5)
 low_battery_threshold = 15        # warn at or below this percentage
 low_battery_cooldown_minutes = 120  # minimum gap between repeat warnings
 selected_device_id = ""           # which device to watch (set from the menu)
-autostart = true                  # start with Windows
+autostart = false                 # start with Windows (toggle from the tray menu)
 log_level = "info"                # detail level for the log file
 ```
 

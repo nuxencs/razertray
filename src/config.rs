@@ -23,7 +23,7 @@ impl Default for AppConfig {
             low_battery_threshold: 15,
             low_battery_cooldown_minutes: 120,
             selected_device_id: String::new(),
-            autostart: true,
+            autostart: false,
             log_level: "info".to_string(),
         }
     }
