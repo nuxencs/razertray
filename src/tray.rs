@@ -157,6 +157,11 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     let mut devices: Vec<BatteryState> = Vec::new();
     let mut selected_device_id = cfg.selected_device_id.clone();
 
+    // Tolerate brief gaps: keep showing the last reading for up to this many
+    // consecutive empty polls before clearing the tray to "no device".
+    let mut missed_polls: u32 = 0;
+    const MAX_MISSED_POLLS: u32 = 3;
+
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
 
@@ -208,13 +213,27 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         devices: new_devices,
                         errors,
                     } = poll_result;
-                    devices = new_devices;
 
                     if !errors.is_empty() {
                         for err in errors {
                             tracing::warn!("poll error: {err}");
                         }
                     }
+
+                    // Keep the last known reading through brief gaps: a poll that
+                    // comes back empty while we still have devices is treated as a
+                    // transient miss until it persists for MAX_MISSED_POLLS cycles.
+                    if new_devices.is_empty() && !devices.is_empty() {
+                        missed_polls += 1;
+                        if missed_polls < MAX_MISSED_POLLS {
+                            tracing::debug!(
+                                "transient empty poll ({missed_polls}/{MAX_MISSED_POLLS}); keeping last reading"
+                            );
+                            return;
+                        }
+                    }
+                    missed_polls = 0;
+                    devices = new_devices;
 
                     if ensure_selected_device(&mut selected_device_id, &devices) {
                         cfg.selected_device_id = selected_device_id.clone();
@@ -304,6 +323,8 @@ fn ensure_selected_device(selected_device_id: &mut String, devices: &[BatterySta
     true
 }
 
+const EMPTY_RETRY_START_SECS: u64 = 2;
+
 fn spawn_poll_worker(
     proxy: EventLoopProxy<UserEvent>,
     cmd_rx: mpsc::Receiver<WorkerCommand>,
@@ -311,12 +332,33 @@ fn spawn_poll_worker(
     poll_interval_seconds: u64,
 ) {
     thread::spawn(move || {
+        // When a poll finds no device we retry quickly, doubling the delay each
+        // time (2s, 4s, 8s, …) up to the normal interval, so a sleeping or
+        // not-yet-ready device is picked up fast without hammering the USB bus
+        // forever when nothing is connected.
+        let mut empty_backoff = EMPTY_RETRY_START_SECS;
+
+        // Create the HidApi handle once and reuse it across polls;
+        // `refresh_devices` picks up newly attached/removed devices without a
+        // full re-enumeration. The handle is recreated lazily if init ever fails.
+        let mut api: Option<HidApi> = None;
+
         loop {
-            let poll_result = match HidApi::new() {
-                Ok(api) => client::poll_devices(&api, &mut cache),
-                Err(err) => PollResult {
+            if api.is_none() {
+                match HidApi::new() {
+                    Ok(a) => api = Some(a),
+                    Err(err) => tracing::warn!("failed initializing hidapi: {err}"),
+                }
+            }
+
+            let poll_result = match api.as_mut() {
+                Some(a) => {
+                    let _ = a.refresh_devices();
+                    client::poll_devices(a, &mut cache)
+                }
+                None => PollResult {
                     devices: Vec::new(),
-                    errors: vec![format!("failed initializing hidapi: {err}")],
+                    errors: vec!["hidapi unavailable".to_string()],
                 },
             };
 
@@ -324,9 +366,21 @@ fn spawn_poll_worker(
                 tracing::warn!("failed saving pid cache: {err}");
             }
 
+            let found = !poll_result.devices.is_empty();
             let _ = proxy.send_event(UserEvent::Poll(poll_result));
 
-            match cmd_rx.recv_timeout(Duration::from_secs(poll_interval_seconds)) {
+            // Sleep the full interval once we have a device; otherwise back off
+            // quickly so the next attempt is soon after a device appears.
+            let wait = if found {
+                empty_backoff = EMPTY_RETRY_START_SECS;
+                poll_interval_seconds
+            } else {
+                let w = empty_backoff.min(poll_interval_seconds);
+                empty_backoff = (empty_backoff * 2).min(poll_interval_seconds);
+                w
+            };
+
+            match cmd_rx.recv_timeout(Duration::from_secs(wait)) {
                 Ok(WorkerCommand::Refresh) => continue,
                 Ok(WorkerCommand::Exit) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
