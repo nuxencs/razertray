@@ -146,3 +146,13 @@ status.
 
 CI keeps the device list in sync with OpenRazer and cuts releases automatically
 — see the workflows in [`.github/workflows/`](.github/workflows/).
+
+## License
+
+razertray is licensed under the [GNU General Public License v2.0 or later](LICENSE)
+(`GPL-2.0-or-later`).
+
+The device support map (`src/device_map.rs`) and the Razer HID protocol code are
+derived from [OpenRazer](https://github.com/openrazer/openrazer), which is itself
+licensed under GPL-2.0-or-later. razertray matches that license out of respect for
+the OpenRazer project's reverse-engineering work, which this app builds on.
