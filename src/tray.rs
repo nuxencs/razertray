@@ -1,15 +1,17 @@
 use crate::APP_ID;
 use crate::autostart;
 use crate::config::{self, AppConfig, PidCache};
+use crate::forecast::{Forecast, Forecaster, Observation, format_duration_hm};
 use crate::hid::client;
 use crate::icon;
-use crate::model::{BatteryState, PollResult};
+use crate::model::{BatteryState, PollError, PollResult};
 use crate::notify::Notifier;
 use anyhow::{Context, Result};
 use hidapi::HidApi;
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
@@ -168,6 +170,15 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     let mut devices: Vec<BatteryState> = Vec::new();
     let mut selected_device_id = cfg.selected_device_id.clone();
 
+    // Battery history → runout forecast, and the latest forecast per device so
+    // menu/visual refreshes outside the poll path can reuse it.
+    let mut forecaster = Forecaster::new();
+    let mut forecasts: HashMap<String, Forecast> = HashMap::new();
+
+    // Collapses the wireless-sleep error flood to a transition + periodic
+    // summary + recovery line instead of one WARN per poll.
+    let mut error_tracker = PollErrorTracker::new(ERROR_SUMMARY_INTERVAL);
+
     // Tolerate brief gaps: keep showing the last reading for up to this many
     // consecutive empty polls before clearing the tray to "no device".
     let mut missed_polls: u32 = 0;
@@ -215,6 +226,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                             &selected_device_id,
                             &menu.status_item,
                             text_mode,
+                            forecasts.get(&selected_device_id),
                         ) {
                             tracing::warn!("failed updating tray visuals: {err}");
                         }
@@ -233,23 +245,23 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                             &selected_device_id,
                             &menu.status_item,
                             text_mode,
+                            forecasts.get(&selected_device_id),
                         ) {
                             tracing::warn!("failed updating tray visuals: {err}");
                         }
                     }
                 }
                 UserEvent::Poll(mut poll_result) => {
+                    let now = Instant::now();
                     poll_result.sort_devices();
                     let PollResult {
                         devices: new_devices,
                         errors,
                     } = poll_result;
 
-                    if !errors.is_empty() {
-                        for err in errors {
-                            tracing::warn!("poll error: {err}");
-                        }
-                    }
+                    // Track failures before the transient-miss early return, so a
+                    // device going to sleep is still recorded each cycle.
+                    error_tracker.observe(now, &new_devices, &errors);
 
                     // Keep the last known reading through brief gaps: a poll that
                     // comes back empty while we still have devices is treated as a
@@ -265,6 +277,23 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                     }
                     missed_polls = 0;
                     devices = new_devices;
+
+                    // Feed each fresh reading to the forecaster and log a battery
+                    // line whenever the level or charging state actually changes.
+                    for device in &devices {
+                        let obs = forecaster.observe(
+                            &device.device_key,
+                            device.battery_raw,
+                            device.battery_percent,
+                            device.is_charging,
+                            now,
+                        );
+                        if obs.changed {
+                            log_battery_line(device, &obs);
+                        }
+                        forecasts.insert(device.device_key.clone(), obs.forecast);
+                    }
+                    forecasts.retain(|key, _| devices.iter().any(|d| &d.device_key == key));
 
                     if ensure_selected_device(&mut selected_device_id, &devices) {
                         cfg.selected_device_id = selected_device_id.clone();
@@ -283,12 +312,17 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         &selected_device_id,
                         &menu.status_item,
                         text_mode,
+                        forecasts.get(&selected_device_id),
                     ) {
                         tracing::warn!("failed refreshing visuals: {err}");
                     }
 
                     for device in &devices {
-                        notifier.maybe_notify_low_battery(device);
+                        let forecast = forecasts
+                            .get(&device.device_key)
+                            .cloned()
+                            .unwrap_or(Forecast::Estimating);
+                        notifier.maybe_notify_low_battery(device, &forecast);
                     }
                 }
             }
@@ -311,6 +345,7 @@ fn refresh_tray_visuals(
     selected_device_id: &str,
     status_item: &MenuItem,
     text_mode: bool,
+    forecast: Option<&Forecast>,
 ) -> Result<()> {
     let selected = devices.iter().find(|d| d.device_key == selected_device_id);
 
@@ -322,16 +357,7 @@ fn refresh_tray_visuals(
         };
         tray_icon.set_icon(Some(icon))?;
 
-        let tooltip = format!(
-            "{}: {}%{}",
-            device.display_name,
-            device.battery_percent,
-            if device.is_charging {
-                " (charging)"
-            } else {
-                ""
-            }
-        );
+        let tooltip = device_tooltip(device, forecast);
         tray_icon.set_tooltip(Some(tooltip.clone()))?;
         status_item.set_text(&tooltip);
     } else {
@@ -341,6 +367,48 @@ fn refresh_tray_visuals(
     }
 
     Ok(())
+}
+
+/// Tooltip / status text for a device, appending the runout estimate while
+/// discharging (e.g. `DeathAdder: 78% · ~25h left`).
+fn device_tooltip(device: &BatteryState, forecast: Option<&Forecast>) -> String {
+    let mut text = format!("{}: {}%", device.display_name, device.battery_percent);
+    if device.is_charging {
+        text.push_str(" (charging)");
+    } else if let Some(forecast @ Forecast::Discharging { .. }) = forecast {
+        text.push_str(" · ");
+        text.push_str(&forecast.short());
+    }
+    text
+}
+
+/// Emit one INFO line summarising a battery reading: the drop since the previous
+/// reading plus the current runout estimate. This is the signal that used to be
+/// missing from the log entirely.
+fn log_battery_line(device: &BatteryState, obs: &Observation) {
+    let charging = if device.is_charging {
+        " (charging)"
+    } else {
+        ""
+    };
+    match obs.since_last {
+        Some(since) if obs.delta_percent != 0 => tracing::info!(
+            "{}: {}%{} ({:+}% in {}, {})",
+            device.display_name,
+            device.battery_percent,
+            charging,
+            obs.delta_percent,
+            format_duration_hm(since),
+            obs.forecast.detailed()
+        ),
+        _ => tracing::info!(
+            "{}: {}%{} ({})",
+            device.display_name,
+            device.battery_percent,
+            charging,
+            obs.forecast.detailed()
+        ),
+    }
 }
 
 fn ensure_selected_device(selected_device_id: &mut String, devices: &[BatteryState]) -> bool {
@@ -361,6 +429,10 @@ fn ensure_selected_device(selected_device_id: &mut String, devices: &[BatterySta
 }
 
 const EMPTY_RETRY_START_SECS: u64 = 2;
+
+/// While a device keeps failing, re-log a summary at most this often instead of
+/// once per poll.
+const ERROR_SUMMARY_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 fn spawn_poll_worker(
     proxy: EventLoopProxy<UserEvent>,
@@ -395,7 +467,12 @@ fn spawn_poll_worker(
                 }
                 None => PollResult {
                     devices: Vec::new(),
-                    errors: vec!["hidapi unavailable".to_string()],
+                    errors: vec![PollError {
+                        device_key: String::new(),
+                        display_name: String::new(),
+                        pid: None,
+                        message: "hidapi unavailable".to_string(),
+                    }],
                 },
             };
 
@@ -438,10 +515,111 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
     Ok(())
 }
 
+struct ErrState {
+    /// Whether the current episode is benign wireless-sleep noise. We dedupe on
+    /// this category, not the exact message: a sleeping device fails at different
+    /// transport stages from poll to poll (all "unreachable"), and treating each
+    /// wording as a new fault would re-flood the log and reset the summary timer.
+    unreachable: bool,
+    since: Instant,
+    last_log: Instant,
+    count: u32,
+}
+
+/// Throttles repeated poll failures: logs the first failure (and any change of
+/// failure mode), a periodic summary while it persists, and a recovery line when
+/// the device reads successfully again. Keeps the benign wireless-sleep noise out
+/// of the log without hiding genuine, changing faults.
+struct PollErrorTracker {
+    states: HashMap<String, ErrState>,
+    summary_interval: Duration,
+}
+
+impl PollErrorTracker {
+    fn new(summary_interval: Duration) -> Self {
+        Self {
+            states: HashMap::new(),
+            summary_interval,
+        }
+    }
+
+    fn observe(&mut self, now: Instant, devices: &[BatteryState], errors: &[PollError]) {
+        // Any device that read successfully clears (and reports) its error state.
+        for device in devices {
+            if let Some(state) = self.states.remove(&device.device_key) {
+                tracing::info!(
+                    "{} recovered after {} failed poll(s) over {}",
+                    device.display_name,
+                    state.count,
+                    format_duration_hm(now.saturating_duration_since(state.since))
+                );
+            }
+        }
+
+        for error in errors {
+            // Scan-level errors carry no device key; key them by message instead.
+            let key = if error.device_key.is_empty() {
+                error.message.clone()
+            } else {
+                error.device_key.clone()
+            };
+
+            let unreachable = error.is_unreachable();
+            match self.states.get_mut(&key) {
+                None => {
+                    log_poll_failure(error);
+                    self.states.insert(
+                        key,
+                        ErrState {
+                            unreachable,
+                            since: now,
+                            last_log: now,
+                            count: 1,
+                        },
+                    );
+                }
+                Some(state) => {
+                    state.count += 1;
+                    if state.unreachable != unreachable {
+                        // Failure category flipped (e.g. asleep -> genuine fault):
+                        // surface it and start a new episode.
+                        log_poll_failure(error);
+                        state.unreachable = unreachable;
+                        state.since = now;
+                        state.last_log = now;
+                        state.count = 1;
+                    } else if now.saturating_duration_since(state.last_log) >= self.summary_interval
+                    {
+                        tracing::info!(
+                            "still failing: {error} ({} poll(s) over {})",
+                            state.count,
+                            format_duration_hm(now.saturating_duration_since(state.since))
+                        );
+                        state.last_log = now;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// First-occurrence log for a poll failure. Benign wireless-sleep failures are
+/// flagged as such (and the caller suppresses their repeats); anything else is a
+/// plain WARN so genuine faults stay visible.
+fn log_poll_failure(error: &PollError) {
+    if error.is_unreachable() {
+        tracing::warn!("poll error: {error} — device unreachable (asleep?); suppressing repeats");
+    } else {
+        tracing::warn!("poll error: {error}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ensure_selected_device;
-    use crate::model::BatteryState;
+    use super::{PollErrorTracker, device_tooltip, ensure_selected_device};
+    use crate::forecast::Forecast;
+    use crate::model::{BatteryState, PollError};
+    use std::time::{Duration, Instant};
 
     fn mk_state(id: &str) -> BatteryState {
         BatteryState {
@@ -449,8 +627,18 @@ mod tests {
             display_name: "X".to_string(),
             pid: 0x0001,
             battery_percent: 50,
+            battery_raw: 128,
             is_charging: false,
             supports_charging_status: true,
+        }
+    }
+
+    fn unreachable_err(key: &str) -> PollError {
+        PollError {
+            device_key: key.to_string(),
+            display_name: "X".to_string(),
+            pid: Some(0x0001),
+            message: "send_feature_report failed".to_string(),
         }
     }
 
@@ -461,5 +649,92 @@ mod tests {
         let changed = ensure_selected_device(&mut selected, &devices);
         assert!(changed);
         assert_eq!(selected, "a");
+    }
+
+    #[test]
+    fn tooltip_appends_runout_only_while_discharging() {
+        let mut device = mk_state("a");
+        device.display_name = "DeathAdder".to_string();
+        device.battery_percent = 78;
+
+        let forecast = Forecast::Discharging {
+            rate_pct_per_h: 3.1,
+            time_to_empty: Duration::from_secs(25 * 3600),
+        };
+        assert_eq!(
+            device_tooltip(&device, Some(&forecast)),
+            "DeathAdder: 78% · ~25h left"
+        );
+        assert_eq!(
+            device_tooltip(&device, Some(&Forecast::Estimating)),
+            "DeathAdder: 78%"
+        );
+
+        device.is_charging = true;
+        assert_eq!(
+            device_tooltip(&device, Some(&forecast)),
+            "DeathAdder: 78% (charging)"
+        );
+    }
+
+    #[test]
+    fn error_tracker_tracks_episode_then_clears_on_recovery() {
+        let mut tracker = PollErrorTracker::new(Duration::from_secs(900));
+        let t0 = Instant::now();
+
+        // Failure opens an episode.
+        tracker.observe(t0, &[], &[unreachable_err("a")]);
+        assert_eq!(tracker.states.len(), 1);
+        assert_eq!(tracker.states["a"].count, 1);
+
+        // Repeats accumulate without opening new episodes.
+        tracker.observe(t0 + Duration::from_secs(60), &[], &[unreachable_err("a")]);
+        assert_eq!(tracker.states["a"].count, 2);
+
+        // A successful read clears the episode.
+        tracker.observe(t0 + Duration::from_secs(120), &[mk_state("a")], &[]);
+        assert!(tracker.states.is_empty());
+    }
+
+    #[test]
+    fn error_tracker_resets_episode_when_failure_mode_changes() {
+        let mut tracker = PollErrorTracker::new(Duration::from_secs(900));
+        let t0 = Instant::now();
+        tracker.observe(t0, &[], &[unreachable_err("a")]);
+        tracker.observe(t0 + Duration::from_secs(60), &[], &[unreachable_err("a")]);
+        assert_eq!(tracker.states["a"].count, 2);
+
+        // Flipping category (benign sleep -> genuine fault) starts a new episode.
+        let mut changed = unreachable_err("a");
+        changed.message = "device returned STATUS_FAILURE".to_string();
+        assert!(!changed.is_unreachable());
+        tracker.observe(t0 + Duration::from_secs(120), &[], &[changed]);
+        assert_eq!(tracker.states["a"].count, 1);
+        assert!(!tracker.states["a"].unreachable);
+    }
+
+    #[test]
+    fn error_tracker_keeps_one_episode_for_varying_sleep_messages() {
+        // A sleeping device fails at different transport stages from poll to poll;
+        // all are is_unreachable(), so they must stay a single episode (no reflood,
+        // no episode reset) rather than re-logging each time the wording changes.
+        let mut tracker = PollErrorTracker::new(Duration::from_secs(900));
+        let t0 = Instant::now();
+
+        let mut e1 = unreachable_err("a");
+        e1.message = "send_feature_report failed".to_string();
+        let mut e2 = unreachable_err("a");
+        e2.message = "device stayed busy/unresponsive after retries".to_string();
+        let mut e3 = unreachable_err("a");
+        e3.message = "expected 91 bytes, got 0".to_string();
+        assert!(e1.is_unreachable() && e2.is_unreachable() && e3.is_unreachable());
+
+        tracker.observe(t0, &[], &[e1]);
+        tracker.observe(t0 + Duration::from_secs(30), &[], &[e2]);
+        tracker.observe(t0 + Duration::from_secs(60), &[], &[e3]);
+
+        // One continuous episode: count accumulates, the start time is unchanged.
+        assert_eq!(tracker.states["a"].count, 3);
+        assert!(tracker.states["a"].unreachable);
     }
 }

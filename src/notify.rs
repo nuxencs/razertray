@@ -1,3 +1,4 @@
+use crate::forecast::Forecast;
 use crate::model::BatteryState;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -31,13 +32,13 @@ impl Notifier {
         true
     }
 
-    pub fn maybe_notify_low_battery(&mut self, state: &BatteryState) -> bool {
+    pub fn maybe_notify_low_battery(&mut self, state: &BatteryState, forecast: &Forecast) -> bool {
         let now = Instant::now();
         if !self.should_notify(state, now) {
             return false;
         }
 
-        if send_toast_low_battery(state).is_ok() {
+        if send_toast_low_battery(state, forecast).is_ok() {
             self.last_sent.insert(state.device_key.clone(), now);
             return true;
         }
@@ -46,15 +47,24 @@ impl Notifier {
     }
 }
 
+/// Toast body text: lead with the runout estimate when we have one.
+#[cfg(any(target_os = "windows", test))]
+fn low_battery_body(forecast: &Forecast) -> String {
+    match forecast {
+        Forecast::Discharging { .. } => format!("{} — plug in soon", forecast.short()),
+        _ => "Plug in charger soon".to_string(),
+    }
+}
+
 #[cfg(target_os = "windows")]
-fn send_toast_low_battery(state: &BatteryState) -> anyhow::Result<()> {
+fn send_toast_low_battery(state: &BatteryState, forecast: &Forecast) -> anyhow::Result<()> {
     use tauri_winrt_notification::Toast;
     let app_id = toast_app_id();
 
     Toast::new(app_id)
         .title(&low_battery_title(state))
         .text1("Battery low")
-        .text2("Plug in charger soon")
+        .text2(&low_battery_body(forecast))
         .show()?;
 
     Ok(())
@@ -107,7 +117,7 @@ fn register_toast_aumid() -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn send_toast_low_battery(_state: &BatteryState) -> anyhow::Result<()> {
+fn send_toast_low_battery(_state: &BatteryState, _forecast: &Forecast) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -118,7 +128,8 @@ fn low_battery_title(state: &BatteryState) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Notifier, low_battery_title};
+    use super::{Notifier, low_battery_body, low_battery_title};
+    use crate::forecast::Forecast;
     use crate::model::BatteryState;
     use std::time::{Duration, Instant};
 
@@ -130,11 +141,12 @@ mod tests {
             display_name: "Test Mouse".to_string(),
             pid: 0x0072,
             battery_percent: 10,
+            battery_raw: 26,
             is_charging: true,
             supports_charging_status: true,
         };
 
-        assert!(!notifier.maybe_notify_low_battery(&state));
+        assert!(!notifier.maybe_notify_low_battery(&state, &Forecast::Charging));
     }
 
     #[test]
@@ -144,11 +156,25 @@ mod tests {
             display_name: "Test Mouse".to_string(),
             pid: 0x0072,
             battery_percent: 10,
+            battery_raw: 26,
             is_charging: false,
             supports_charging_status: true,
         };
 
         assert_eq!(low_battery_title(&state), "Test Mouse: 10%");
+    }
+
+    #[test]
+    fn body_includes_runout_when_discharging() {
+        assert_eq!(
+            low_battery_body(&Forecast::Estimating),
+            "Plug in charger soon"
+        );
+        let fc = Forecast::Discharging {
+            rate_pct_per_h: 4.0,
+            time_to_empty: Duration::from_secs(90 * 60),
+        };
+        assert_eq!(low_battery_body(&fc), "~1h 30m left — plug in soon");
     }
 
     #[test]
@@ -159,6 +185,7 @@ mod tests {
             display_name: "Test Mouse".to_string(),
             pid: 0x0072,
             battery_percent: 10,
+            battery_raw: 26,
             is_charging: false,
             supports_charging_status: true,
         };

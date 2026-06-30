@@ -9,7 +9,9 @@ Low-battery notifications use this collapsed title format:
 Toast body lines:
 
 - `Battery low`
-- `Plug in charger soon`
+- `Plug in charger soon` — or, when a runout estimate is available,
+  `~{time} left — plug in soon` (e.g. `~1h 30m left — plug in soon`). See
+  [forecast.md](forecast.md).
 
 ## Sender identity (AUMID)
 
