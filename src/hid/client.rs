@@ -6,7 +6,7 @@ use crate::hid::protocol::{
     expected_response_matches, feature_report_payload,
 };
 use crate::hid::scanner::{DiscoveredDevice, scan_devices};
-use crate::model::{BatteryState, PollResult};
+use crate::model::{BatteryState, PollError, PollResult};
 use anyhow::{Context, Result, bail};
 use hidapi::{HidApi, HidDevice};
 use std::thread;
@@ -23,10 +23,12 @@ pub fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollResult {
     for device in discovered {
         match query_device(api, &device, pid_cache) {
             Ok(state) => result.devices.push(state),
-            Err(err) => result.errors.push(format!(
-                "{} ({:04X}): {err}",
-                device.product_name, device.pid
-            )),
+            Err(err) => result.errors.push(PollError {
+                device_key: device.key.clone(),
+                display_name: resolved_name(&device),
+                pid: Some(device.pid),
+                message: format!("{err}"),
+            }),
         }
     }
 
@@ -57,7 +59,8 @@ fn query_device(
     };
 
     let battery_report = send_request(&mut handle, build_battery_request(transaction_id))?;
-    let battery_percent = scale_percent(battery_report.arguments[1]);
+    let battery_raw = battery_report.arguments[1];
+    let battery_percent = scale_percent(battery_raw);
 
     let supports_charging_status = match known {
         Some(support) => support.supports_charging_status,
@@ -73,18 +76,24 @@ fn query_device(
         false
     };
 
-    let display_name = known
-        .map(|support| support.name.to_string())
-        .unwrap_or_else(|| device.product_name.clone());
-
     Ok(BatteryState {
         device_key: device.key.clone(),
-        display_name,
+        display_name: resolved_name(device),
         pid: device.pid,
         battery_percent,
+        battery_raw,
         is_charging,
         supports_charging_status,
     })
+}
+
+/// Resolve a stable display name: prefer the curated device-map name, fall back
+/// to the HID product string. Used by both the success and error paths so a
+/// device is referred to the same way whether or not the poll succeeds.
+fn resolved_name(device: &DiscoveredDevice) -> String {
+    device_map::known_device_support(device.pid)
+        .map(|support| support.name.to_string())
+        .unwrap_or_else(|| device.product_name.clone())
 }
 
 fn probe_transaction_id(handle: &mut HidDevice, pid: u16) -> Result<u8> {

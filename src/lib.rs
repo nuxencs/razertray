@@ -4,6 +4,7 @@ pub mod app;
 pub mod autostart;
 pub mod config;
 pub mod device_map;
+pub mod forecast;
 pub mod hid;
 pub mod icon;
 pub mod model;

@@ -18,6 +18,9 @@ pick which one the icon tracks.
   when nearly empty, and blue while charging
 - Hover the icon for a tooltip with the device name, exact percentage, and
   whether it's charging
+- Runout forecast: estimates how long the battery will last (e.g. `~25h left`)
+  in the tooltip, and logs how much drained since the last check — see
+  [docs/forecast.md](docs/forecast.md)
 - Automatic low-battery alerts so you get a heads-up before the mouse dies
 - Pick which Razer device to watch when several are connected
 - "Refresh now" for an instant reading instead of waiting for the next check
