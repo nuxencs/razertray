@@ -93,96 +93,138 @@ fn query_device(
     let mut failures = Vec::new();
     let mut unsupported_interfaces = 0_usize;
     let mut opened_interfaces = 0_usize;
-    let deadline = Instant::now() + DEVICE_POLL_BUDGET;
+    let overall_deadline = Instant::now() + DEVICE_POLL_BUDGET;
+    let candidates: Vec<_> = device
+        .candidates
+        .iter()
+        .take(MAX_CANDIDATES_PER_DEVICE)
+        .collect();
 
-    for candidate in device.candidates.iter().take(MAX_CANDIDATES_PER_DEVICE) {
-        if Instant::now() >= deadline {
-            failures.push("poll time budget exhausted".to_string());
-            break;
-        }
-        let handle = match api.open_path(candidate.path.as_c_str()) {
-            Ok(handle) => handle,
-            Err(err) => {
-                failures.push(format!(
-                    "interface {} could not be opened: {err}",
-                    candidate.interface_number
-                ));
-                continue;
+    let found = probe_candidates_with_clock(
+        candidates.len(),
+        overall_deadline,
+        Instant::now,
+        |index, candidate_deadline| {
+            let candidate = candidates[index];
+            let handle = match api.open_path(candidate.path.as_c_str()) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    failures.push(format!(
+                        "interface {} could not be opened: {err}",
+                        candidate.interface_number
+                    ));
+                    return None;
+                }
+            };
+            opened_interfaces += 1;
+
+            match query_handle(
+                &handle,
+                device.pid,
+                known,
+                pid_cache,
+                cache_changed,
+                candidate_deadline,
+            ) {
+                Ok((transaction_id, battery_report)) => {
+                    Some((handle, transaction_id, battery_report))
+                }
+                Err(err) if err.downcast_ref::<UnsupportedCommand>().is_some() => {
+                    unsupported_interfaces += 1;
+                    None
+                }
+                Err(err) => {
+                    failures.push(format!(
+                        "interface {} failed: {}",
+                        candidate.interface_number,
+                        format_error_chain(&err)
+                    ));
+                    None
+                }
             }
-        };
-        opened_interfaces += 1;
+        },
+    );
 
-        match query_handle(
-            &handle,
-            device.pid,
-            known,
-            pid_cache,
-            cache_changed,
-            deadline,
-        ) {
-            Ok((transaction_id, battery_report)) => {
-                let battery_raw = battery_report.arguments[1];
-                let battery_percent = scale_percent(battery_raw);
-                let (charge_state, warning) =
-                    if known.is_some_and(|support| !support.supports_charging_status) {
+    if let Some((handle, transaction_id, battery_report)) = found {
+        let battery_raw = battery_report.arguments[1];
+        let battery_percent = scale_percent(battery_raw);
+        let (charge_state, warning) =
+            if known.is_some_and(|support| !support.supports_charging_status) {
+                (ChargeState::Unsupported, None)
+            } else {
+                match send_request(
+                    &handle,
+                    build_charging_request(transaction_id),
+                    device.pid,
+                    overall_deadline,
+                ) {
+                    Ok(report) if report.arguments[1] > 0 => (ChargeState::Charging, None),
+                    Ok(_) => (ChargeState::NotCharging, None),
+                    Err(err) if err.downcast_ref::<UnsupportedCommand>().is_some() => {
                         (ChargeState::Unsupported, None)
-                    } else {
-                        match send_request(
-                            &handle,
-                            build_charging_request(transaction_id),
-                            device.pid,
-                            deadline,
-                        ) {
-                            Ok(report) if report.arguments[1] > 0 => (ChargeState::Charging, None),
-                            Ok(_) => (ChargeState::NotCharging, None),
-                            Err(err) if err.downcast_ref::<UnsupportedCommand>().is_some() => {
-                                (ChargeState::Unsupported, None)
-                            }
-                            Err(err) => (
-                                ChargeState::Unavailable,
-                                Some(PollError {
-                                    device_key: device.key.clone(),
-                                    display_name: display_name.clone(),
-                                    pid: device.pid,
-                                    scope: PollErrorScope::ChargeState,
-                                    kind: classify_error(&err),
-                                    message: format!(
-                                        "charging status unavailable: {}",
-                                        format_error_chain(&err)
-                                    ),
-                                }),
+                    }
+                    Err(err) => (
+                        ChargeState::Unavailable,
+                        Some(PollError {
+                            device_key: device.key.clone(),
+                            display_name: display_name.clone(),
+                            pid: device.pid,
+                            scope: PollErrorScope::ChargeState,
+                            kind: classify_error(&err),
+                            message: format!(
+                                "charging status unavailable: {}",
+                                format_error_chain(&err)
                             ),
-                        }
-                    };
+                        }),
+                    ),
+                }
+            };
 
-                return Ok((
-                    BatteryState {
-                        device_key: device.key.clone(),
-                        display_name,
-                        pid: device.pid,
-                        battery_raw,
-                        battery_percent,
-                        charge_state,
-                    },
-                    warning,
-                ));
-            }
-            Err(err) if err.downcast_ref::<UnsupportedCommand>().is_some() => {
-                unsupported_interfaces += 1;
-            }
-            Err(err) => failures.push(format!(
-                "interface {} failed: {}",
-                candidate.interface_number,
-                format_error_chain(&err)
-            )),
-        }
+        return Ok((
+            BatteryState {
+                device_key: device.key.clone(),
+                display_name,
+                pid: device.pid,
+                battery_raw,
+                battery_percent,
+                charge_state,
+            },
+            warning,
+        ));
     }
 
     if failures.is_empty() && opened_interfaces > 0 && unsupported_interfaces == opened_interfaces {
         Err(QueryFailure::Unsupported)
     } else {
+        if Instant::now() >= overall_deadline {
+            failures.push("poll time budget exhausted".to_string());
+        }
+        if failures.is_empty() {
+            failures.push("no candidate interface produced a battery reading".to_string());
+        }
         Err(QueryFailure::Failed(anyhow::anyhow!(failures.join("; "))))
     }
+}
+
+fn probe_candidates_with_clock<T>(
+    candidate_count: usize,
+    overall_deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+    mut probe: impl FnMut(usize, Instant) -> Option<T>,
+) -> Option<T> {
+    for index in 0..candidate_count {
+        let current = now();
+        if current >= overall_deadline {
+            break;
+        }
+        let remaining_candidates = (candidate_count - index) as u32;
+        let candidate_deadline =
+            current + overall_deadline.saturating_duration_since(current) / remaining_candidates;
+        if let Some(result) = probe(index, candidate_deadline) {
+            return Some(result);
+        }
+    }
+    None
 }
 
 fn query_handle(
@@ -317,7 +359,8 @@ fn send_request_with<T: FeatureTransport>(
     let mut last_error = None;
 
     for attempt in 0..MAX_RETRIES {
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline || deadline.saturating_duration_since(now) < response_wait {
             last_error = Some(anyhow::anyhow!("poll time budget exhausted"));
             break;
         }
@@ -426,7 +469,8 @@ fn scale_percent(raw: u8) -> u8 {
 mod tests {
     use super::{
         FeatureTransport, MAX_RETRIES, QueryFailure, classify_error, format_error_chain,
-        record_query_result, scale_percent, send_request_with, update_cache_after_success,
+        probe_candidates_with_clock, record_query_result, scale_percent, send_request_with,
+        update_cache_after_success,
     };
     use crate::config::PidCache;
     use crate::hid::protocol::{
@@ -643,5 +687,48 @@ mod tests {
 
         assert_eq!(classify_error(&aggregate), PollErrorKind::AccessDenied);
         assert!(format_error_chain(&aggregate).contains("access denied by operating system"));
+    }
+
+    #[test]
+    fn review_hid_candidate_budget_reserves_fallback_windows() {
+        let started = Instant::now();
+        let clock = Cell::new(started);
+        let attempts = RefCell::new(Vec::new());
+
+        let found = probe_candidates_with_clock(
+            2,
+            started + Duration::from_secs(8),
+            || clock.get(),
+            |index, deadline| {
+                attempts.borrow_mut().push(index);
+                if index == 0 {
+                    assert_eq!(deadline, started + Duration::from_secs(4));
+                    clock.set(deadline);
+                    None
+                } else {
+                    assert_eq!(deadline, started + Duration::from_secs(8));
+                    Some(index)
+                }
+            },
+        );
+
+        assert_eq!(found, Some(1));
+        assert_eq!(*attempts.borrow(), vec![0, 1]);
+
+        let fast_clock = Cell::new(started);
+        let deadlines = RefCell::new(Vec::new());
+        let found = probe_candidates_with_clock(
+            2,
+            started + Duration::from_secs(8),
+            || fast_clock.get(),
+            |index, deadline| {
+                deadlines.borrow_mut().push(deadline);
+                (index == 1).then_some(index)
+            },
+        );
+
+        assert_eq!(found, Some(1));
+        assert_eq!(deadlines.borrow()[0], started + Duration::from_secs(4));
+        assert_eq!(deadlines.borrow()[1], started + Duration::from_secs(8));
     }
 }

@@ -18,6 +18,25 @@ struct Segment {
     started_raw: u8,
     last_at: Instant,
     lowest_raw: u8,
+    last_estimate: Option<TimedEstimate>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimedEstimate {
+    observed_at: Instant,
+    remaining: Duration,
+}
+
+impl Segment {
+    fn new(now: Instant, raw: u8) -> Self {
+        Self {
+            started_at: now,
+            started_raw: raw,
+            last_at: now,
+            lowest_raw: raw,
+            last_estimate: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -35,21 +54,11 @@ impl Forecaster {
         let segment = self
             .segments
             .entry(reading.device_key.clone())
-            .or_insert(Segment {
-                started_at: now,
-                started_raw: reading.battery_raw,
-                last_at: now,
-                lowest_raw: reading.battery_raw,
-            });
+            .or_insert_with(|| Segment::new(now, reading.battery_raw));
 
         let gap = now.saturating_duration_since(segment.last_at);
         if gap > MAX_SAMPLE_GAP || reading.battery_raw > segment.lowest_raw.saturating_add(2) {
-            *segment = Segment {
-                started_at: now,
-                started_raw: reading.battery_raw,
-                last_at: now,
-                lowest_raw: reading.battery_raw,
-            };
+            *segment = Segment::new(now, reading.battery_raw);
             return None;
         }
 
@@ -63,7 +72,18 @@ impl Forecaster {
 
         let seconds_per_raw = span.as_secs_f64() / f64::from(drop);
         let remaining_secs = (seconds_per_raw * f64::from(reading.battery_raw)) as u64;
-        let remaining = Duration::from_secs(remaining_secs).min(MAX_ESTIMATE);
+        let calculated = Duration::from_secs(remaining_secs).min(MAX_ESTIMATE);
+        let remaining = segment.last_estimate.map_or(calculated, |previous| {
+            calculated.min(
+                previous
+                    .remaining
+                    .saturating_sub(now.saturating_duration_since(previous.observed_at)),
+            )
+        });
+        segment.last_estimate = Some(TimedEstimate {
+            observed_at: now,
+            remaining,
+        });
         Some(Estimate { remaining })
     }
 }
@@ -197,5 +217,65 @@ mod tests {
             }),
             "~2 days left"
         );
+    }
+
+    #[test]
+    fn review_forecast_counts_down_across_quantized_plateaus() {
+        let now = Instant::now();
+        let mut forecaster = Forecaster::default();
+        forecaster.observe(&reading(200, ChargeState::NotCharging), now);
+        let first = forecaster
+            .observe(
+                &reading(190, ChargeState::NotCharging),
+                now + Duration::from_secs(60 * 60),
+            )
+            .expect("first estimate");
+        let plateau = forecaster
+            .observe(
+                &reading(190, ChargeState::NotCharging),
+                now + Duration::from_secs(2 * 60 * 60),
+            )
+            .expect("plateau estimate");
+        let faster_drop = forecaster
+            .observe(
+                &reading(180, ChargeState::NotCharging),
+                now + Duration::from_secs(150 * 60),
+            )
+            .expect("later estimate");
+
+        assert_eq!(first.remaining, Duration::from_secs(19 * 60 * 60));
+        assert_eq!(plateau.remaining, Duration::from_secs(18 * 60 * 60));
+        assert!(faster_drop.remaining <= plateau.remaining - Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn review_forecast_gap_reset_starts_an_independent_countdown() {
+        let now = Instant::now();
+        let mut forecaster = Forecaster::default();
+        forecaster.observe(&reading(200, ChargeState::NotCharging), now);
+        let first = forecaster
+            .observe(
+                &reading(100, ChargeState::NotCharging),
+                now + Duration::from_secs(60 * 60),
+            )
+            .expect("first estimate");
+        assert_eq!(first.remaining, Duration::from_secs(60 * 60));
+
+        assert_eq!(
+            forecaster.observe(
+                &reading(200, ChargeState::NotCharging),
+                now + Duration::from_secs(8 * 60 * 60),
+            ),
+            None
+        );
+        let reset = forecaster
+            .observe(
+                &reading(190, ChargeState::NotCharging),
+                now + Duration::from_secs(9 * 60 * 60),
+            )
+            .expect("reset estimate");
+
+        assert_eq!(reset.remaining, Duration::from_secs(19 * 60 * 60));
+        assert!(reset.remaining > first.remaining);
     }
 }
