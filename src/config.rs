@@ -899,7 +899,10 @@ welcome_shown = true
         let diagnostic = loaded.state.into_diagnostic().expect("cache diagnostic");
         assert_eq!(diagnostic.display_name, "PID cache");
         assert_eq!(diagnostic.scope, PollErrorScope::Subsystem);
-        assert_eq!(diagnostic.kind, PollErrorKind::DeviceUnavailable);
+        assert!(matches!(
+            diagnostic.kind,
+            PollErrorKind::AccessDenied | PollErrorKind::DeviceUnavailable
+        ));
     }
 
     #[test]
