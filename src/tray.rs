@@ -292,7 +292,7 @@ pub fn run_tray_app(config: AppConfig, startup_recovery: Option<ConfigRecovery>)
                     core.handle(AppEvent::PollStarted(id), Instant::now())
                 }
                 UserEvent::PollFinished(id, result) => {
-                    let (poll_errors, successful_ids, poll_completed) = match &result {
+                    let (poll_errors, successful_ids, allow_recovery) = match &result {
                         Ok(poll_result) => (
                             poll_result.errors.clone(),
                             poll_result
@@ -307,7 +307,7 @@ pub fn run_tray_app(config: AppConfig, startup_recovery: Option<ConfigRecovery>)
                     for notice in error_tracker.observe(
                         &poll_errors,
                         &successful_ids,
-                        poll_completed,
+                        allow_recovery,
                         Instant::now(),
                     ) {
                         log_error_notice(notice);
@@ -481,6 +481,7 @@ fn recovery_message(component: Option<SubsystemComponent>, scope: PollErrorScope
         (Some(SubsystemComponent::Hid), _) => "HID subsystem recovered",
         (Some(SubsystemComponent::PidCache), _) => "PID cache recovered",
         (None, PollErrorScope::Interface) => "interface fallback recovered",
+        (None, PollErrorScope::ProbeCoverage) => "interface coverage recovered",
         (None, _) => "device polling recovered",
     }
 }
@@ -814,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn review_round_25_recovery_wording_preserves_incident_scope() {
+    fn review_round_26_recovery_wording_preserves_incident_scope() {
         assert_eq!(
             recovery_message(
                 Some(SubsystemComponent::PidCache),
@@ -825,6 +826,10 @@ mod tests {
         assert_eq!(
             recovery_message(None, PollErrorScope::Interface),
             "interface fallback recovered"
+        );
+        assert_eq!(
+            recovery_message(None, PollErrorScope::ProbeCoverage),
+            "interface coverage recovered"
         );
     }
 }

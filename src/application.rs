@@ -542,7 +542,10 @@ fn append_diagnostics(text: &mut String, diagnostics: &[PollError]) {
             text.push_str(" - ");
             if error.scope == PollErrorScope::Subsystem {
                 text.push_str(&diagnostic_status(error));
-            } else if error.scope == PollErrorScope::Interface {
+            } else if matches!(
+                error.scope,
+                PollErrorScope::Interface | PollErrorScope::ProbeCoverage
+            ) {
                 text.push_str(poll_error_status(error.scope, error.kind));
             } else {
                 text.push_str(&error.display_name);
@@ -581,7 +584,11 @@ fn diagnostic_summary(diagnostics: &[PollError]) -> Option<String> {
         match &mut summary {
             Some(summary) => {
                 summary.push_str(" - ");
-                summary.push_str(&fallback);
+                summary.push_str(if device_count > 1 {
+                    "fallback interfaces in use"
+                } else {
+                    "fallback interface in use"
+                });
             }
             None => summary = Some(fallback),
         }
@@ -676,6 +683,9 @@ fn poll_error_status(scope: PollErrorScope, kind: crate::model::PollErrorKind) -
             "Battery reading unavailable - refresh to retry"
         }
         (PollErrorScope::Interface, _) => "Using a fallback interface - run --diagnose for details",
+        (PollErrorScope::ProbeCoverage, _) => {
+            "Some device interfaces were not checked - run --diagnose for details"
+        }
         (PollErrorScope::ChargeState, crate::model::PollErrorKind::AccessDenied) => {
             "Charging status access denied - check permissions and refresh"
         }
@@ -735,6 +745,9 @@ fn multi_device_poll_error_status(
             format!("Battery readings unavailable for {device_count} devices - refresh to retry")
         }
         (PollErrorScope::Interface, _) => interface_fallback_status(device_count),
+        (PollErrorScope::ProbeCoverage, _) => format!(
+            "Some interfaces were not checked for {device_count} devices - run --diagnose for details"
+        ),
         (PollErrorScope::ChargeState, crate::model::PollErrorKind::AccessDenied) => format!(
             "Charging status access denied for {device_count} devices - check permissions and refresh"
         ),
@@ -1725,5 +1738,44 @@ mod tests {
         assert!(!update.view.status_text.contains("access denied"));
         assert!(!update.view.status_text.contains("indeterminate"));
         assert_eq!(update.view.diagnostics, errors);
+    }
+
+    #[test]
+    fn review_round_26_partial_coverage_does_not_claim_fallback_use() {
+        let now = Instant::now();
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
+        let coverage = PollError {
+            device_key: "mouse".to_string(),
+            display_name: "Mouse mouse".to_string(),
+            pid: 1,
+            scope: PollErrorScope::ProbeCoverage,
+            component: None,
+            kind: PollErrorKind::Unknown,
+            message: "two candidate interfaces were not checked".to_string(),
+        };
+
+        let update = core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: vec![reading("mouse", 70)],
+                    errors: vec![coverage.clone()],
+                }),
+            ),
+            now,
+        );
+
+        assert!(matches!(
+            update.view.observation,
+            ObservationView::Fresh { reading } if reading.device_key == "mouse"
+        ));
+        assert!(
+            update
+                .view
+                .status_text
+                .contains("Some device interfaces were not checked")
+        );
+        assert!(!update.view.status_text.contains("fallback"));
+        assert_eq!(update.view.diagnostics, vec![coverage]);
     }
 }

@@ -1,5 +1,5 @@
 use hidapi::HidApi;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 
 pub const RAZER_VID: u16 = 0x1532;
@@ -67,7 +67,24 @@ pub fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
         );
     }
 
-    let mut out: Vec<DiscoveredDevice> = best_by_key
+    finalize_devices(best_by_key)
+}
+
+fn finalize_devices(mut devices: BTreeMap<String, DiscoveredDevice>) -> Vec<DiscoveredDevice> {
+    let serialized_pids = devices
+        .values()
+        .filter(|device| device.interface_grouping == InterfaceGrouping::VerifiedDevice)
+        .map(|device| device.pid)
+        .collect::<BTreeSet<_>>();
+    for device in devices.values_mut() {
+        if device.interface_grouping == InterfaceGrouping::SingleSerialless
+            && serialized_pids.contains(&device.pid)
+        {
+            device.interface_grouping = InterfaceGrouping::AmbiguousSerialless;
+        }
+    }
+
+    let mut out: Vec<DiscoveredDevice> = devices
         .into_values()
         .map(|mut device| {
             device.candidates.sort_by(|a, b| {
@@ -147,7 +164,7 @@ fn candidate_score(interface_number: i32, usage_page: u16, usage: u16) -> u8 {
 mod tests {
     use super::{
         InterfaceCandidate, InterfaceGrouping, add_interface, candidate_score, device_identity,
-        non_empty_text,
+        finalize_devices, non_empty_text,
     };
     use std::collections::BTreeMap;
     use std::ffi::CString;
@@ -244,6 +261,46 @@ mod tests {
         let device = devices.values().next().expect("device");
         assert_eq!(device.interface_grouping, InterfaceGrouping::VerifiedDevice);
         assert_eq!(device.candidates.len(), 2);
+    }
+
+    #[test]
+    fn review_round_26_mixed_serial_metadata_cannot_create_two_definitive_devices() {
+        let mut devices = BTreeMap::new();
+        add_interface(
+            &mut devices,
+            0x00BF,
+            Some("ABC123"),
+            "Mouse".to_string(),
+            candidate("physical-a-interface-0", 0),
+        );
+        add_interface(
+            &mut devices,
+            0x00BF,
+            None,
+            "Mouse".to_string(),
+            candidate("physical-a-interface-1", 1),
+        );
+
+        let devices = finalize_devices(devices);
+
+        assert_eq!(devices.len(), 2);
+        assert_eq!(
+            devices
+                .iter()
+                .filter(|device| {
+                    device.interface_grouping != InterfaceGrouping::AmbiguousSerialless
+                })
+                .count(),
+            1
+        );
+        let uncertain = devices
+            .iter()
+            .find(|device| device.key == "00BF")
+            .expect("serialless group");
+        assert_eq!(
+            uncertain.interface_grouping,
+            InterfaceGrouping::AmbiguousSerialless
+        );
     }
 
     #[test]

@@ -70,7 +70,7 @@ impl ErrorTracker {
         &mut self,
         errors: &[PollError],
         successful_device_ids: &BTreeSet<String>,
-        poll_completed: bool,
+        allow_recovery: bool,
         now: Instant,
     ) -> Vec<ErrorNotice> {
         let current: BTreeSet<ErrorKey> = errors.iter().map(ErrorKey::from).collect();
@@ -110,18 +110,22 @@ impl ErrorTracker {
         let absent: Vec<_> = self
             .active
             .keys()
-            .filter(|key| !current.contains(*key) && poll_completed)
+            .filter(|key| !current.contains(*key))
             .cloned()
             .collect();
         let mut recovered_incidents = BTreeSet::new();
         for key in absent {
             let replacement_is_active = current_incidents.contains(&key.incident);
-            let recovered = !replacement_is_active
+            let recovered = allow_recovery
+                && !replacement_is_active
                 && if key.incident.device_key.is_empty() {
                     true
                 } else {
                     successful_device_ids.contains(&key.incident.device_key)
                 };
+            if !replacement_is_active && !recovered {
+                continue;
+            }
             if let Some(active) = self.active.remove(&key) {
                 if recovered && recovered_incidents.insert(key.incident) {
                     notices.push(ErrorNotice::Recovered {
@@ -370,6 +374,40 @@ mod tests {
                 scope: PollErrorScope::Subsystem,
                 component: Some(crate::model::SubsystemComponent::PidCache),
             }]
+        );
+    }
+
+    #[test]
+    fn review_round_26_failed_events_retire_replaced_error_details() {
+        let now = Instant::now();
+        let mut tracker = ErrorTracker::default();
+        let no_success = std::collections::BTreeSet::new();
+        let mut first = PollError::subsystem("HID failure A");
+        first.kind = PollErrorKind::Unknown;
+        let mut second = PollError::subsystem("HID failure B");
+        second.kind = PollErrorKind::Unknown;
+
+        assert_eq!(
+            tracker.observe(std::slice::from_ref(&first), &no_success, false, now),
+            vec![ErrorNotice::Started(first.clone())]
+        );
+        assert_eq!(
+            tracker.observe(
+                std::slice::from_ref(&second),
+                &no_success,
+                false,
+                now + Duration::from_secs(60)
+            ),
+            vec![ErrorNotice::Started(second)]
+        );
+        assert_eq!(
+            tracker.observe(
+                std::slice::from_ref(&first),
+                &no_success,
+                false,
+                now + Duration::from_secs(120)
+            ),
+            vec![ErrorNotice::Started(first)]
         );
     }
 }

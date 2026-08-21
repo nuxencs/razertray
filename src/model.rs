@@ -90,6 +90,7 @@ impl fmt::Display for PollErrorKind {
 pub enum PollErrorScope {
     Device,
     Interface,
+    ProbeCoverage,
     ChargeState,
     Subsystem,
 }
@@ -115,6 +116,7 @@ impl fmt::Display for PollErrorScope {
         formatter.write_str(match self {
             Self::Device => "device",
             Self::Interface => "interface",
+            Self::ProbeCoverage => "probe-coverage",
             Self::ChargeState => "charge-state",
             Self::Subsystem => "subsystem",
         })

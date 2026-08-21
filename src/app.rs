@@ -26,6 +26,12 @@ pub enum OnceStatus {
     PartialFailure,
 }
 
+#[doc(hidden)]
+pub fn run_hid_worker() -> Result<()> {
+    HidApi::disable_device_discovery();
+    client::run_feature_worker()
+}
+
 pub fn run_once(output: OnceOutput) -> Result<OnceStatus> {
     let loaded = config::load_or_create_config()?;
     let cfg = loaded.config;

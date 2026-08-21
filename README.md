@@ -15,8 +15,8 @@ status. It reads HID feature reports directly. Razer Synapse is not required.
   Windows startup
 - Manual refresh and direct access to the app data folder
 - Automatic recovery from an invalid configuration file
-- HID interface fallback, transaction-ID probing, bounded retries, and cache
-  invalidation
+- Isolated HID interface opens, transaction-ID fallback, bounded retries, and
+  cache invalidation
 - Human-readable, JSON, and diagnostic command-line output
 
 ## Install and run
@@ -140,7 +140,8 @@ and retained as typed diagnostics in JSON, diagnostic output, and tray status.
   Multiple serialless interfaces with one PID remain in an explicit ambiguous
   group so legacy device preferences stay reachable. Responses from that group
   remain typed diagnostics instead of a battery reading that could silently
-  switch between physical devices.
+  switch between physical devices. Serialless interfaces also remain ambiguous
+  when another interface for the same PID reports a serial number.
 
 ## Development
 

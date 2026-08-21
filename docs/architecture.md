@@ -30,17 +30,19 @@ This split keeps the core testable without a Windows tray or physical hardware.
 
 The scanner groups serial-numbered HID interfaces by verified device identity.
 It marks multiple serialless interfaces with one PID as a typed ambiguous group
-with the legacy PID-only preference key. The client tries grouped candidates in
-a deterministic order. It tries a cached transaction ID, known device metadata,
-and bounded protocol fallbacks. Failed cached IDs are removed. Battery and
-charging queries aggregate relevant candidate results before declaring a state
-unsupported.
+with the legacy PID-only preference key. A serialless group also remains
+ambiguous when the same PID has a serialized group, so partial serial metadata
+cannot create a second definitive device. The client tries grouped candidates
+in a deterministic order. It tries a cached transaction ID, known device
+metadata, and bounded protocol fallbacks. Failed cached IDs are removed. Battery
+and charging queries aggregate relevant candidate results before declaring a
+state unsupported.
 Transport and protocol failures can retry within a per-device time budget. If
 the bounded candidate set is truncated, unsupported evidence remains partial.
-Each blocking feature exchange runs behind a timeout boundary. Timed-out native
-operations are isolated from the polling worker. A stable per-interface gate
-prevents later polls from starting more blocked work on the same path without
-denying healthy interfaces.
+Each interface open and feature exchange runs in a short-lived worker process.
+The polling worker terminates that process at the operation deadline, so a
+stalled driver call cannot retain handles, threads, or admission capacity. The
+next candidate or transaction ID then runs in fresh isolation.
 Verified devices try the battery-winning interface first for charging status,
 then bounded fallbacks. Ambiguous serialless groups retain probe results only as
 typed diagnostics, never as a definitive device reading. Excluded charge
@@ -55,16 +57,17 @@ to the rest of the app.
 values, charge-state uncertainty, typed error scopes and kinds, and readable
 devices in the same result. Independent transport failures remain separate
 diagnostics. When an interface fallback succeeds, those details retain
-interface scope while the tray shows one concise fallback warning. Subsystem
-diagnostics also carry a typed HID or PID-cache component identity. JSON output
-uses this type directly.
+interface scope while the tray shows one concise fallback warning. Candidate
+truncation has separate probe-coverage scope and never claims that a fallback
+was used. Subsystem diagnostics also carry a typed HID or PID-cache component
+identity. JSON output uses this type directly.
 
 The tray shows a bounded diagnostic summary. Logs and CLI or JSON output retain
 the complete typed details.
 
 Exact repeated errors are throttled in logs without collapsing distinct probe
-details. A later successful poll records recovery with device or subsystem
-component identity.
+details. Every completed event retires replaced details. A later successful
+poll records recovery with device or subsystem component identity.
 
 ## Forecast
 

@@ -7,6 +7,7 @@ use std::process::ExitCode;
 enum Mode {
     Tray,
     Once(OnceOutput),
+    HidWorker,
     Help,
     Version,
 }
@@ -63,6 +64,15 @@ fn main() -> ExitCode {
                 }
             };
         }
+        Mode::HidWorker => {
+            return match razertray::app::run_hid_worker() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("razertray HID worker: {error:#}");
+                    ExitCode::from(2)
+                }
+            };
+        }
         Mode::Tray => {}
     }
 
@@ -81,6 +91,7 @@ fn parse_mode(args: &[String]) -> Result<Mode, String> {
         [arg] if arg == "--once" => Ok(Mode::Once(OnceOutput::Human)),
         [arg] if arg == "--json" => Ok(Mode::Once(OnceOutput::Json)),
         [arg] if arg == "--diagnose" => Ok(Mode::Once(OnceOutput::Diagnose)),
+        [arg] if arg == "--hid-worker" => Ok(Mode::HidWorker),
         [arg] if arg == "--help" || arg == "-h" => Ok(Mode::Help),
         [arg] if arg == "--version" || arg == "-V" => Ok(Mode::Version),
         [arg] => Err(format!("Unknown argument: {arg}")),
@@ -118,5 +129,13 @@ mod tests {
         );
         assert!(parse_mode(&args(&["--json", "--once"])).is_err());
         assert!(parse_mode(&args(&["--unknown"])).is_err());
+    }
+
+    #[test]
+    fn review_round_26_hidden_hid_worker_mode_is_recognized() {
+        assert_eq!(
+            parse_mode(&args(&["--hid-worker"])).unwrap(),
+            Mode::HidWorker
+        );
     }
 }

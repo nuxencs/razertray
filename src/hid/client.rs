@@ -10,10 +10,11 @@ use crate::model::{
     BatteryState, ChargeState, PollError, PollErrorKind, PollErrorScope, PollResult,
 };
 use anyhow::{Context, Result};
-use hidapi::{HidApi, HidDevice};
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex, mpsc};
+use hidapi::HidApi;
+use serde::{Deserialize, Serialize};
+use std::ffi::CString;
+use std::io::{Read, Write};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,9 +24,6 @@ const DEVICE_POLL_BUDGET: Duration = Duration::from_secs(8);
 const FEATURE_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const SEND_DELAY: Duration = Duration::from_millis(60);
 const RETRY_DELAY: Duration = Duration::from_millis(400);
-
-static ACTIVE_FEATURE_PATHS: LazyLock<Mutex<HashSet<Vec<u8>>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 pub struct PollBatch {
     pub result: PollResult,
@@ -41,6 +39,10 @@ enum QueryFailure {
     Failed {
         errors: Vec<anyhow::Error>,
     },
+    ProbeCoverage {
+        failure: Box<QueryFailure>,
+        omitted: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +56,7 @@ struct ProbeSuccess {
     candidate_index: usize,
     transaction_id: u8,
     report: RazerReport,
+    interface_failures: Vec<anyhow::Error>,
 }
 
 pub fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollBatch {
@@ -62,7 +65,7 @@ pub fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollBatch {
     let mut cache_changed = false;
 
     for device in discovered {
-        let query = query_device(api, &device, pid_cache, &mut cache_changed);
+        let query = query_device(&device, pid_cache, &mut cache_changed);
         record_query_result(&mut result, &device, query);
     }
 
@@ -78,6 +81,10 @@ fn record_query_result(
     device: &DiscoveredDevice,
     query: std::result::Result<(BatteryState, Vec<PollError>), QueryFailure>,
 ) {
+    let (query, omitted) = match query {
+        Err(QueryFailure::ProbeCoverage { failure, omitted }) => (Err(*failure), omitted),
+        query => (query, 0),
+    };
     let ambiguous = device.interface_grouping.is_ambiguous();
     if ambiguous {
         result.errors.push(PollError {
@@ -129,51 +136,38 @@ fn record_query_result(
         Err(QueryFailure::Failed { errors }) => result
             .errors
             .extend(errors.into_iter().map(|error| poll_error(device, error))),
+        Err(QueryFailure::ProbeCoverage { .. }) => unreachable!(),
+    }
+    if omitted > 0 {
+        result.errors.extend(coverage_warnings(device, omitted));
     }
 }
 
 fn query_device(
-    api: &HidApi,
     device: &DiscoveredDevice,
     pid_cache: &mut PidCache,
     cache_changed: &mut bool,
 ) -> std::result::Result<(BatteryState, Vec<PollError>), QueryFailure> {
     let known = device_map::known_device_support(device.pid);
     let display_name = display_name(device);
-    let (candidates, truncation_warning) = candidate_probe_plan(&device.candidates);
-    let mut failures: Vec<_> = truncation_warning
-        .into_iter()
-        .map(anyhow::Error::msg)
-        .collect();
+    let candidate_plan = candidate_probe_plan(&device.candidates);
     let overall_deadline = Instant::now() + DEVICE_POLL_BUDGET;
-    let mut transports = Vec::new();
-    for candidate in candidates {
-        if Instant::now() >= overall_deadline {
-            failures.push(anyhow::anyhow!(
-                "poll time budget exhausted while opening interfaces"
-            ));
-            break;
-        }
-        match api.open_path(candidate.path.as_c_str()) {
-            Ok(handle) => match HidTransport::new(handle, candidate.path.to_bytes().to_vec()) {
-                Ok(transport) => transports.push((candidate.interface_number, transport)),
-                Err(err) => failures.push(anyhow::anyhow!(
-                    "interface {} transport unavailable: {err:#}",
-                    candidate.interface_number
-                )),
-            },
-            Err(err) => failures.push(anyhow::anyhow!(
-                "interface {} could not be opened: {err}",
-                candidate.interface_number
-            )),
-        }
-    }
+    let mut transports = candidate_plan
+        .candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.interface_number,
+                ProcessTransport::new(candidate.path.to_bytes().to_vec()),
+            )
+        })
+        .collect::<Vec<_>>();
 
     if transports.is_empty() {
         if pid_cache.get(device.pid).is_some() {
             *cache_changed |= pid_cache.remove(device.pid);
         }
-        return Err(no_open_transport_failure(failures));
+        return Err(no_candidate_transport_failure(Vec::new()));
     }
 
     let cached = pid_cache.get(device.pid);
@@ -190,13 +184,14 @@ fn query_device(
         candidate_index,
         transaction_id,
         report: battery_report,
+        interface_failures,
     } = match battery_probe {
         Ok(found) => found,
         Err(failure) => {
             if cached.is_some() {
                 *cache_changed |= pid_cache.remove(device.pid);
             }
-            return Err(merge_query_failure(failure, failures));
+            return Err(with_probe_coverage(failure, candidate_plan.omitted));
         }
     };
     let observed_at = Instant::now();
@@ -206,7 +201,8 @@ fn query_device(
         update_cache_after_success(pid_cache, device.pid, cached, generated, transaction_id);
     let battery_raw = battery_report.arguments[1];
     let battery_percent = scale_percent(battery_raw);
-    let mut warnings = device_transport_warnings(device, failures);
+    let mut warnings =
+        successful_probe_warnings(device, interface_failures, candidate_plan.omitted);
     let (charge_state, charge_warnings) =
         if known.is_some_and(|support| !support.supports_charging_status) {
             (ChargeState::Unsupported, Vec::new())
@@ -239,17 +235,27 @@ fn query_device(
     ))
 }
 
-fn device_transport_warnings(
+fn successful_probe_warnings(
     device: &DiscoveredDevice,
-    failures: Vec<anyhow::Error>,
+    interface_failures: Vec<anyhow::Error>,
+    omitted: usize,
 ) -> Vec<PollError> {
-    failures
+    let mut warnings = interface_failures
         .into_iter()
         .map(|error| scoped_poll_error(device, PollErrorScope::Interface, error))
+        .collect::<Vec<_>>();
+    warnings.extend(coverage_warnings(device, omitted));
+    warnings
+}
+
+fn coverage_warnings(device: &DiscoveredDevice, omitted: usize) -> Vec<PollError> {
+    coverage_failures(omitted)
+        .into_iter()
+        .map(|error| scoped_poll_error(device, PollErrorScope::ProbeCoverage, error))
         .collect()
 }
 
-fn no_open_transport_failure(mut failures: Vec<anyhow::Error>) -> QueryFailure {
+fn no_candidate_transport_failure(mut failures: Vec<anyhow::Error>) -> QueryFailure {
     if failures.is_empty() {
         failures.push(anyhow::anyhow!(
             "candidate interfaces unavailable for battery query"
@@ -263,8 +269,17 @@ fn charge_query_result(
     query: std::result::Result<ProbeSuccess, QueryFailure>,
 ) -> (ChargeState, Vec<PollError>) {
     match query {
-        Ok(success) if success.report.arguments[1] > 0 => (ChargeState::Charging, Vec::new()),
-        Ok(_) => (ChargeState::NotCharging, Vec::new()),
+        Ok(success) => {
+            let state = if success.report.arguments[1] > 0 {
+                ChargeState::Charging
+            } else {
+                ChargeState::NotCharging
+            };
+            (
+                state,
+                successful_probe_warnings(device, success.interface_failures, 0),
+            )
+        }
         Err(QueryFailure::Unsupported {
             evidence: UnsupportedEvidence::Conclusive,
             auxiliary,
@@ -304,6 +319,9 @@ fn charge_query_result(
                 .collect();
             (ChargeState::Unavailable, warnings)
         }
+        Err(QueryFailure::ProbeCoverage { failure, .. }) => {
+            charge_query_result(device, Err(*failure))
+        }
     }
 }
 
@@ -326,15 +344,51 @@ fn merge_query_failure(failure: QueryFailure, mut auxiliary: Vec<anyhow::Error>)
             auxiliary.extend(errors);
             QueryFailure::Failed { errors: auxiliary }
         }
+        QueryFailure::ProbeCoverage { failure, omitted } => QueryFailure::ProbeCoverage {
+            failure: Box::new(merge_query_failure(*failure, auxiliary)),
+            omitted,
+        },
     }
 }
 
-fn candidate_probe_plan<T>(candidates: &[T]) -> (&[T], Option<String>) {
+fn with_probe_coverage(failure: QueryFailure, omitted: usize) -> QueryFailure {
+    if omitted == 0 {
+        return failure;
+    }
+    let failure = match failure {
+        QueryFailure::Unsupported { auxiliary, .. } => QueryFailure::Unsupported {
+            evidence: UnsupportedEvidence::Partial,
+            auxiliary,
+        },
+        failure => failure,
+    };
+    QueryFailure::ProbeCoverage {
+        failure: Box::new(failure),
+        omitted,
+    }
+}
+
+struct CandidateProbePlan<'a, T> {
+    candidates: &'a [T],
+    omitted: usize,
+}
+
+fn candidate_probe_plan<T>(candidates: &[T]) -> CandidateProbePlan<'_, T> {
     let attempted = candidates.len().min(MAX_CANDIDATES_PER_DEVICE);
     let omitted = candidates.len() - attempted;
-    let warning = (omitted > 0)
-        .then(|| format!("{omitted} candidate interface(s) skipped by the bounded probe limit"));
-    (&candidates[..attempted], warning)
+    CandidateProbePlan {
+        candidates: &candidates[..attempted],
+        omitted,
+    }
+}
+
+fn coverage_failures(omitted: usize) -> Vec<anyhow::Error> {
+    (omitted > 0)
+        .then(|| {
+            anyhow::anyhow!("{omitted} candidate interface(s) skipped by the bounded probe limit")
+        })
+        .into_iter()
+        .collect()
 }
 
 fn prioritize_probe_candidate<T>(candidates: &mut [T], candidate_index: usize) {
@@ -367,6 +421,10 @@ fn mark_unsupported_incomplete(failure: QueryFailure, incomplete: bool) -> Query
         } if incomplete => QueryFailure::Unsupported {
             evidence: UnsupportedEvidence::Partial,
             auxiliary,
+        },
+        QueryFailure::ProbeCoverage { failure, omitted } => QueryFailure::ProbeCoverage {
+            failure: Box::new(mark_unsupported_incomplete(*failure, incomplete)),
+            omitted,
         },
         failure => failure,
     }
@@ -432,25 +490,47 @@ fn probe_request_with<T: FeatureTransport, F: Fn(u8) -> RazerReport>(
                 }
 
                 let request = build_request(transaction_id);
-                let operation_timeout =
-                    FEATURE_IO_TIMEOUT.min(deadline.saturating_duration_since(now));
-                states[target_index] = match attempt_request_with(
-                    transport,
-                    &request,
-                    response_wait,
-                    operation_timeout,
-                ) {
+                let remaining_targets = (target_index..target_count)
+                    .filter(|index| states[*index].is_active())
+                    .count()
+                    .max(1);
+                let fair_timeout = deadline.saturating_duration_since(now)
+                    / u32::try_from(remaining_targets).unwrap_or(u32::MAX);
+                let operation_timeout = FEATURE_IO_TIMEOUT.min(fair_timeout);
+                let attempt =
+                    attempt_request_with(transport, &request, response_wait, operation_timeout);
+                match attempt {
                     RequestAttempt::Success(report) => {
+                        let interface_failures = candidates[..candidate_index]
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(failed_index, (interface_number, _))| {
+                                let state_index =
+                                    transaction_index * candidates.len() + failed_index;
+                                fallback_interface_error(
+                                    &states[state_index],
+                                    *interface_number,
+                                    transaction_id,
+                                )
+                            })
+                            .collect();
                         return Ok(ProbeSuccess {
                             candidate_index,
                             transaction_id,
                             report,
+                            interface_failures,
                         });
                     }
-                    RequestAttempt::Retry(err) => ProbeState::Retry(err),
-                    RequestAttempt::Failed(err) => ProbeState::Failed(err),
-                    RequestAttempt::Unsupported => ProbeState::Unsupported,
-                };
+                    RequestAttempt::Retry(err) => {
+                        states[target_index] = ProbeState::Retry(err);
+                    }
+                    RequestAttempt::Failed(err) => {
+                        states[target_index] = ProbeState::Failed(err);
+                    }
+                    RequestAttempt::Unsupported => {
+                        states[target_index] = ProbeState::Unsupported;
+                    }
+                }
             }
         }
 
@@ -508,6 +588,23 @@ fn probe_request_with<T: FeatureTransport, F: Fn(u8) -> RazerReport>(
     Err(QueryFailure::Failed { errors: failures })
 }
 
+fn fallback_interface_error(
+    state: &ProbeState,
+    interface_number: i32,
+    transaction_id: u8,
+) -> Option<anyhow::Error> {
+    match state {
+        ProbeState::Retry(error) | ProbeState::Failed(error) => Some(anyhow::anyhow!(
+            "interface {interface_number}, tx 0x{transaction_id:02X}: {}",
+            format_error_chain(error)
+        )),
+        ProbeState::Unsupported => Some(anyhow::anyhow!(
+            "interface {interface_number}, tx 0x{transaction_id:02X}: device returned STATUS_NOT_SUPPORTED"
+        )),
+        ProbeState::Pending => None,
+    }
+}
+
 fn update_cache_after_success(
     pid_cache: &mut PidCache,
     pid: u16,
@@ -536,103 +633,31 @@ trait FeatureTransport {
     fn pause(&self, duration: Duration);
 }
 
-trait BlockingFeatureDevice: Send + 'static {
-    fn exchange_blocking(
-        &self,
-        request: &[u8],
-        response: &mut [u8],
-        response_wait: Duration,
-    ) -> Result<usize>;
-}
-
-impl BlockingFeatureDevice for HidDevice {
-    fn exchange_blocking(
-        &self,
-        request: &[u8],
-        response: &mut [u8],
-        response_wait: Duration,
-    ) -> Result<usize> {
-        self.send_feature_report(request)
-            .context("send_feature_report failed")?;
-        thread::sleep(response_wait);
-        self.get_feature_report(response)
-            .context("get_feature_report failed")
-    }
-}
-
-struct FeatureCommand {
+#[derive(Debug, Deserialize, Serialize)]
+struct FeatureWorkerRequest {
+    path: Vec<u8>,
     request: Vec<u8>,
     response: Vec<u8>,
-    response_wait: Duration,
-    reply: mpsc::Sender<Result<(usize, Vec<u8>)>>,
+    response_wait_ms: u64,
 }
 
-struct FeatureOperationPermit {
+#[derive(Debug, Deserialize, Serialize)]
+enum FeatureWorkerReply {
+    Success { count: usize, response: Vec<u8> },
+    Failure { message: String },
+}
+
+struct ProcessTransport {
     path: Vec<u8>,
 }
 
-impl FeatureOperationPermit {
-    fn acquire(path: &[u8]) -> Option<Self> {
-        let mut active = ACTIVE_FEATURE_PATHS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let path = path.to_vec();
-        if active.insert(path.clone()) {
-            Some(Self { path })
-        } else {
-            None
-        }
+impl ProcessTransport {
+    fn new(path: Vec<u8>) -> Self {
+        Self { path }
     }
 }
 
-impl Drop for FeatureOperationPermit {
-    fn drop(&mut self) {
-        ACTIVE_FEATURE_PATHS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.path);
-    }
-}
-
-struct HidTransport {
-    commands: mpsc::Sender<FeatureCommand>,
-    timed_out: AtomicBool,
-}
-
-impl HidTransport {
-    fn new<D: BlockingFeatureDevice>(device: D, path: Vec<u8>) -> Result<Self> {
-        let (commands, receiver) = mpsc::channel::<FeatureCommand>();
-        thread::Builder::new()
-            .name("razertray-hid-feature".to_string())
-            .spawn(move || {
-                while let Ok(command) = receiver.recv() {
-                    let result = match FeatureOperationPermit::acquire(&path) {
-                        Some(_permit) => {
-                            let mut response = command.response;
-                            device
-                                .exchange_blocking(
-                                    &command.request,
-                                    &mut response,
-                                    command.response_wait,
-                                )
-                                .map(|count| (count, response))
-                        }
-                        None => Err(anyhow::anyhow!(
-                            "HID feature operation unavailable because this interface remains blocked"
-                        )),
-                    };
-                    let _ = command.reply.send(result);
-                }
-            })
-            .context("failed spawning HID feature worker")?;
-        Ok(Self {
-            commands,
-            timed_out: AtomicBool::new(false),
-        })
-    }
-}
-
-impl FeatureTransport for HidTransport {
+impl FeatureTransport for ProcessTransport {
     fn exchange(
         &self,
         request: &[u8],
@@ -640,40 +665,121 @@ impl FeatureTransport for HidTransport {
         response_wait: Duration,
         operation_timeout: Duration,
     ) -> Result<usize> {
-        if self.timed_out.load(Ordering::Acquire) {
-            anyhow::bail!("HID feature transport unavailable after a timed-out operation");
-        }
-        let (reply, receiver) = mpsc::channel();
-        self.commands
-            .send(FeatureCommand {
-                request: request.to_vec(),
-                response: response.to_vec(),
-                response_wait,
-                reply,
-            })
-            .context("HID feature worker unavailable")?;
-        match receiver.recv_timeout(operation_timeout) {
-            Ok(result) => {
-                let (count, received) = result?;
+        let request = FeatureWorkerRequest {
+            path: self.path.clone(),
+            request: request.to_vec(),
+            response: response.to_vec(),
+            response_wait_ms: response_wait.as_millis().try_into().unwrap_or(u64::MAX),
+        };
+        match run_feature_worker_process(&request, operation_timeout)? {
+            FeatureWorkerReply::Success {
+                count,
+                response: received,
+            } => {
+                if received.len() != response.len() {
+                    anyhow::bail!(
+                        "HID feature worker returned {} bytes of storage, expected {}",
+                        received.len(),
+                        response.len()
+                    );
+                }
                 response.copy_from_slice(&received);
                 Ok(count)
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.timed_out.store(true, Ordering::Release);
-                anyhow::bail!(
-                    "HID feature operation unavailable after timing out at {} ms",
-                    operation_timeout.as_millis()
-                )
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("HID feature worker unavailable")
-            }
+            FeatureWorkerReply::Failure { message } => anyhow::bail!(message),
         }
     }
 
     fn pause(&self, duration: Duration) {
         thread::sleep(duration);
     }
+}
+
+fn run_feature_worker_process(
+    request: &FeatureWorkerRequest,
+    timeout: Duration,
+) -> Result<FeatureWorkerReply> {
+    let executable = std::env::current_exe().context("failed resolving HID worker executable")?;
+    let child = Command::new(executable)
+        .arg("--hid-worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed starting HID worker process")?;
+    let input = serde_json::to_vec(request).context("failed encoding HID worker request")?;
+    let output = collect_child_output(child, &input, timeout)?;
+    serde_json::from_slice(&output).context("failed decoding HID worker response")
+}
+
+fn collect_child_output(mut child: Child, input: &[u8], timeout: Duration) -> Result<Vec<u8>> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("HID worker stdin was unavailable")?;
+    stdin
+        .write_all(input)
+        .context("failed sending HID worker request")?;
+    drop(stdin);
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("failed waiting for HID worker")? {
+            let mut output = Vec::new();
+            child
+                .stdout
+                .take()
+                .context("HID worker stdout was unavailable")?
+                .read_to_end(&mut output)
+                .context("failed reading HID worker response")?;
+            if !status.success() {
+                anyhow::bail!("HID worker exited with {status}");
+            }
+            return Ok(output);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "HID operation unavailable after timing out at {} ms",
+                timeout.as_millis()
+            );
+        }
+        thread::sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(now)));
+    }
+}
+
+pub(crate) fn run_feature_worker() -> Result<()> {
+    let request: FeatureWorkerRequest =
+        serde_json::from_reader(std::io::stdin().lock()).context("invalid HID worker request")?;
+    let reply = match execute_feature_worker_request(request) {
+        Ok((count, response)) => FeatureWorkerReply::Success { count, response },
+        Err(error) => FeatureWorkerReply::Failure {
+            message: format_error_chain(&error),
+        },
+    };
+    serde_json::to_writer(std::io::stdout().lock(), &reply)
+        .context("failed writing HID worker response")?;
+    Ok(())
+}
+
+fn execute_feature_worker_request(request: FeatureWorkerRequest) -> Result<(usize, Vec<u8>)> {
+    let path = CString::new(request.path).context("invalid HID interface path")?;
+    let api = HidApi::new().context("failed initializing HID access")?;
+    let device = api
+        .open_path(path.as_c_str())
+        .context("could not open HID interface")?;
+    device
+        .send_feature_report(&request.request)
+        .context("send_feature_report failed")?;
+    thread::sleep(Duration::from_millis(request.response_wait_ms));
+    let mut response = request.response;
+    let count = device
+        .get_feature_report(&mut response)
+        .context("get_feature_report failed")?;
+    Ok((count, response))
 }
 
 enum RequestAttempt {
@@ -798,11 +904,12 @@ fn scale_percent(raw: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockingFeatureDevice, FeatureTransport, HidTransport, MAX_RETRIES, QueryFailure,
-        UnsupportedEvidence, candidate_probe_plan, charge_probe_plan, charge_query_result,
-        device_transport_warnings, display_name, format_error_chain, mark_unsupported_incomplete,
-        merge_query_failure, no_open_transport_failure, prioritize_probe_candidate,
-        probe_request_with, record_query_result, scale_percent, update_cache_after_success,
+        FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence, candidate_probe_plan,
+        charge_probe_plan, charge_query_result, collect_child_output, display_name,
+        format_error_chain, mark_unsupported_incomplete, merge_query_failure,
+        no_candidate_transport_failure, prioritize_probe_candidate, probe_request_with,
+        record_query_result, scale_percent, successful_probe_warnings, update_cache_after_success,
+        with_probe_coverage,
     };
     use crate::config::PidCache;
     use crate::hid::protocol::{
@@ -882,34 +989,29 @@ mod tests {
         fn pause(&self, _duration: Duration) {}
     }
 
-    struct SlowFeatureDevice {
-        started: std::sync::mpsc::Sender<()>,
+    struct TransactionFallbackTransport {
+        attempts: RefCell<Vec<u8>>,
     }
 
-    impl BlockingFeatureDevice for SlowFeatureDevice {
-        fn exchange_blocking(
+    impl FeatureTransport for TransactionFallbackTransport {
+        fn exchange(
             &self,
-            _request: &[u8],
+            request: &[u8],
             response: &mut [u8],
             _response_wait: Duration,
+            _operation_timeout: Duration,
         ) -> Result<usize> {
-            let _ = self.started.send(());
-            std::thread::sleep(Duration::from_millis(500));
-            Ok(response.len())
+            let transaction_id = request[2];
+            self.attempts.borrow_mut().push(transaction_id);
+            if transaction_id == 0x1F {
+                bail!("isolated HID operation timed out")
+            }
+            let bytes = feature_response(transaction_id, 180);
+            response.copy_from_slice(&bytes);
+            Ok(bytes.len())
         }
-    }
 
-    struct FastFeatureDevice;
-
-    impl BlockingFeatureDevice for FastFeatureDevice {
-        fn exchange_blocking(
-            &self,
-            _request: &[u8],
-            response: &mut [u8],
-            _response_wait: Duration,
-        ) -> Result<usize> {
-            Ok(response.len())
-        }
+        fn pause(&self, _duration: Duration) {}
     }
 
     fn feature_response_with_status(transaction_id: u8, battery_raw: u8, status: u8) -> Vec<u8> {
@@ -995,64 +1097,35 @@ mod tests {
     }
 
     #[test]
-    fn review_round_25_stalled_interface_does_not_starve_healthy_interfaces() {
-        let stalled_path = b"review-round-25-stalled".to_vec();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let transport = HidTransport::new(
-            SlowFeatureDevice {
-                started: started_tx,
-            },
-            stalled_path.clone(),
-        )
-        .expect("start feature worker");
-        let mut response = [0; FEATURE_REPORT_LENGTH];
+    fn review_round_26_worker_process_timeout_terminates_isolated_operation() {
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "hid::client::tests::review_round_26_timeout_child",
+                "--ignored",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start isolated child");
         let started = Instant::now();
 
-        let error = transport
-            .exchange(
-                &[0; FEATURE_REPORT_LENGTH],
-                &mut response,
-                Duration::ZERO,
-                Duration::from_millis(20),
-            )
-            .expect_err("slow feature operation should time out");
+        let error = collect_child_output(child, &[], Duration::from_millis(20))
+            .expect_err("slow isolated operation should time out");
 
         assert!(started.elapsed() < Duration::from_millis(250));
         assert!(format!("{error:#}").contains("timing out"));
-        started_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("native operation started");
-
-        let same_path = HidTransport::new(FastFeatureDevice, stalled_path)
-            .expect("start same-path feature worker");
-        let same_path_error = same_path
-            .exchange(
-                &[0; FEATURE_REPORT_LENGTH],
-                &mut response,
-                Duration::ZERO,
-                Duration::from_millis(100),
-            )
-            .expect_err("same path should remain isolated");
-        assert!(format!("{same_path_error:#}").contains("this interface remains blocked"));
-
-        let healthy_path =
-            HidTransport::new(FastFeatureDevice, b"review-round-25-healthy".to_vec())
-                .expect("start healthy feature worker");
-        assert_eq!(
-            healthy_path
-                .exchange(
-                    &[0; FEATURE_REPORT_LENGTH],
-                    &mut response,
-                    Duration::ZERO,
-                    Duration::from_millis(100),
-                )
-                .expect("healthy path should remain available"),
-            FEATURE_REPORT_LENGTH
-        );
     }
 
     #[test]
-    fn review_round_25_successful_fallback_keeps_interface_scope_and_details() {
+    #[ignore]
+    fn review_round_26_timeout_child() {
+        std::thread::sleep(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn review_round_26_successful_fallback_keeps_interface_scope_and_details() {
         let device = DiscoveredDevice {
             key: "mouse".to_string(),
             pid: 0xFFFF,
@@ -1060,11 +1133,12 @@ mod tests {
             interface_grouping: InterfaceGrouping::VerifiedDevice,
             candidates: Vec::new(),
         };
-        let mut warnings = device_transport_warnings(
+        let mut warnings = successful_probe_warnings(
             &device,
             vec![anyhow::anyhow!(
                 "interface 1 could not be opened: access denied"
             )],
+            0,
         );
         let (_, charge_warnings) = charge_query_result(
             &device,
@@ -1216,7 +1290,7 @@ mod tests {
         record_query_result(
             &mut result,
             &device,
-            Err(no_open_transport_failure(vec![anyhow::anyhow!(
+            Err(no_candidate_transport_failure(vec![anyhow::anyhow!(
                 "interface 2 could not be opened: access denied"
             )])),
         );
@@ -1410,6 +1484,27 @@ mod tests {
     }
 
     #[test]
+    fn review_round_26_timeout_advances_to_next_transaction_in_fresh_isolation() {
+        let transport = TransactionFallbackTransport {
+            attempts: RefCell::new(Vec::new()),
+        };
+        let candidates = [(0, transport)];
+
+        let success = probe_request_with(
+            &candidates,
+            &[0x1F, 0x3F, 0xFF],
+            build_battery_request,
+            Duration::ZERO,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("later transaction should run after isolated timeout");
+
+        assert_eq!(success.transaction_id, 0x3F);
+        assert_eq!(success.report.arguments[1], 180);
+        assert_eq!(*candidates[0].1.attempts.borrow(), vec![0x1F, 0x3F]);
+    }
+
+    #[test]
     fn review_hid_preserves_all_unsupported_probe_result() {
         let unsupported_replies = || {
             [0x1F, 0x3F, 0xFF]
@@ -1526,7 +1621,9 @@ mod tests {
         let (state, warnings) = charge_query_result(&device, query);
 
         assert_eq!(state, crate::model::ChargeState::Charging);
-        assert!(warnings.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].scope, PollErrorScope::Interface);
+        assert!(warnings[0].message.contains("interface 0"));
         assert_eq!(candidates[0].1.attempts.get(), 1);
         assert_eq!(candidates[1].1.attempts.get(), 1);
     }
@@ -1727,20 +1824,20 @@ mod tests {
             candidates: Vec::new(),
         };
         let candidates = [0, 1, 2, 3, 4];
-        let (attempted, warning) = candidate_probe_plan(&candidates);
-        let warning = warning.expect("fifth candidate is omitted");
-        let failure = merge_query_failure(
+        let plan = candidate_probe_plan(&candidates);
+        let failure = with_probe_coverage(
             QueryFailure::Unsupported {
                 evidence: UnsupportedEvidence::Conclusive,
                 auxiliary: Vec::new(),
             },
-            vec![anyhow::Error::msg(warning)],
+            plan.omitted,
         );
         let mut result = PollResult::default();
 
         record_query_result(&mut result, &device, Err(failure));
 
-        assert_eq!(attempted, &[0, 1, 2, 3]);
+        assert_eq!(plan.candidates, &[0, 1, 2, 3]);
+        assert_eq!(plan.omitted, 1);
         assert_eq!(result.errors[0].kind, PollErrorKind::PartialUnsupported);
         assert!(
             result.errors[0]
@@ -1748,6 +1845,24 @@ mod tests {
                 .contains("one or more battery probes")
         );
         assert!(result.errors[1].message.contains("1 candidate interface"));
+        assert_eq!(result.errors[1].scope, PollErrorScope::ProbeCoverage);
+    }
+
+    #[test]
+    fn review_round_26_candidate_truncation_is_coverage_not_fallback() {
+        let device = DiscoveredDevice {
+            key: "mouse".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::VerifiedDevice,
+            candidates: Vec::new(),
+        };
+
+        let warnings = successful_probe_warnings(&device, Vec::new(), 2);
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].scope, PollErrorScope::ProbeCoverage);
+        assert!(warnings[0].message.contains("2 candidate interface"));
     }
 
     #[test]
