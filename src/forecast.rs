@@ -154,6 +154,7 @@ mod tests {
             battery_raw: raw,
             battery_percent: (u16::from(raw) * 100 / 255) as u8,
             charge_state,
+            observed_at: None,
         }
     }
 

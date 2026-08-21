@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::fmt;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -24,6 +25,8 @@ pub struct BatteryState {
     pub battery_raw: u8,
     pub battery_percent: u8,
     pub charge_state: ChargeState,
+    #[serde(skip)]
+    pub(crate) observed_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -110,11 +113,18 @@ pub struct PollError {
 
 impl PollError {
     pub(crate) fn subsystem(message: impl Into<String>) -> Self {
+        Self::subsystem_component("HID subsystem", message)
+    }
+
+    pub(crate) fn subsystem_component(
+        display_name: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         let message = message.into();
         let kind = PollErrorKind::classify_message(&message);
         Self {
             device_key: String::new(),
-            display_name: "HID subsystem".to_string(),
+            display_name: display_name.into(),
             pid: 0,
             scope: PollErrorScope::Subsystem,
             kind,

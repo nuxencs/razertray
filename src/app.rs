@@ -34,13 +34,17 @@ pub fn run_once(output: OnceOutput) -> Result<OnceStatus> {
         eprintln!("Warning: {}", recovery.message());
     }
 
-    let mut cache = config::load_or_create_pid_cache()?;
+    let cache_load = config::load_pid_cache_for_polling();
+    let mut cache = cache_load.cache;
     let batch = poll_batch_or_diagnostic(
         HidApi::new()
             .context("failed to initialize hidapi")
             .map(|api| client::poll_devices(&api, &mut cache)),
     );
     let mut result = batch.result;
+    if let Some(diagnostic) = cache_load.diagnostic {
+        result.errors.push(diagnostic);
+    }
     if batch.cache_changed {
         record_cache_save_result(&mut result, config::save_pid_cache(&cache));
     }
@@ -93,14 +97,9 @@ fn record_cache_save_result(result: &mut PollResult, save_result: Result<()>) {
         return;
     };
     let message = format!("failed saving PID cache: {error:#}");
-    result.errors.push(PollError {
-        device_key: String::new(),
-        display_name: "PID cache".to_string(),
-        pid: 0,
-        scope: crate::model::PollErrorScope::Subsystem,
-        kind: crate::model::PollErrorKind::classify_message(&message),
-        message,
-    });
+    result
+        .errors
+        .push(PollError::subsystem_component("PID cache", message));
 }
 
 fn write_poll_errors(
@@ -346,6 +345,7 @@ mod tests {
                 battery_raw: 128,
                 battery_percent: 50,
                 charge_state: ChargeState::NotCharging,
+                observed_at: None,
             }],
             errors: Vec::new(),
         };

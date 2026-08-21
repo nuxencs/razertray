@@ -1,4 +1,5 @@
 use crate::APP_ID;
+use crate::model::PollError;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
@@ -83,6 +84,12 @@ impl Default for AppConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PidCache {
     pub transaction_ids: BTreeMap<String, u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PidCacheLoad {
+    pub cache: PidCache,
+    pub diagnostic: Option<PollError>,
 }
 
 impl PidCache {
@@ -342,6 +349,27 @@ pub fn load_or_create_pid_cache() -> Result<PidCache> {
     load_or_create_pid_cache_at(&path)
 }
 
+pub fn load_pid_cache_for_polling() -> PidCacheLoad {
+    let path = pid_cache_path();
+    load_pid_cache_for_polling_at(&path)
+}
+
+fn load_pid_cache_for_polling_at(path: &Path) -> PidCacheLoad {
+    match load_or_create_pid_cache_at(path) {
+        Ok(cache) => PidCacheLoad {
+            cache,
+            diagnostic: None,
+        },
+        Err(error) => {
+            let message = format!("PID cache unavailable: {error:#}");
+            PidCacheLoad {
+                cache: PidCache::default(),
+                diagnostic: Some(PollError::subsystem_component("PID cache", message)),
+            }
+        }
+    }
+}
+
 fn load_or_create_pid_cache_at(path: &Path) -> Result<PidCache> {
     #[cfg(target_os = "windows")]
     restore_interrupted_replacement(path)?;
@@ -383,8 +411,9 @@ fn save_pid_cache_at(path: &Path, cache: &PidCache) -> Result<()> {
 mod tests {
     use super::{
         AppConfig, ConfigRecovery, PidCache, load_or_create_config_at, load_or_create_pid_cache_at,
-        replacement_backup_path, restore_interrupted_replacement,
+        load_pid_cache_for_polling_at, replacement_backup_path, restore_interrupted_replacement,
     };
+    use crate::model::{PollErrorKind, PollErrorScope};
     use std::fs;
     use std::path::Path;
 
@@ -606,6 +635,21 @@ welcome_shown = true
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn review_round_17_optional_pid_cache_failure_is_typed() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("pid_cache.toml");
+        fs::create_dir(&path).expect("create unreadable cache path");
+
+        let loaded = load_pid_cache_for_polling_at(&path);
+
+        assert!(loaded.cache.transaction_ids.is_empty());
+        let diagnostic = loaded.diagnostic.expect("cache diagnostic");
+        assert_eq!(diagnostic.display_name, "PID cache");
+        assert_eq!(diagnostic.scope, PollErrorScope::Subsystem);
+        assert_eq!(diagnostic.kind, PollErrorKind::DeviceUnavailable);
     }
 
     #[test]

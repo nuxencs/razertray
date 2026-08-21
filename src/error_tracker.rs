@@ -5,10 +5,25 @@ use std::time::{Duration, Instant};
 const REPEAT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ErrorKey {
+struct IncidentKey {
     device_key: String,
     pid: u16,
     scope: PollErrorScope,
+}
+
+impl From<&PollError> for IncidentKey {
+    fn from(error: &PollError) -> Self {
+        Self {
+            device_key: error.device_key.clone(),
+            pid: error.pid,
+            scope: error.scope,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ErrorKey {
+    incident: IncidentKey,
     kind: PollErrorKind,
     message: String,
 }
@@ -16,18 +31,10 @@ struct ErrorKey {
 impl From<&PollError> for ErrorKey {
     fn from(error: &PollError) -> Self {
         Self {
-            device_key: error.device_key.clone(),
-            pid: error.pid,
-            scope: error.scope,
+            incident: IncidentKey::from(error),
             kind: error.kind,
             message: error.message.clone(),
         }
-    }
-}
-
-impl ErrorKey {
-    fn same_incident(&self, other: &Self) -> bool {
-        self.device_key == other.device_key && self.pid == other.pid && self.scope == other.scope
     }
 }
 
@@ -47,7 +54,6 @@ pub enum ErrorNotice {
     Recovered {
         display_name: String,
         scope: PollErrorScope,
-        kind: PollErrorKind,
     },
 }
 
@@ -65,6 +71,8 @@ impl ErrorTracker {
         now: Instant,
     ) -> Vec<ErrorNotice> {
         let current: BTreeSet<ErrorKey> = errors.iter().map(ErrorKey::from).collect();
+        let current_incidents: BTreeSet<IncidentKey> =
+            current.iter().map(|key| key.incident.clone()).collect();
         let mut notices = Vec::new();
 
         for error in errors {
@@ -102,22 +110,20 @@ impl ErrorTracker {
             .filter(|key| !current.contains(*key) && poll_completed)
             .cloned()
             .collect();
+        let mut recovered_incidents = BTreeSet::new();
         for key in absent {
-            let replacement_is_active = current
-                .iter()
-                .any(|current_key| current_key.same_incident(&key));
+            let replacement_is_active = current_incidents.contains(&key.incident);
             let recovered = !replacement_is_active
-                && if key.device_key.is_empty() {
+                && if key.incident.device_key.is_empty() {
                     true
                 } else {
-                    successful_device_ids.contains(&key.device_key)
+                    successful_device_ids.contains(&key.incident.device_key)
                 };
             if let Some(active) = self.active.remove(&key) {
-                if recovered {
+                if recovered && recovered_incidents.insert(key.incident) {
                     notices.push(ErrorNotice::Recovered {
                         display_name: active.error.display_name,
                         scope: active.error.scope,
-                        kind: active.error.kind,
                     });
                 }
             }
@@ -262,6 +268,27 @@ mod tests {
                     now + Duration::from_secs(60)
                 )
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn review_round_17_recovery_is_once_per_device_scope() {
+        let now = Instant::now();
+        let mut tracker = ErrorTracker::default();
+        let mut first = error();
+        first.message = "interface 0 returned no response".to_string();
+        let mut second = error();
+        second.message = "interface 1 returned no response".to_string();
+        tracker.observe(&[first, second], &successful(), true, now);
+
+        let notices = tracker.observe(&[], &successful(), true, now + Duration::from_secs(60));
+
+        assert_eq!(
+            notices,
+            vec![ErrorNotice::Recovered {
+                display_name: "Mouse".to_string(),
+                scope: PollErrorScope::Device,
+            }]
         );
     }
 

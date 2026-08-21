@@ -182,6 +182,7 @@ mod tests {
             battery_percent: 10,
             battery_raw: 25,
             charge_state: ChargeState::Charging,
+            observed_at: None,
         };
 
         assert!(!notifier.maybe_notify_low_battery(&state, None));
@@ -196,6 +197,7 @@ mod tests {
             battery_percent: 10,
             battery_raw: 25,
             charge_state: ChargeState::NotCharging,
+            observed_at: None,
         };
 
         assert_eq!(low_battery_title(&state), "Test Mouse: 10%");
@@ -211,6 +213,7 @@ mod tests {
             battery_percent: 10,
             battery_raw: 25,
             charge_state: ChargeState::NotCharging,
+            observed_at: None,
         };
 
         let now = Instant::now();

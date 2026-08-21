@@ -173,6 +173,7 @@ fn query_device(
             return Err(merge_query_failure(failure, failures));
         }
     };
+    let observed_at = Instant::now();
 
     let generated = known.map(|support| support.transaction_id);
     *cache_changed |=
@@ -203,6 +204,7 @@ fn query_device(
             battery_raw,
             battery_percent,
             charge_state,
+            observed_at: Some(observed_at),
         },
         warnings,
     ))

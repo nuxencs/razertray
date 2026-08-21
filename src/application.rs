@@ -57,6 +57,7 @@ pub struct TrayView {
     pub devices: Vec<DeviceChoiceView>,
     pub refresh_enabled: bool,
     pub forecast: Option<Estimate>,
+    pub next_refresh_at: Option<Instant>,
     pub config: AppConfig,
 }
 
@@ -178,7 +179,8 @@ impl AppCore {
                         result.sort_devices();
                         self.available.clear();
                         for device in result.devices {
-                            match self.forecaster.observe(&device, now) {
+                            let observed_at = device.observed_at.unwrap_or(now).min(now);
+                            match self.forecaster.observe(&device, observed_at) {
                                 Some(estimate) => {
                                     self.forecasts.insert(device.device_key.clone(), estimate);
                                 }
@@ -191,7 +193,7 @@ impl AppCore {
                                 device.device_key.clone(),
                                 TrackedReading {
                                     reading: device,
-                                    observed_at: now,
+                                    observed_at,
                                 },
                             );
                         }
@@ -352,6 +354,16 @@ impl AppCore {
                 .and_then(|estimate| estimate.project(now)),
             _ => None,
         };
+        let stale_refresh_at = match displayed {
+            Some(tracked) if !self.available.contains(&tracked.reading.device_key) => {
+                next_age_refresh_at(tracked.observed_at, now)
+            }
+            _ => None,
+        };
+        let next_refresh_at = match (forecast.map(Estimate::refresh_at), stale_refresh_at) {
+            (Some(forecast), Some(stale)) => Some(forecast.min(stale)),
+            (forecast, stale) => forecast.or(stale),
+        };
         let (status_text, tooltip, icon) =
             presentation(&observation, self.polling, forecast, &diagnostics);
         let devices = self.device_choices();
@@ -365,6 +377,7 @@ impl AppCore {
             devices,
             refresh_enabled: self.polling == PollActivity::Idle,
             forecast,
+            next_refresh_at,
             config: self.config.clone(),
         }
     }
@@ -682,6 +695,24 @@ fn format_age(age: Duration) -> String {
     }
 }
 
+fn next_age_refresh_at(observed_at: Instant, now: Instant) -> Option<Instant> {
+    let elapsed = now.saturating_duration_since(observed_at).as_secs();
+    let boundary = if elapsed < 60 {
+        60
+    } else if elapsed < 3_600 {
+        elapsed
+            .saturating_div(60)
+            .saturating_add(1)
+            .saturating_mul(60)
+    } else {
+        elapsed
+            .saturating_div(3_600)
+            .saturating_add(1)
+            .saturating_mul(3_600)
+    };
+    observed_at.checked_add(Duration::from_secs(boundary))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AppCore, AppEvent, Command, ObservationView, PollActivity, TrayIconState};
@@ -699,6 +730,7 @@ mod tests {
             battery_raw: percent,
             battery_percent: percent,
             charge_state: ChargeState::NotCharging,
+            observed_at: None,
         }
     }
 
@@ -809,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn review_last_reading_becomes_stale_when_no_fallback_is_available() {
+    fn review_round_17_stale_age_refreshes_between_polls() {
         let now = Instant::now();
         let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
         core.handle(
@@ -834,6 +866,22 @@ mod tests {
             ObservationView::Stale { age, .. } if age == Duration::from_secs(120)
         ));
         assert_eq!(update.view.icon, TrayIconState::Stale);
+        assert_eq!(
+            update.view.next_refresh_at,
+            Some(now + Duration::from_secs(180))
+        );
+
+        let refreshed = core.handle(AppEvent::ProjectionTick, now + Duration::from_secs(180));
+        assert!(
+            refreshed
+                .view
+                .status_text
+                .contains("last updated 3 min ago")
+        );
+        assert_eq!(
+            refreshed.view.next_refresh_at,
+            Some(now + Duration::from_secs(240))
+        );
     }
 
     #[test]
@@ -914,6 +962,45 @@ mod tests {
         );
         assert_eq!(expired.view.forecast, None);
         assert!(!expired.view.status_text.contains("left"));
+    }
+
+    #[test]
+    fn review_round_17_forecast_uses_observation_time() {
+        let now = Instant::now();
+        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let mut first_reading = reading("mouse", 100);
+        first_reading.observed_at = Some(now);
+        core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: vec![first_reading],
+                    errors: Vec::new(),
+                }),
+            ),
+            now + Duration::from_secs(8),
+        );
+
+        let second = core.next_poll_id();
+        let observed_at = now + Duration::from_secs(30 * 60);
+        core.handle(AppEvent::PollStarted(second), observed_at);
+        let mut second_reading = reading("mouse", 50);
+        second_reading.observed_at = Some(observed_at);
+        let update = core.handle(
+            AppEvent::PollFinished(
+                second,
+                Ok(PollResult {
+                    devices: vec![second_reading],
+                    errors: Vec::new(),
+                }),
+            ),
+            observed_at + Duration::from_secs(16),
+        );
+
+        assert_eq!(
+            update.view.forecast.map(|estimate| estimate.remaining),
+            Some(Duration::from_secs(30 * 60 - 16))
+        );
     }
 
     #[test]

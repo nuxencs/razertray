@@ -7,7 +7,7 @@ use crate::config::{self, AlertScope, AppConfig, ConfigRecovery, PidCache, ViewM
 use crate::error_tracker::{ErrorNotice, ErrorTracker};
 use crate::hid::client;
 use crate::icon;
-use crate::model::{PollError, PollOutcome};
+use crate::model::{PollError, PollOutcome, PollResult};
 use crate::notify::{self, Notifier};
 use anyhow::{Context, Result};
 use hidapi::HidApi;
@@ -211,7 +211,10 @@ pub fn run_tray_app(config: AppConfig, startup_recovery: Option<ConfigRecovery>)
             None
         }
     };
-    let cache = config::load_or_create_pid_cache().unwrap_or_else(|_| PidCache::default());
+    let config::PidCacheLoad {
+        cache,
+        diagnostic: cache_diagnostic,
+    } = config::load_pid_cache_for_polling();
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
@@ -223,7 +226,13 @@ pub fn run_tray_app(config: AppConfig, startup_recovery: Option<ConfigRecovery>)
     }));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
-    spawn_poll_worker(proxy, cmd_rx, cache, config.poll_interval_seconds);
+    spawn_poll_worker(
+        proxy,
+        cmd_rx,
+        cache,
+        cache_diagnostic,
+        config.poll_interval_seconds,
+    );
 
     let now = Instant::now();
     let (mut core, _initial_poll, initial_update) = AppCore::new(config, now);
@@ -376,7 +385,7 @@ pub fn run_tray_app(config: AppConfig, startup_recovery: Option<ConfigRecovery>)
         if let Err(err) = apply_projection(&mut menu, &mut tray_icon, &update.view) {
             tracing::warn!("failed applying tray view: {err}");
         }
-        next_projection_at = update.view.forecast.map(|estimate| estimate.refresh_at());
+        next_projection_at = update.view.next_refresh_at;
         *control_flow = next_projection_at
             .map(ControlFlow::WaitUntil)
             .unwrap_or(ControlFlow::Wait);
@@ -443,11 +452,9 @@ fn log_error_notice(notice: ErrorNotice) {
         ErrorNotice::Recovered {
             display_name,
             scope,
-            kind,
         } => tracing::info!(
             device = %display_name,
             scope = ?scope,
-            kind = ?kind,
             "device polling recovered"
         ),
     }
@@ -491,6 +498,7 @@ fn spawn_poll_worker(
     proxy: EventLoopProxy<UserEvent>,
     cmd_rx: mpsc::Receiver<WorkerCommand>,
     mut cache: PidCache,
+    mut cache_diagnostic: Option<PollError>,
     initial_interval: u64,
 ) {
     thread::spawn(move || {
@@ -505,6 +513,7 @@ fn spawn_poll_worker(
 
         loop {
             if poll_now {
+                let mut cache_recovered = false;
                 poll_number = poll_number.saturating_add(1);
                 let poll_id = PollId::new(poll_number);
                 let _ = proxy.send_event(UserEvent::PollStarted(poll_id));
@@ -531,7 +540,10 @@ fn spawn_poll_worker(
                             cache_dirty |= batch.cache_changed;
                             if cache_dirty {
                                 match config::save_pid_cache(&cache) {
-                                    Ok(()) => cache_dirty = false,
+                                    Ok(()) => {
+                                        cache_dirty = false;
+                                        cache_recovered = true;
+                                    }
                                     Err(err) => {
                                         tracing::warn!("failed saving PID cache: {err}");
                                     }
@@ -547,6 +559,10 @@ fn spawn_poll_worker(
                         .clone()
                         .unwrap_or_else(|| PollError::subsystem("HID access is unavailable"))),
                 };
+                let outcome = attach_poll_diagnostic(outcome, cache_diagnostic.as_ref());
+                if cache_recovered {
+                    cache_diagnostic = None;
+                }
                 let found = outcome
                     .as_ref()
                     .is_ok_and(|result| !result.devices.is_empty());
@@ -573,6 +589,22 @@ fn spawn_poll_worker(
             }
         }
     });
+}
+
+fn attach_poll_diagnostic(outcome: PollOutcome, diagnostic: Option<&PollError>) -> PollOutcome {
+    let Some(diagnostic) = diagnostic else {
+        return outcome;
+    };
+    match outcome {
+        Ok(mut result) => {
+            result.errors.push(diagnostic.clone());
+            Ok(result)
+        }
+        Err(error) => Ok(PollResult {
+            devices: Vec::new(),
+            errors: vec![error, diagnostic.clone()],
+        }),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -602,10 +634,10 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::welcome_update;
+    use super::{attach_poll_diagnostic, welcome_update};
     use crate::application::AppCore;
     use crate::config::AppConfig;
-    use crate::model::{PollError, PollErrorKind};
+    use crate::model::{PollError, PollErrorKind, PollErrorScope};
     use std::time::Instant;
 
     #[test]
@@ -635,5 +667,24 @@ mod tests {
             delivered.commands.as_slice(),
             [crate::application::Command::SaveConfig { .. }]
         ));
+    }
+
+    #[test]
+    fn review_round_17_cache_diagnostic_preserves_hid_failure() {
+        let hid_error = PollError::subsystem("HID access denied");
+        let cache_error =
+            PollError::subsystem_component("PID cache", "PID cache unavailable: permission denied");
+
+        let result = attach_poll_diagnostic(Err(hid_error.clone()), Some(&cache_error))
+            .expect("typed poll result");
+
+        assert!(result.devices.is_empty());
+        assert_eq!(result.errors, vec![hid_error, cache_error]);
+        assert!(
+            result
+                .errors
+                .iter()
+                .all(|error| error.scope == PollErrorScope::Subsystem)
+        );
     }
 }
