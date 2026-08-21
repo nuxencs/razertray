@@ -261,9 +261,11 @@ pub fn run_tray_app(config: AppConfig, startup_recovery: Option<ConfigRecovery>)
     let mut error_tracker = ErrorTracker::default();
 
     if let Some(recovery) = startup_recovery {
-        let message = recovery.message();
-        tracing::warn!("configuration recovery: {message}");
-        let _ = notify::show_error(recovery.title(), &message);
+        tracing::warn!(
+            "configuration recovery: {}",
+            recovery.diagnostic_message()
+        );
+        let _ = notify::show_error(recovery.title(), recovery.notification_message());
     }
 
     match welcome_update(&mut core, notify::show_welcome, Instant::now()) {

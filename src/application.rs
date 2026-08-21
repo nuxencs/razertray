@@ -625,7 +625,7 @@ fn poll_error_status(scope: PollErrorScope, kind: crate::model::PollErrorKind) -
             "Device access denied - check permissions and refresh"
         }
         (PollErrorScope::Device, crate::model::PollErrorKind::AmbiguousIdentity) => {
-            "Device identity is ambiguous - disconnect duplicate serialless devices"
+            "Device identity is ambiguous - run --diagnose for details"
         }
         (PollErrorScope::Device, crate::model::PollErrorKind::DeviceUnavailable) => {
             "Device unavailable - wake or reconnect it"
@@ -1495,7 +1495,7 @@ mod tests {
     }
 
     #[test]
-    fn review_round_22_ambiguous_identity_has_explicit_tray_status() {
+    fn review_round_23_ambiguous_identity_has_neutral_tray_guidance() {
         let now = Instant::now();
         let (mut core, first, _) = started_core(AppConfig::default(), now);
         let update = core.handle(
@@ -1527,7 +1527,7 @@ mod tests {
         ));
         assert_eq!(
             update.view.status_text,
-            "Device identity is ambiguous - disconnect duplicate serialless devices"
+            "Device identity is ambiguous - run --diagnose for details"
         );
     }
 

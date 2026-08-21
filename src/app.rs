@@ -31,7 +31,7 @@ pub fn run_once(output: OnceOutput) -> Result<OnceStatus> {
     let cfg = loaded.config;
     init_logging(&cfg);
     if let Some(recovery) = loaded.recovery {
-        eprintln!("Warning: {}", recovery.message());
+        eprintln!("Warning: {}", recovery.diagnostic_message());
     }
 
     let config::PidCacheLoad {

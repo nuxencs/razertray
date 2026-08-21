@@ -175,7 +175,7 @@ impl ConfigRecovery {
         }
     }
 
-    pub fn message(&self) -> String {
+    pub fn diagnostic_message(&self) -> String {
         match self {
             Self::InvalidFileReset {
                 backup_path,
@@ -186,6 +186,17 @@ impl ConfigRecovery {
             ),
             Self::ValuesAdjusted => {
                 "Unsafe configuration values were adjusted to supported limits.".to_string()
+            }
+        }
+    }
+
+    pub fn notification_message(&self) -> &'static str {
+        match self {
+            Self::InvalidFileReset { .. } => {
+                "Defaults were restored. Open Preferences to review them."
+            }
+            Self::ValuesAdjusted => {
+                "Safe limits were applied. Open Preferences to review them."
             }
         }
     }
@@ -540,7 +551,7 @@ welcome_shown = true
     }
 
     #[test]
-    fn config_recovery_resets_invalid_file() {
+    fn review_round_23_config_recovery_resets_invalid_file() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let path = temp.path().join("config.toml");
         fs::write(&path, "not = [valid").expect("write invalid config");
@@ -557,6 +568,13 @@ welcome_shown = true
             } => {
                 assert!(backup_path.exists());
                 assert!(!parse_error.is_empty());
+                let diagnostic = recovery.diagnostic_message();
+                assert!(diagnostic.contains(&backup_path.display().to_string()));
+                assert!(diagnostic.contains(parse_error));
+                assert_eq!(
+                    recovery.notification_message(),
+                    "Defaults were restored. Open Preferences to review them."
+                );
             }
             ConfigRecovery::ValuesAdjusted => panic!("expected invalid-file reset"),
         }
@@ -582,7 +600,7 @@ welcome_shown = true
     }
 
     #[test]
-    fn config_recovery_adjusts_values_without_reset() {
+    fn review_round_23_config_recovery_adjusts_values_without_reset() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let path = temp.path().join("config.toml");
         let config = AppConfig {
@@ -609,8 +627,18 @@ welcome_shown = true
             Some("Configuration was adjusted")
         );
         assert_eq!(
-            loaded.recovery.as_ref().map(ConfigRecovery::message),
+            loaded
+                .recovery
+                .as_ref()
+                .map(ConfigRecovery::diagnostic_message),
             Some("Unsafe configuration values were adjusted to supported limits.".to_string())
+        );
+        assert_eq!(
+            loaded
+                .recovery
+                .as_ref()
+                .map(ConfigRecovery::notification_message),
+            Some("Safe limits were applied. Open Preferences to review them.")
         );
         assert_eq!(loaded.config.poll_interval_seconds, 5);
         assert_eq!(loaded.config.low_battery_threshold, 25);
