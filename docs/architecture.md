@@ -37,15 +37,19 @@ in a deterministic order. It tries a cached transaction ID, known device
 metadata, and bounded protocol fallbacks. Failed cached IDs are removed. Battery
 and charging queries aggregate relevant candidate results before declaring a
 state unsupported.
-The complete HID scan and poll runs in a worker process with a fixed deadline.
+The complete HID scan and poll runs in a worker process. Enumeration has a
+fixed deadline. After enumeration, the worker reports a deadline derived from
+the number of scheduled devices, so valid sequential device budgets remain
+available without discarding earlier results.
 Transport and protocol failures can retry within a per-device time budget. The
 scheduler reserves the required response wait plus process and I/O time for
 every first-round target. If the bounded candidate set is truncated,
 unsupported evidence remains partial. Each interface open and feature exchange
 runs in its own short-lived worker process. At a deadline, the caller requests
-termination and returns without waiting for process cleanup. Cleanup uses a
-bounded background reaper, so a stalled driver call cannot retain polling
-capacity. The next candidate or transaction ID then runs in fresh isolation.
+termination and returns without waiting for process cleanup. A bounded
+background supervisor retains every non-exited process until it is reaped, so
+stalled processes cannot accumulate without limit. The next candidate or
+transaction ID then runs in fresh isolation while supervised capacity remains.
 Verified devices try the battery-winning interface first for charging status,
 then bounded fallbacks. Ambiguous serialless groups retain probe results only as
 typed diagnostics, never as a definitive device reading. Excluded charge

@@ -60,6 +60,13 @@ struct ProbeSuccess {
 
 pub fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollBatch {
     let discovered = scan_devices(api);
+    poll_discovered_devices(discovered, pid_cache)
+}
+
+pub(crate) fn poll_discovered_devices(
+    discovered: Vec<DiscoveredDevice>,
+    pid_cache: &mut PidCache,
+) -> PollBatch {
     let mut result = PollResult::default();
     let mut cache_changed = false;
 
@@ -73,6 +80,13 @@ pub fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollBatch {
         result,
         cache_changed,
     }
+}
+
+pub(crate) fn maximum_poll_duration(device_count: usize) -> Duration {
+    let device_count = u32::try_from(device_count).unwrap_or(u32::MAX);
+    MAX_PROBE_BUDGET
+        .saturating_mul(2)
+        .saturating_mul(device_count)
 }
 
 fn record_query_result(
@@ -829,10 +843,11 @@ mod tests {
     use super::{
         FEATURE_IO_ALLOWANCE, FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence,
         candidate_probe_plan, charge_probe_plan, charge_query_result, display_name,
-        format_error_chain, mark_unsupported_incomplete, merge_query_failure,
-        minimum_operation_timeout, no_candidate_transport_failure, operation_timeout,
-        prioritize_probe_candidate, probe_budget, probe_request_with, record_query_result,
-        scale_percent, successful_probe_warnings, update_cache_after_success, with_probe_coverage,
+        format_error_chain, mark_unsupported_incomplete, maximum_poll_duration,
+        merge_query_failure, minimum_operation_timeout, no_candidate_transport_failure,
+        operation_timeout, prioritize_probe_candidate, probe_budget, probe_request_with,
+        record_query_result, scale_percent, successful_probe_warnings, update_cache_after_success,
+        with_probe_coverage,
     };
     use crate::config::PidCache;
     use crate::hid::protocol::{
@@ -1032,6 +1047,13 @@ mod tests {
             assert!(timeout >= minimum);
             remaining = remaining.saturating_sub(timeout);
         }
+    }
+
+    #[test]
+    fn review_round_28_batch_budget_scales_with_scheduled_devices() {
+        assert_eq!(maximum_poll_duration(0), Duration::ZERO);
+        assert_eq!(maximum_poll_duration(1), Duration::from_secs(32));
+        assert_eq!(maximum_poll_duration(3), Duration::from_secs(96));
     }
 
     #[test]
