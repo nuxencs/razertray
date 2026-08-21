@@ -7,7 +7,7 @@ use crate::config::{self, AlertScope, AppConfig, ConfigRecovery, PidCache, ViewM
 use crate::error_tracker::{ErrorNotice, ErrorTracker};
 use crate::hid::client;
 use crate::icon;
-use crate::model::{PollError, PollErrorKind, PollOutcome};
+use crate::model::{PollError, PollErrorKind, PollErrorScope, PollOutcome};
 use crate::notify::{self, Notifier};
 use anyhow::{Context, Result};
 use hidapi::HidApi;
@@ -415,19 +415,26 @@ fn log_error_notice(notice: ErrorNotice) {
     match notice {
         ErrorNotice::Started(error) => tracing::warn!(
             device = %error.display_name,
+            scope = ?error.scope,
             kind = ?error.kind,
             "poll error: {}",
             error.message
         ),
         ErrorNotice::Repeated { error, suppressed } => tracing::warn!(
             device = %error.display_name,
+            scope = ?error.scope,
             kind = ?error.kind,
             suppressed,
             "poll error continues: {}",
             error.message
         ),
-        ErrorNotice::Recovered { display_name, kind } => tracing::info!(
+        ErrorNotice::Recovered {
+            display_name,
+            scope,
+            kind,
+        } => tracing::info!(
             device = %display_name,
+            scope = ?scope,
             kind = ?kind,
             "device polling recovered"
         ),
@@ -568,6 +575,7 @@ fn subsystem_error(message: String) -> PollError {
         device_key: String::new(),
         display_name: "HID subsystem".to_string(),
         pid: 0,
+        scope: PollErrorScope::Subsystem,
         kind,
         message,
     }

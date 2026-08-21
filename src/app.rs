@@ -243,7 +243,7 @@ fn rotated_log_path(base_path: &Path, index: usize) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{OnceStatus, once_status};
-    use crate::model::{PollError, PollErrorKind, PollResult};
+    use crate::model::{PollError, PollErrorKind, PollErrorScope, PollResult};
 
     #[test]
     fn unsupported_device_is_a_failure_not_no_device() {
@@ -253,6 +253,7 @@ mod tests {
                 device_key: "mouse".to_string(),
                 display_name: "Mouse".to_string(),
                 pid: 1,
+                scope: PollErrorScope::Device,
                 kind: PollErrorKind::Unsupported,
                 message: "battery status is not supported".to_string(),
             }],

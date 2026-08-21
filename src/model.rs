@@ -35,11 +35,20 @@ pub enum PollErrorKind {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PollErrorScope {
+    Device,
+    ChargeState,
+    Subsystem,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PollError {
     pub device_key: String,
     pub display_name: String,
     pub pid: u16,
+    pub scope: PollErrorScope,
     pub kind: PollErrorKind,
     pub message: String,
 }

@@ -6,7 +6,9 @@ use crate::hid::protocol::{
     expected_response_matches, feature_report_payload,
 };
 use crate::hid::scanner::{DiscoveredDevice, scan_devices};
-use crate::model::{BatteryState, ChargeState, PollError, PollErrorKind, PollResult};
+use crate::model::{
+    BatteryState, ChargeState, PollError, PollErrorKind, PollErrorScope, PollResult,
+};
 use anyhow::{Context, Result, bail};
 use hidapi::{HidApi, HidDevice};
 use std::thread;
@@ -72,6 +74,7 @@ fn record_query_result(
             device_key: device.key.clone(),
             display_name: display_name(device),
             pid: device.pid,
+            scope: PollErrorScope::Device,
             kind: PollErrorKind::Unsupported,
             message: "battery status is not supported by this device".to_string(),
         }),
@@ -141,8 +144,12 @@ fn query_device(
                                     device_key: device.key.clone(),
                                     display_name: display_name.clone(),
                                     pid: device.pid,
+                                    scope: PollErrorScope::ChargeState,
                                     kind: classify_error(&err),
-                                    message: format!("charging status unavailable: {err}"),
+                                    message: format!(
+                                        "charging status unavailable: {}",
+                                        format_error_chain(&err)
+                                    ),
                                 }),
                             ),
                         }
@@ -164,8 +171,9 @@ fn query_device(
                 unsupported_interfaces += 1;
             }
             Err(err) => failures.push(format!(
-                "interface {} failed: {err}",
-                candidate.interface_number
+                "interface {} failed: {}",
+                candidate.interface_number,
+                format_error_chain(&err)
             )),
         }
     }
@@ -220,7 +228,10 @@ fn query_handle(
             Err(err) if err.downcast_ref::<UnsupportedCommand>().is_some() => {
                 unsupported += 1;
             }
-            Err(err) => failures.push(format!("tx 0x{transaction_id:02X}: {err}")),
+            Err(err) => failures.push(format!(
+                "tx 0x{transaction_id:02X}: {}",
+                format_error_chain(&err)
+            )),
         }
     }
 
@@ -373,13 +384,14 @@ fn poll_error(device: &DiscoveredDevice, err: anyhow::Error) -> PollError {
         device_key: device.key.clone(),
         display_name: display_name(device),
         pid: device.pid,
+        scope: PollErrorScope::Device,
         kind: classify_error(&err),
-        message: err.to_string(),
+        message: format_error_chain(&err),
     }
 }
 
 fn classify_error(err: &anyhow::Error) -> PollErrorKind {
-    let message = err.to_string().to_ascii_lowercase();
+    let message = format_error_chain(err).to_ascii_lowercase();
     if message.contains("access") || message.contains("permission") {
         PollErrorKind::AccessDenied
     } else if message.contains("open")
@@ -399,6 +411,10 @@ fn classify_error(err: &anyhow::Error) -> PollErrorKind {
     }
 }
 
+fn format_error_chain(err: &anyhow::Error) -> String {
+    format!("{err:#}")
+}
+
 fn scale_percent(raw: u8) -> u8 {
     // Match OpenRazer's user-facing conversion, which truncates: the daemon
     // computes (raw / 255) * 100 as a float and pylib applies int() to it
@@ -409,8 +425,8 @@ fn scale_percent(raw: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FeatureTransport, QueryFailure, record_query_result, scale_percent, send_request_with,
-        update_cache_after_success,
+        FeatureTransport, MAX_RETRIES, QueryFailure, classify_error, format_error_chain,
+        record_query_result, scale_percent, send_request_with, update_cache_after_success,
     };
     use crate::config::PidCache;
     use crate::hid::protocol::{
@@ -418,7 +434,7 @@ mod tests {
         build_battery_request,
     };
     use crate::hid::scanner::DiscoveredDevice;
-    use crate::model::{PollErrorKind, PollResult};
+    use crate::model::{PollErrorKind, PollErrorScope, PollResult};
     use anyhow::{Result, bail};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -593,10 +609,39 @@ mod tests {
         record_query_result(&mut result, &device, Err(QueryFailure::Unsupported));
 
         assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].scope, PollErrorScope::Device);
         assert_eq!(result.errors[0].kind, PollErrorKind::Unsupported);
         assert_eq!(result.errors[0].device_key, "mouse");
         assert_eq!(result.errors[0].pid, 0xFFFF);
         let json = serde_json::to_value(result).expect("serialize poll result");
         assert_eq!(json["errors"][0]["kind"], "unsupported");
+        assert_eq!(json["errors"][0]["scope"], "device");
+    }
+
+    #[test]
+    fn diagnostic_classification_preserves_transport_source() {
+        let request = build_battery_request(0x1F);
+        let replies = (0..MAX_RETRIES)
+            .map(|_| {
+                Err(anyhow::anyhow!("access denied by operating system")
+                    .context("send_feature_report failed"))
+            })
+            .collect();
+        let transport = FakeTransport::new(replies);
+
+        let transport_error = send_request_with(
+            &transport,
+            request,
+            Duration::ZERO,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect_err("transport retries should fail");
+        let aggregate = anyhow::anyhow!(
+            "unable to read battery (tx 0x1F: {})",
+            format_error_chain(&transport_error)
+        );
+
+        assert_eq!(classify_error(&aggregate), PollErrorKind::AccessDenied);
+        assert!(format_error_chain(&aggregate).contains("access denied by operating system"));
     }
 }

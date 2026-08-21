@@ -1,6 +1,6 @@
 use crate::config::{AlertScope, AppConfig, ViewMode};
 use crate::forecast::{Estimate, Forecaster, format_estimate};
-use crate::model::{BatteryState, ChargeState, PollError, PollOutcome};
+use crate::model::{BatteryState, ChargeState, PollError, PollErrorScope, PollOutcome};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,7 @@ pub enum ObservationView {
     },
     NoDevice,
     Failed {
+        scope: PollErrorScope,
         kind: crate::model::PollErrorKind,
         message: String,
     },
@@ -326,6 +327,7 @@ impl AppCore {
             ObservationView::NeverObserved
         } else if let Some(error) = &diagnostic {
             ObservationView::Failed {
+                scope: error.scope,
                 kind: error.kind,
                 message: error.message.clone(),
             }
@@ -502,8 +504,8 @@ fn presentation(
             let text = "No battery-capable Razer device found".to_string();
             (text.clone(), text, TrayIconState::Unknown)
         }
-        ObservationView::Failed { kind, .. } => {
-            let text = poll_error_status(*kind).to_string();
+        ObservationView::Failed { scope, kind, .. } => {
+            let text = poll_error_status(*scope, *kind).to_string();
             (text.clone(), text, TrayIconState::Unknown)
         }
     }
@@ -514,23 +516,47 @@ fn append_diagnostic(text: &mut String, diagnostic: Option<&PollError>) {
         text.push_str(" - ");
         text.push_str(&error.display_name);
         text.push_str(": ");
-        text.push_str(poll_error_status(error.kind));
+        text.push_str(poll_error_status(error.scope, error.kind));
     }
 }
 
-fn poll_error_status(kind: crate::model::PollErrorKind) -> &'static str {
-    match kind {
-        crate::model::PollErrorKind::AccessDenied => {
+fn poll_error_status(scope: PollErrorScope, kind: crate::model::PollErrorKind) -> &'static str {
+    match (scope, kind) {
+        (PollErrorScope::Device, crate::model::PollErrorKind::AccessDenied) => {
             "Device access denied - check permissions and refresh"
         }
-        crate::model::PollErrorKind::DeviceUnavailable => {
+        (PollErrorScope::Device, crate::model::PollErrorKind::DeviceUnavailable) => {
             "Device unavailable - wake or reconnect it"
         }
-        crate::model::PollErrorKind::Unsupported => {
+        (PollErrorScope::Device, crate::model::PollErrorKind::Unsupported) => {
             "Battery reporting is unsupported by this device"
         }
-        crate::model::PollErrorKind::Protocol => "Battery response invalid - refresh to retry",
-        crate::model::PollErrorKind::Unknown => "Battery reading unavailable - refresh to retry",
+        (PollErrorScope::Device, crate::model::PollErrorKind::Protocol) => {
+            "Battery response invalid - refresh to retry"
+        }
+        (PollErrorScope::Device, crate::model::PollErrorKind::Unknown) => {
+            "Battery reading unavailable - refresh to retry"
+        }
+        (PollErrorScope::ChargeState, crate::model::PollErrorKind::AccessDenied) => {
+            "Charging status access denied - check permissions and refresh"
+        }
+        (PollErrorScope::ChargeState, crate::model::PollErrorKind::Unsupported) => {
+            "Charging status is not reported by this device"
+        }
+        (PollErrorScope::ChargeState, crate::model::PollErrorKind::Protocol) => {
+            "Charging status response invalid - refresh to retry"
+        }
+        (PollErrorScope::ChargeState, _) => "Charging status unavailable - refresh to retry",
+        (PollErrorScope::Subsystem, crate::model::PollErrorKind::AccessDenied) => {
+            "HID access denied - check permissions and refresh"
+        }
+        (PollErrorScope::Subsystem, crate::model::PollErrorKind::Protocol) => {
+            "HID response invalid - refresh to retry"
+        }
+        (PollErrorScope::Subsystem, crate::model::PollErrorKind::Unsupported) => {
+            "HID subsystem is unsupported"
+        }
+        (PollErrorScope::Subsystem, _) => "HID access unavailable - refresh to retry",
     }
 }
 
@@ -557,7 +583,9 @@ fn format_age(age: Duration) -> String {
 mod tests {
     use super::{AppCore, AppEvent, Command, ObservationView, PollActivity};
     use crate::config::AppConfig;
-    use crate::model::{BatteryState, ChargeState, PollError, PollErrorKind, PollResult};
+    use crate::model::{
+        BatteryState, ChargeState, PollError, PollErrorKind, PollErrorScope, PollResult,
+    };
     use std::time::{Duration, Instant};
 
     fn reading(id: &str, percent: u8) -> BatteryState {
@@ -576,6 +604,7 @@ mod tests {
             device_key: id.to_string(),
             display_name: format!("Mouse {id}"),
             pid: 1,
+            scope: PollErrorScope::Device,
             kind: PollErrorKind::Unsupported,
             message: "battery status is not supported by this device".to_string(),
         }
@@ -967,5 +996,45 @@ mod tests {
             update.view.diagnostic.as_ref().map(|error| error.kind),
             Some(PollErrorKind::Unsupported)
         );
+    }
+
+    #[test]
+    fn diagnostic_charge_state_failure_does_not_claim_device_failure() {
+        let now = Instant::now();
+        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let mut state = reading("mouse", 70);
+        state.charge_state = ChargeState::Unavailable;
+
+        let update = core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: vec![state],
+                    errors: vec![PollError {
+                        device_key: "mouse".to_string(),
+                        display_name: "Mouse mouse".to_string(),
+                        pid: 1,
+                        scope: PollErrorScope::ChargeState,
+                        kind: PollErrorKind::DeviceUnavailable,
+                        message: "charging status unavailable".to_string(),
+                    }],
+                }),
+            ),
+            now,
+        );
+
+        assert!(matches!(
+            update.view.observation,
+            ObservationView::Fresh { reading }
+                if reading.charge_state == ChargeState::Unavailable
+        ));
+        assert!(
+            update
+                .view
+                .status_text
+                .contains("Charging status unavailable")
+        );
+        assert!(update.view.tooltip.contains("Charging status unavailable"));
+        assert!(!update.view.status_text.contains("Device unavailable"));
     }
 }

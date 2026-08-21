@@ -40,8 +40,8 @@ to the rest of the app.
 ## Diagnostics
 
 `PollResult` is the structured diagnostic boundary. It preserves raw battery
-values, charge-state uncertainty, typed error kinds, and readable devices in the
-same result. JSON output uses this type directly.
+values, charge-state uncertainty, typed error scopes and kinds, and readable
+devices in the same result. JSON output uses this type directly.
 
 Repeated errors are throttled in logs. A later successful poll records recovery.
 
@@ -49,4 +49,5 @@ Repeated errors are throttled in logs. A later successful poll records recovery.
 
 Forecasting is private application state. It consumes successful, timestamped
 readings only. It resets after charging, large gaps, or implausible upward
-changes. The tray receives only a formatted estimate, not forecast internals.
+changes. The tray and notification commands receive the current estimate.
+Forecast samples and discharge-rate state remain private to `AppCore`.

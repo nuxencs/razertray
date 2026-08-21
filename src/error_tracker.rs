@@ -1,4 +1,4 @@
-use crate::model::{PollError, PollErrorKind};
+use crate::model::{PollError, PollErrorKind, PollErrorScope};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -8,6 +8,7 @@ const REPEAT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 struct ErrorKey {
     device_key: String,
     pid: u16,
+    scope: PollErrorScope,
     kind: PollErrorKind,
 }
 
@@ -16,6 +17,7 @@ impl From<&PollError> for ErrorKey {
         Self {
             device_key: error.device_key.clone(),
             pid: error.pid,
+            scope: error.scope,
             kind: error.kind,
         }
     }
@@ -36,6 +38,7 @@ pub enum ErrorNotice {
     },
     Recovered {
         display_name: String,
+        scope: PollErrorScope,
         kind: PollErrorKind,
     },
 }
@@ -54,11 +57,6 @@ impl ErrorTracker {
         now: Instant,
     ) -> Vec<ErrorNotice> {
         let current: BTreeSet<ErrorKey> = errors.iter().map(ErrorKey::from).collect();
-        let current_error_devices: BTreeSet<&str> = errors
-            .iter()
-            .filter(|error| !error.device_key.is_empty())
-            .map(|error| error.device_key.as_str())
-            .collect();
         let mut notices = Vec::new();
 
         for error in errors {
@@ -99,7 +97,6 @@ impl ErrorTracker {
                         poll_completed
                     } else {
                         successful_device_ids.contains(&key.device_key)
-                            && !current_error_devices.contains(key.device_key.as_str())
                     }
             })
             .cloned()
@@ -108,6 +105,7 @@ impl ErrorTracker {
             if let Some(active) = self.active.remove(&key) {
                 notices.push(ErrorNotice::Recovered {
                     display_name: active.error.display_name,
+                    scope: active.error.scope,
                     kind: active.error.kind,
                 });
             }
@@ -120,7 +118,7 @@ impl ErrorTracker {
 #[cfg(test)]
 mod tests {
     use super::{ErrorNotice, ErrorTracker};
-    use crate::model::{PollError, PollErrorKind};
+    use crate::model::{PollError, PollErrorKind, PollErrorScope};
     use std::time::{Duration, Instant};
 
     fn successful() -> std::collections::BTreeSet<String> {
@@ -132,6 +130,7 @@ mod tests {
             device_key: "device".to_string(),
             display_name: "Mouse".to_string(),
             pid: 1,
+            scope: PollErrorScope::Device,
             kind: PollErrorKind::DeviceUnavailable,
             message: "receiver asleep".to_string(),
         }
@@ -192,5 +191,35 @@ mod tests {
                 )
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn diagnostic_scope_distinguishes_active_errors() {
+        let now = Instant::now();
+        let mut tracker = ErrorTracker::default();
+        tracker.observe(&[error()], &successful(), true, now);
+        let mut charge_error = error();
+        charge_error.scope = PollErrorScope::ChargeState;
+
+        let notices = tracker.observe(
+            &[charge_error],
+            &successful(),
+            true,
+            now + Duration::from_secs(60),
+        );
+
+        assert!(matches!(
+            notices.as_slice(),
+            [
+                ErrorNotice::Started(PollError {
+                    scope: PollErrorScope::ChargeState,
+                    ..
+                }),
+                ErrorNotice::Recovered {
+                    scope: PollErrorScope::Device,
+                    ..
+                }
+            ]
+        ));
     }
 }
