@@ -249,7 +249,7 @@ pub fn run_tray_app(config: AppConfig, startup_recovery: Option<ConfigRecovery>)
     );
 
     let now = Instant::now();
-    let (mut core, _initial_poll, initial_update) = AppCore::new(config, now);
+    let (mut core, initial_update) = AppCore::new(config, now);
     let mut menu = MenuHandles::build(core.config(), autostart_enabled)?;
     let initial_icon = icon::neutral_icon()?;
     let mut tray_icon = build_tray_icon(&menu.root, initial_icon)?;
@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn reliability_welcome_is_marked_only_after_successful_delivery() {
         let now = Instant::now();
-        let (mut core, _, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, _) = AppCore::new(AppConfig::default(), now);
 
         let failed = welcome_update(&mut core, || anyhow::bail!("toast delivery failed"), now);
 

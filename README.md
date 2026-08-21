@@ -135,9 +135,10 @@ and retained as typed diagnostics in JSON, diagnostic output, and tray status.
 - Forecast history is held in memory and restarts with the app.
 - Multiple identical devices without serial numbers can be difficult to
   distinguish because the HID metadata does not always expose a stable identity.
-  Their interfaces remain in one explicit ambiguous PID group so legacy device
-  preferences and battery-interface fallback remain available. Charge state is
-  read only from the interface that supplied the battery reading.
+  Multiple serialless interfaces with one PID remain in an explicit ambiguous
+  group so legacy device preferences stay reachable. Responses from that group
+  remain typed diagnostics instead of a battery reading that could silently
+  switch between physical devices.
 
 ## Development
 

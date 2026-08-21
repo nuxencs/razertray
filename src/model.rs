@@ -33,6 +33,7 @@ pub struct BatteryState {
 #[serde(rename_all = "kebab-case")]
 pub enum PollErrorKind {
     AccessDenied,
+    AmbiguousIdentity,
     DeviceUnavailable,
     Unsupported,
     PartialUnsupported,
@@ -74,6 +75,7 @@ impl fmt::Display for PollErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::AccessDenied => "access-denied",
+            Self::AmbiguousIdentity => "ambiguous-identity",
             Self::DeviceUnavailable => "device-unavailable",
             Self::Unsupported => "unsupported",
             Self::PartialUnsupported => "partial-unsupported",

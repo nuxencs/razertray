@@ -119,7 +119,6 @@ pub struct AppCore {
     config: AppConfig,
     polling: PollActivity,
     active_poll: Option<PollId>,
-    next_poll_id: u64,
     readings: BTreeMap<String, TrackedReading>,
     available: BTreeSet<String>,
     last_displayed_id: Option<String>,
@@ -130,13 +129,12 @@ pub struct AppCore {
 }
 
 impl AppCore {
-    pub fn new(mut config: AppConfig, now: Instant) -> (Self, PollId, Update) {
+    pub fn new(mut config: AppConfig, now: Instant) -> (Self, Update) {
         config.validate();
-        let mut core = Self {
+        let core = Self {
             config,
             polling: PollActivity::Idle,
             active_poll: None,
-            next_poll_id: 1,
             readings: BTreeMap::new(),
             available: BTreeSet::new(),
             last_displayed_id: None,
@@ -145,17 +143,8 @@ impl AppCore {
             forecaster: Forecaster::default(),
             forecasts: BTreeMap::new(),
         };
-        let poll_id = core.next_poll_id();
-        core.polling = PollActivity::Checking;
-        core.active_poll = Some(poll_id);
         let update = core.update(now, Vec::new());
-        (core, poll_id, update)
-    }
-
-    pub fn next_poll_id(&mut self) -> PollId {
-        let id = PollId(self.next_poll_id);
-        self.next_poll_id = self.next_poll_id.saturating_add(1);
-        id
+        (core, update)
     }
 
     pub fn handle(&mut self, event: AppEvent, now: Instant) -> Update {
@@ -635,6 +624,9 @@ fn poll_error_status(scope: PollErrorScope, kind: crate::model::PollErrorKind) -
         (PollErrorScope::Device, crate::model::PollErrorKind::AccessDenied) => {
             "Device access denied - check permissions and refresh"
         }
+        (PollErrorScope::Device, crate::model::PollErrorKind::AmbiguousIdentity) => {
+            "Device identity is ambiguous - disconnect duplicate serialless devices"
+        }
         (PollErrorScope::Device, crate::model::PollErrorKind::DeviceUnavailable) => {
             "Device unavailable - wake or reconnect it"
         }
@@ -687,6 +679,9 @@ fn multi_device_poll_error_status(
     match (scope, kind) {
         (PollErrorScope::Device, crate::model::PollErrorKind::AccessDenied) => {
             format!("Access denied for {device_count} devices - check permissions and refresh")
+        }
+        (PollErrorScope::Device, crate::model::PollErrorKind::AmbiguousIdentity) => {
+            format!("Identity is ambiguous for {device_count} device groups")
         }
         (PollErrorScope::Device, crate::model::PollErrorKind::DeviceUnavailable) => {
             format!("{device_count} devices unavailable - wake or reconnect them")
@@ -763,7 +758,9 @@ fn next_age_refresh_at(observed_at: Instant, now: Instant) -> Option<Instant> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppCore, AppEvent, Command, ObservationView, PollActivity, TrayIconState};
+    use super::{
+        AppCore, AppEvent, Command, ObservationView, PollActivity, PollId, TrayIconState, Update,
+    };
     use crate::config::AppConfig;
     use crate::model::{
         BatteryState, ChargeState, PollError, PollErrorKind, PollErrorScope, PollResult,
@@ -782,6 +779,13 @@ mod tests {
         }
     }
 
+    fn started_core(config: AppConfig, now: Instant) -> (AppCore, PollId, Update) {
+        let (mut core, _) = AppCore::new(config, now);
+        let poll_id = PollId::new(1);
+        let update = core.handle(AppEvent::PollStarted(poll_id), now);
+        (core, poll_id, update)
+    }
+
     fn unsupported_error(id: &str) -> PollError {
         PollError {
             device_key: id.to_string(),
@@ -795,9 +799,13 @@ mod tests {
     }
 
     #[test]
-    fn boot_is_checking_and_refresh_is_disabled() {
+    fn review_round_22_worker_event_owns_initial_poll_id() {
         let now = Instant::now();
-        let (_core, _poll_id, update) = AppCore::new(AppConfig::default(), now);
+        let (mut core, initial) = AppCore::new(AppConfig::default(), now);
+        assert_eq!(initial.view.polling, PollActivity::Idle);
+        assert!(initial.view.refresh_enabled);
+
+        let update = core.handle(AppEvent::PollStarted(PollId::new(41)), now);
         assert_eq!(update.view.polling, PollActivity::Checking);
         assert_eq!(update.view.observation, ObservationView::NeverObserved);
         assert!(!update.view.refresh_enabled);
@@ -811,7 +819,7 @@ mod tests {
             ..AppConfig::default()
         };
         cfg.validate();
-        let (mut core, first, _) = AppCore::new(cfg, now);
+        let (mut core, first, _) = started_core(cfg, now);
         core.handle(
             AppEvent::PollFinished(
                 first,
@@ -823,7 +831,7 @@ mod tests {
             now,
         );
 
-        let second = core.next_poll_id();
+        let second = PollId::new(2);
         core.handle(AppEvent::PollStarted(second), now);
         let missing = core.handle(
             AppEvent::PollFinished(
@@ -840,7 +848,7 @@ mod tests {
             matches!(missing.view.observation, ObservationView::Fresh { reading } if reading.device_key == "fallback")
         );
 
-        let third = core.next_poll_id();
+        let third = PollId::new(3);
         core.handle(AppEvent::PollStarted(third), now);
         let returned = core.handle(
             AppEvent::PollFinished(
@@ -860,8 +868,8 @@ mod tests {
     #[test]
     fn stale_poll_ids_do_not_replace_newer_state() {
         let now = Instant::now();
-        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
-        let stale = core.next_poll_id();
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
+        let stale = PollId::new(2);
         let ignored = core.handle(
             AppEvent::PollFinished(
                 stale,
@@ -892,7 +900,7 @@ mod tests {
     #[test]
     fn review_round_17_stale_age_refreshes_between_polls() {
         let now = Instant::now();
-        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
         core.handle(
             AppEvent::PollFinished(
                 first,
@@ -903,7 +911,7 @@ mod tests {
             ),
             now,
         );
-        let second = core.next_poll_id();
+        let second = PollId::new(2);
         core.handle(AppEvent::PollStarted(second), now);
         let update = core.handle(
             AppEvent::PollFinished(second, Ok(PollResult::default())),
@@ -936,7 +944,7 @@ mod tests {
     #[test]
     fn failed_config_write_can_restore_projected_state() {
         let now = Instant::now();
-        let (mut core, _, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, _, _) = started_core(AppConfig::default(), now);
         let changed = core.handle(AppEvent::SetViewMode(crate::config::ViewMode::Text), now);
         let rollback = match changed.commands.as_slice() {
             [Command::SaveConfig { rollback, .. }] => rollback.clone(),
@@ -954,7 +962,7 @@ mod tests {
     #[test]
     fn poll_interval_applies_only_after_its_save_command() {
         let now = Instant::now();
-        let (mut core, _, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, _, _) = started_core(AppConfig::default(), now);
         let changed = core.handle(AppEvent::SetPollInterval(300), now);
 
         assert!(matches!(
@@ -966,7 +974,7 @@ mod tests {
     #[test]
     fn review_forecast_projection_counts_down_and_expires_between_polls() {
         let now = Instant::now();
-        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
         core.handle(
             AppEvent::PollFinished(
                 first,
@@ -977,7 +985,7 @@ mod tests {
             ),
             now,
         );
-        let second = core.next_poll_id();
+        let second = PollId::new(2);
         let measured_at = now + Duration::from_secs(30 * 60);
         core.handle(AppEvent::PollStarted(second), measured_at);
         let measured = core.handle(
@@ -1016,7 +1024,7 @@ mod tests {
     #[test]
     fn review_round_18_forecast_projects_tray_and_notification() {
         let now = Instant::now();
-        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
         let mut first_reading = reading("mouse", 100);
         first_reading.observed_at = Some(now);
         core.handle(
@@ -1030,7 +1038,7 @@ mod tests {
             now + Duration::from_secs(8),
         );
 
-        let second = core.next_poll_id();
+        let second = PollId::new(2);
         let observed_at = now + Duration::from_secs(30 * 60);
         core.handle(AppEvent::PollStarted(second), observed_at);
         let mut second_reading = reading("mouse", 50);
@@ -1062,7 +1070,7 @@ mod tests {
     #[test]
     fn review_round_18_unavailable_poll_resets_forecast_calibration() {
         let now = Instant::now();
-        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
         let mut initial = reading("mouse", 78);
         initial.battery_raw = 200;
         initial.observed_at = Some(now);
@@ -1077,7 +1085,7 @@ mod tests {
             now,
         );
 
-        let unavailable = core.next_poll_id();
+        let unavailable = PollId::new(2);
         core.handle(
             AppEvent::PollStarted(unavailable),
             now + Duration::from_secs(2 * 60 * 60),
@@ -1087,7 +1095,7 @@ mod tests {
             now + Duration::from_secs(2 * 60 * 60),
         );
 
-        let returned = core.next_poll_id();
+        let returned = PollId::new(3);
         let returned_at = now + Duration::from_secs(5 * 60 * 60);
         core.handle(AppEvent::PollStarted(returned), returned_at);
         let mut returned_reading = reading("mouse", 74);
@@ -1105,7 +1113,7 @@ mod tests {
         );
         assert_eq!(reset.view.forecast, None);
 
-        let recalibration = core.next_poll_id();
+        let recalibration = PollId::new(4);
         let recalibrated_at = returned_at + Duration::from_secs(30 * 60);
         core.handle(AppEvent::PollStarted(recalibration), recalibrated_at);
         let mut recalibrated_reading = reading("mouse", 70);
@@ -1133,7 +1141,7 @@ mod tests {
     #[test]
     fn review_round_18_cache_diagnostic_preserves_component_name() {
         let now = Instant::now();
-        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
         let update = core.handle(
             AppEvent::PollFinished(
                 first,
@@ -1161,7 +1169,7 @@ mod tests {
             selected_device_id: "preferred".to_string(),
             ..AppConfig::default()
         };
-        let (mut core, first, _) = AppCore::new(cfg, now);
+        let (mut core, first, _) = started_core(cfg, now);
         core.handle(
             AppEvent::PollFinished(
                 first,
@@ -1172,7 +1180,7 @@ mod tests {
             ),
             now,
         );
-        let second = core.next_poll_id();
+        let second = PollId::new(2);
         core.handle(AppEvent::PollStarted(second), now);
         core.handle(
             AppEvent::PollFinished(
@@ -1184,7 +1192,7 @@ mod tests {
             ),
             now + Duration::from_secs(60),
         );
-        let third = core.next_poll_id();
+        let third = PollId::new(3);
         core.handle(AppEvent::PollStarted(third), now);
         let stale = core.handle(
             AppEvent::PollFinished(third, Ok(PollResult::default())),
@@ -1200,7 +1208,7 @@ mod tests {
     #[test]
     fn reliability_selected_device_becomes_the_stale_view() {
         let now = Instant::now();
-        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
         core.handle(
             AppEvent::PollFinished(
                 first,
@@ -1216,7 +1224,7 @@ mod tests {
         assert!(
             matches!(selected.view.observation, ObservationView::Fresh { reading } if reading.device_key == "b")
         );
-        let second = core.next_poll_id();
+        let second = PollId::new(2);
         core.handle(AppEvent::PollStarted(second), now);
         let stale = core.handle(
             AppEvent::PollFinished(second, Ok(PollResult::default())),
@@ -1231,7 +1239,7 @@ mod tests {
     #[test]
     fn reliability_failed_selection_save_restores_display_history() {
         let now = Instant::now();
-        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
         core.handle(
             AppEvent::PollFinished(
                 first,
@@ -1249,7 +1257,7 @@ mod tests {
             commands => panic!("unexpected commands: {commands:?}"),
         };
         core.handle(AppEvent::RestoreConfig(rollback), now);
-        let second = core.next_poll_id();
+        let second = PollId::new(2);
         core.handle(AppEvent::PollStarted(second), now);
         let stale = core.handle(
             AppEvent::PollFinished(second, Ok(PollResult::default())),
@@ -1265,7 +1273,7 @@ mod tests {
     #[test]
     fn reliability_stale_reading_keeps_current_unsupported_diagnostic() {
         let now = Instant::now();
-        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
         core.handle(
             AppEvent::PollFinished(
                 first,
@@ -1276,7 +1284,7 @@ mod tests {
             ),
             now,
         );
-        let second = core.next_poll_id();
+        let second = PollId::new(2);
         core.handle(AppEvent::PollStarted(second), now);
 
         let update = core.handle(
@@ -1312,7 +1320,7 @@ mod tests {
             selected_device_id: "preferred".to_string(),
             ..AppConfig::default()
         };
-        let (mut core, first, _) = AppCore::new(cfg, now);
+        let (mut core, first, _) = started_core(cfg, now);
         core.handle(
             AppEvent::PollFinished(
                 first,
@@ -1323,7 +1331,7 @@ mod tests {
             ),
             now,
         );
-        let second = core.next_poll_id();
+        let second = PollId::new(2);
         core.handle(AppEvent::PollStarted(second), now);
 
         let update = core.handle(
@@ -1364,7 +1372,7 @@ mod tests {
             selected_device_id: "preferred".to_string(),
             ..AppConfig::default()
         };
-        let (mut core, first, _) = AppCore::new(cfg, now);
+        let (mut core, first, _) = started_core(cfg, now);
         let update = core.handle(
             AppEvent::PollFinished(
                 first,
@@ -1419,7 +1427,7 @@ mod tests {
     #[test]
     fn review_homogeneous_diagnostics_keep_their_conclusive_kind() {
         let now = Instant::now();
-        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
         let update = core.handle(
             AppEvent::PollFinished(
                 first,
@@ -1456,7 +1464,7 @@ mod tests {
     #[test]
     fn unsupported_battery_query_has_explicit_tray_status() {
         let now = Instant::now();
-        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
 
         let update = core.handle(
             AppEvent::PollFinished(
@@ -1487,9 +1495,46 @@ mod tests {
     }
 
     #[test]
+    fn review_round_22_ambiguous_identity_has_explicit_tray_status() {
+        let now = Instant::now();
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
+        let update = core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: Vec::new(),
+                    errors: vec![PollError {
+                        device_key: "00BF".to_string(),
+                        display_name: "Razer Mouse (identity ambiguous)".to_string(),
+                        pid: 0x00BF,
+                        scope: PollErrorScope::Device,
+                        component: None,
+                        kind: PollErrorKind::AmbiguousIdentity,
+                        message: "serialless interfaces cannot be assigned to one physical device"
+                            .to_string(),
+                    }],
+                }),
+            ),
+            now,
+        );
+
+        assert!(matches!(
+            update.view.observation,
+            ObservationView::Failed {
+                kind: PollErrorKind::AmbiguousIdentity,
+                ..
+            }
+        ));
+        assert_eq!(
+            update.view.status_text,
+            "Device identity is ambiguous - disconnect duplicate serialless devices"
+        );
+    }
+
+    #[test]
     fn review_mixed_device_evidence_remains_indeterminate_and_visible() {
         let now = Instant::now();
-        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
         let mut unsupported = unsupported_error("mouse");
         unsupported.kind = PollErrorKind::PartialUnsupported;
         unsupported.message = "one or more battery probes reported unsupported status".to_string();
@@ -1550,7 +1595,7 @@ mod tests {
     #[test]
     fn diagnostic_charge_state_failure_does_not_claim_device_failure() {
         let now = Instant::now();
-        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
         let mut state = reading("mouse", 70);
         state.charge_state = ChargeState::Unavailable;
 

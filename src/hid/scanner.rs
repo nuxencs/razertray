@@ -23,7 +23,29 @@ pub struct DiscoveredDevice {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InterfaceGrouping {
     VerifiedDevice,
+    SingleSerialless,
     AmbiguousSerialless,
+}
+
+impl InterfaceGrouping {
+    pub fn is_ambiguous(self) -> bool {
+        matches!(self, Self::AmbiguousSerialless)
+    }
+
+    pub fn charge_candidate_count(self, available: usize) -> usize {
+        match self {
+            Self::VerifiedDevice | Self::SingleSerialless => available,
+            Self::AmbiguousSerialless => available.min(1),
+        }
+    }
+
+    pub fn display_suffix(self) -> &'static str {
+        match self {
+            Self::VerifiedDevice => "",
+            Self::SingleSerialless => " (serial unavailable)",
+            Self::AmbiguousSerialless => " (identity ambiguous)",
+        }
+    }
 }
 
 pub fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
@@ -71,7 +93,11 @@ fn add_interface(
     let (key, interface_grouping) = device_identity(pid, serial_number);
     match devices.entry(key.clone()) {
         std::collections::btree_map::Entry::Occupied(mut entry) => {
-            entry.get_mut().candidates.push(candidate);
+            let device = entry.get_mut();
+            if device.interface_grouping == InterfaceGrouping::SingleSerialless {
+                device.interface_grouping = InterfaceGrouping::AmbiguousSerialless;
+            }
+            device.candidates.push(candidate);
         }
         std::collections::btree_map::Entry::Vacant(entry) => {
             entry.insert(DiscoveredDevice {
@@ -103,7 +129,7 @@ fn device_identity(pid: u16, serial_number: Option<&str>) -> (String, InterfaceG
             InterfaceGrouping::VerifiedDevice,
         )
     } else {
-        (format!("{pid:04X}"), InterfaceGrouping::AmbiguousSerialless)
+        (format!("{pid:04X}"), InterfaceGrouping::SingleSerialless)
     }
 }
 
@@ -174,6 +200,26 @@ mod tests {
             InterfaceGrouping::AmbiguousSerialless
         );
         assert_eq!(device.candidates.len(), 2);
+    }
+
+    #[test]
+    fn review_round_22_single_serialless_interface_is_not_ambiguous() {
+        let mut devices = BTreeMap::new();
+        add_interface(
+            &mut devices,
+            0x00BF,
+            None,
+            "Mouse".to_string(),
+            candidate("physical-a-interface-0", 0),
+        );
+
+        let device = devices.values().next().expect("device");
+        assert_eq!(device.key, "00BF");
+        assert_eq!(
+            device.interface_grouping,
+            InterfaceGrouping::SingleSerialless
+        );
+        assert_eq!(device.candidates.len(), 1);
     }
 
     #[test]

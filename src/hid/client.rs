@@ -71,15 +71,31 @@ fn record_query_result(
     device: &DiscoveredDevice,
     query: std::result::Result<(BatteryState, Vec<PollError>), QueryFailure>,
 ) {
+    let ambiguous = device.interface_grouping.is_ambiguous();
+    if ambiguous {
+        result.errors.push(PollError {
+            device_key: device.key.clone(),
+            display_name: display_name(device),
+            pid: device.pid,
+            scope: PollErrorScope::Device,
+            component: None,
+            kind: PollErrorKind::AmbiguousIdentity,
+            message: "serialless interfaces cannot be assigned to one physical device".to_string(),
+        });
+    }
     match query {
-        Ok((state, warnings)) => {
+        Ok((state, warnings)) if !ambiguous => {
             result.devices.push(state);
             result.errors.extend(warnings);
         }
+        Ok((_, warnings)) => result.errors.extend(warnings),
         Err(QueryFailure::Unsupported {
-            evidence,
+            mut evidence,
             auxiliary,
         }) => {
+            if ambiguous {
+                evidence = UnsupportedEvidence::Partial;
+            }
             result.errors.push(PollError {
                 device_key: device.key.clone(),
                 display_name: display_name(device),
@@ -186,14 +202,15 @@ fn query_device(
         (ChargeState::Unsupported, Vec::new())
     } else {
         prioritize_probe_candidate(&mut transports, candidate_index);
-        let charge_candidates = charge_probe_candidates(&transports, device.interface_grouping);
+        let charge_plan = charge_probe_plan(&transports, device.interface_grouping);
         let charge_probe = probe_request_with(
-            charge_candidates,
+            charge_plan.candidates,
             &[transaction_id],
             build_charging_request,
             response_wait(device.pid),
             overall_deadline,
         )
+        .map_err(|failure| mark_unsupported_incomplete(failure, charge_plan.omitted))
         .map_err(|failure| merge_query_failure(failure, failures));
         charge_query_result(device, charge_probe)
     };
@@ -306,10 +323,32 @@ fn prioritize_probe_candidate<T>(candidates: &mut [T], candidate_index: usize) {
     }
 }
 
-fn charge_probe_candidates<T>(candidates: &[T], interface_grouping: InterfaceGrouping) -> &[T] {
-    match interface_grouping {
-        InterfaceGrouping::VerifiedDevice => candidates,
-        InterfaceGrouping::AmbiguousSerialless => &candidates[..candidates.len().min(1)],
+struct ChargeProbePlan<'a, T> {
+    candidates: &'a [T],
+    omitted: bool,
+}
+
+fn charge_probe_plan<T>(
+    candidates: &[T],
+    interface_grouping: InterfaceGrouping,
+) -> ChargeProbePlan<'_, T> {
+    let count = interface_grouping.charge_candidate_count(candidates.len());
+    ChargeProbePlan {
+        candidates: &candidates[..count],
+        omitted: count < candidates.len(),
+    }
+}
+
+fn mark_unsupported_incomplete(failure: QueryFailure, incomplete: bool) -> QueryFailure {
+    match failure {
+        QueryFailure::Unsupported {
+            evidence: UnsupportedEvidence::Conclusive,
+            auxiliary,
+        } if incomplete => QueryFailure::Unsupported {
+            evidence: UnsupportedEvidence::Partial,
+            auxiliary,
+        },
+        failure => failure,
     }
 }
 
@@ -553,10 +592,7 @@ fn display_name(device: &DiscoveredDevice) -> String {
         || device.product_name.clone(),
         |support| support.name.to_string(),
     );
-    match device.interface_grouping {
-        InterfaceGrouping::VerifiedDevice => name,
-        InterfaceGrouping::AmbiguousSerialless => format!("{name} (serial unavailable)"),
-    }
+    format!("{name}{}", device.interface_grouping.display_suffix())
 }
 
 fn poll_error(device: &DiscoveredDevice, err: anyhow::Error) -> PollError {
@@ -613,9 +649,10 @@ fn scale_percent(raw: u8) -> u8 {
 mod tests {
     use super::{
         FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence, candidate_probe_plan,
-        charge_probe_candidates, charge_query_result, display_name, format_error_chain,
-        merge_query_failure, no_open_transport_failure, prioritize_probe_candidate,
-        probe_request_with, record_query_result, scale_percent, update_cache_after_success,
+        charge_probe_plan, charge_query_result, display_name, format_error_chain,
+        mark_unsupported_incomplete, merge_query_failure, no_open_transport_failure,
+        prioritize_probe_candidate, probe_request_with, record_query_result, scale_percent,
+        update_cache_after_success,
     };
     use crate::config::PidCache;
     use crate::hid::protocol::{
@@ -1253,17 +1290,27 @@ mod tests {
     }
 
     #[test]
-    fn review_round_21_ambiguous_charge_stays_on_battery_interface() {
+    fn review_round_22_ambiguous_charge_is_incomplete() {
         let candidates = [0, 1, 2];
 
-        assert_eq!(
-            charge_probe_candidates(&candidates, InterfaceGrouping::AmbiguousSerialless),
-            &[0]
+        let ambiguous = charge_probe_plan(&candidates, InterfaceGrouping::AmbiguousSerialless);
+        assert_eq!(ambiguous.candidates, &[0]);
+        assert!(ambiguous.omitted);
+
+        let failure = mark_unsupported_incomplete(
+            QueryFailure::Unsupported {
+                evidence: UnsupportedEvidence::Conclusive,
+                auxiliary: Vec::new(),
+            },
+            ambiguous.omitted,
         );
-        assert_eq!(
-            charge_probe_candidates(&candidates, InterfaceGrouping::VerifiedDevice),
-            &[0, 1, 2]
-        );
+        assert!(matches!(
+            &failure,
+            QueryFailure::Unsupported {
+                evidence: UnsupportedEvidence::Partial,
+                ..
+            }
+        ));
 
         let device = DiscoveredDevice {
             key: "00BF".to_string(),
@@ -1272,7 +1319,54 @@ mod tests {
             interface_grouping: InterfaceGrouping::AmbiguousSerialless,
             candidates: Vec::new(),
         };
-        assert_eq!(display_name(&device), "Razer Mouse (serial unavailable)");
+        let (state, warnings) = charge_query_result(&device, Err(failure));
+        assert_eq!(state, crate::model::ChargeState::Unavailable);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].kind, PollErrorKind::PartialUnsupported);
+
+        let verified = charge_probe_plan(&candidates, InterfaceGrouping::VerifiedDevice);
+        assert_eq!(verified.candidates, &[0, 1, 2]);
+        assert!(!verified.omitted);
+    }
+
+    #[test]
+    fn review_round_22_ambiguous_group_does_not_emit_device_reading() {
+        let device = DiscoveredDevice {
+            key: "00BF".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::AmbiguousSerialless,
+            candidates: Vec::new(),
+        };
+        let mut result = PollResult::default();
+        record_query_result(
+            &mut result,
+            &device,
+            Ok((
+                crate::model::BatteryState {
+                    device_key: device.key.clone(),
+                    display_name: display_name(&device),
+                    pid: device.pid,
+                    battery_raw: 128,
+                    battery_percent: 50,
+                    charge_state: crate::model::ChargeState::Unavailable,
+                    observed_at: None,
+                },
+                Vec::new(),
+            )),
+        );
+
+        assert!(result.devices.is_empty());
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].device_key, "00BF");
+        assert_eq!(result.errors[0].kind, PollErrorKind::AmbiguousIdentity);
+        assert_eq!(
+            result.errors[0].display_name,
+            "Razer Mouse (identity ambiguous)"
+        );
+        let json = serde_json::to_value(result).expect("serialize ambiguous result");
+        assert_eq!(json["devices"], serde_json::json!([]));
+        assert_eq!(json["errors"][0]["kind"], "ambiguous-identity");
     }
 
     #[test]
