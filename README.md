@@ -15,8 +15,8 @@ status. It reads HID feature reports directly. Razer Synapse is not required.
   Windows startup
 - Manual refresh and direct access to the app data folder
 - Automatic recovery from an invalid configuration file
-- Isolated HID interface opens, transaction-ID fallback, bounded retries, and
-  cache invalidation
+- Isolated HID scans and interface opens, transaction-ID fallback, bounded
+  retries, and cache invalidation
 - Human-readable, JSON, and diagnostic command-line output
 
 ## Install and run

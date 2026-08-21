@@ -1,3 +1,4 @@
 pub mod client;
 pub mod protocol;
 pub mod scanner;
+pub(crate) mod worker;

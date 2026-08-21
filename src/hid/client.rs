@@ -6,15 +6,12 @@ use crate::hid::protocol::{
     expected_response_matches, feature_report_payload,
 };
 use crate::hid::scanner::{DiscoveredDevice, InterfaceGrouping, scan_devices};
+use crate::hid::worker;
 use crate::model::{
     BatteryState, ChargeState, PollError, PollErrorKind, PollErrorScope, PollResult,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use hidapi::HidApi;
-use serde::{Deserialize, Serialize};
-use std::ffi::CString;
-use std::io::{Read, Write};
-use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,6 +19,8 @@ const MAX_CANDIDATES_PER_DEVICE: usize = 4;
 const MAX_RETRIES: usize = 5;
 const DEVICE_POLL_BUDGET: Duration = Duration::from_secs(8);
 const FEATURE_IO_TIMEOUT: Duration = Duration::from_secs(1);
+const FEATURE_IO_ALLOWANCE: Duration = Duration::from_millis(250);
+const MAX_PROBE_BUDGET: Duration = Duration::from_secs(16);
 const SEND_DELAY: Duration = Duration::from_millis(60);
 const RETRY_DELAY: Duration = Duration::from_millis(400);
 
@@ -151,7 +150,6 @@ fn query_device(
     let known = device_map::known_device_support(device.pid);
     let display_name = display_name(device);
     let candidate_plan = candidate_probe_plan(&device.candidates);
-    let overall_deadline = Instant::now() + DEVICE_POLL_BUDGET;
     let mut transports = candidate_plan
         .candidates
         .iter()
@@ -172,12 +170,19 @@ fn query_device(
 
     let cached = pid_cache.get(device.pid);
     let transaction_ids = battery_transaction_ids(cached, known);
+    let response_wait = response_wait(device.pid);
+    let battery_deadline = Instant::now()
+        + probe_budget(
+            transports.len() * transaction_ids.len(),
+            response_wait,
+            DEVICE_POLL_BUDGET,
+        );
     let battery_probe = probe_request_with(
         &transports,
         &transaction_ids,
         build_battery_request,
-        response_wait(device.pid),
-        overall_deadline,
+        response_wait,
+        battery_deadline,
     );
 
     let ProbeSuccess {
@@ -209,12 +214,14 @@ fn query_device(
         } else {
             prioritize_probe_candidate(&mut transports, candidate_index);
             let charge_plan = charge_probe_plan(&transports, device.interface_grouping);
+            let charge_deadline = Instant::now()
+                + probe_budget(charge_plan.candidates.len(), response_wait, Duration::ZERO);
             let charge_probe = probe_request_with(
                 charge_plan.candidates,
                 &[transaction_id],
                 build_charging_request,
-                response_wait(device.pid),
-                overall_deadline,
+                response_wait,
+                charge_deadline,
             )
             .map_err(|failure| mark_unsupported_incomplete(failure, charge_plan.omitted));
             charge_query_result(device, charge_probe)
@@ -484,7 +491,7 @@ fn probe_request_with<T: FeatureTransport, F: Fn(u8) -> RazerReport>(
                 }
 
                 let now = Instant::now();
-                if now >= deadline || deadline.saturating_duration_since(now) < response_wait {
+                if now >= deadline {
                     budget_exhausted = true;
                     break 'rounds;
                 }
@@ -494,9 +501,14 @@ fn probe_request_with<T: FeatureTransport, F: Fn(u8) -> RazerReport>(
                     .filter(|index| states[*index].is_active())
                     .count()
                     .max(1);
-                let fair_timeout = deadline.saturating_duration_since(now)
-                    / u32::try_from(remaining_targets).unwrap_or(u32::MAX);
-                let operation_timeout = FEATURE_IO_TIMEOUT.min(fair_timeout);
+                let Some(operation_timeout) = operation_timeout(
+                    deadline.saturating_duration_since(now),
+                    remaining_targets,
+                    response_wait,
+                ) else {
+                    budget_exhausted = true;
+                    break 'rounds;
+                };
                 let attempt =
                     attempt_request_with(transport, &request, response_wait, operation_timeout);
                 match attempt {
@@ -588,6 +600,34 @@ fn probe_request_with<T: FeatureTransport, F: Fn(u8) -> RazerReport>(
     Err(QueryFailure::Failed { errors: failures })
 }
 
+fn probe_budget(
+    target_count: usize,
+    response_wait: Duration,
+    minimum_budget: Duration,
+) -> Duration {
+    let target_count = u32::try_from(target_count).unwrap_or(u32::MAX);
+    let reserved = minimum_operation_timeout(response_wait)
+        .checked_mul(target_count)
+        .unwrap_or(MAX_PROBE_BUDGET);
+    minimum_budget.max(reserved).min(MAX_PROBE_BUDGET)
+}
+
+fn operation_timeout(
+    remaining: Duration,
+    remaining_targets: usize,
+    response_wait: Duration,
+) -> Option<Duration> {
+    let minimum = minimum_operation_timeout(response_wait);
+    let later_targets = u32::try_from(remaining_targets.saturating_sub(1)).unwrap_or(u32::MAX);
+    let reserved_for_later = minimum.checked_mul(later_targets)?;
+    let available = remaining.checked_sub(reserved_for_later)?;
+    (available >= minimum).then_some(FEATURE_IO_TIMEOUT.min(available))
+}
+
+fn minimum_operation_timeout(response_wait: Duration) -> Duration {
+    response_wait.saturating_add(FEATURE_IO_ALLOWANCE)
+}
+
 fn fallback_interface_error(
     state: &ProbeState,
     interface_number: i32,
@@ -633,20 +673,6 @@ trait FeatureTransport {
     fn pause(&self, duration: Duration);
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct FeatureWorkerRequest {
-    path: Vec<u8>,
-    request: Vec<u8>,
-    response: Vec<u8>,
-    response_wait_ms: u64,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-enum FeatureWorkerReply {
-    Success { count: usize, response: Vec<u8> },
-    Failure { message: String },
-}
-
 struct ProcessTransport {
     path: Vec<u8>,
 }
@@ -665,121 +691,18 @@ impl FeatureTransport for ProcessTransport {
         response_wait: Duration,
         operation_timeout: Duration,
     ) -> Result<usize> {
-        let request = FeatureWorkerRequest {
-            path: self.path.clone(),
-            request: request.to_vec(),
-            response: response.to_vec(),
-            response_wait_ms: response_wait.as_millis().try_into().unwrap_or(u64::MAX),
-        };
-        match run_feature_worker_process(&request, operation_timeout)? {
-            FeatureWorkerReply::Success {
-                count,
-                response: received,
-            } => {
-                if received.len() != response.len() {
-                    anyhow::bail!(
-                        "HID feature worker returned {} bytes of storage, expected {}",
-                        received.len(),
-                        response.len()
-                    );
-                }
-                response.copy_from_slice(&received);
-                Ok(count)
-            }
-            FeatureWorkerReply::Failure { message } => anyhow::bail!(message),
-        }
+        worker::exchange_feature(
+            &self.path,
+            request,
+            response,
+            response_wait,
+            operation_timeout,
+        )
     }
 
     fn pause(&self, duration: Duration) {
         thread::sleep(duration);
     }
-}
-
-fn run_feature_worker_process(
-    request: &FeatureWorkerRequest,
-    timeout: Duration,
-) -> Result<FeatureWorkerReply> {
-    let executable = std::env::current_exe().context("failed resolving HID worker executable")?;
-    let child = Command::new(executable)
-        .arg("--hid-worker")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed starting HID worker process")?;
-    let input = serde_json::to_vec(request).context("failed encoding HID worker request")?;
-    let output = collect_child_output(child, &input, timeout)?;
-    serde_json::from_slice(&output).context("failed decoding HID worker response")
-}
-
-fn collect_child_output(mut child: Child, input: &[u8], timeout: Duration) -> Result<Vec<u8>> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("HID worker stdin was unavailable")?;
-    stdin
-        .write_all(input)
-        .context("failed sending HID worker request")?;
-    drop(stdin);
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait().context("failed waiting for HID worker")? {
-            let mut output = Vec::new();
-            child
-                .stdout
-                .take()
-                .context("HID worker stdout was unavailable")?
-                .read_to_end(&mut output)
-                .context("failed reading HID worker response")?;
-            if !status.success() {
-                anyhow::bail!("HID worker exited with {status}");
-            }
-            return Ok(output);
-        }
-
-        let now = Instant::now();
-        if now >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!(
-                "HID operation unavailable after timing out at {} ms",
-                timeout.as_millis()
-            );
-        }
-        thread::sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(now)));
-    }
-}
-
-pub(crate) fn run_feature_worker() -> Result<()> {
-    let request: FeatureWorkerRequest =
-        serde_json::from_reader(std::io::stdin().lock()).context("invalid HID worker request")?;
-    let reply = match execute_feature_worker_request(request) {
-        Ok((count, response)) => FeatureWorkerReply::Success { count, response },
-        Err(error) => FeatureWorkerReply::Failure {
-            message: format_error_chain(&error),
-        },
-    };
-    serde_json::to_writer(std::io::stdout().lock(), &reply)
-        .context("failed writing HID worker response")?;
-    Ok(())
-}
-
-fn execute_feature_worker_request(request: FeatureWorkerRequest) -> Result<(usize, Vec<u8>)> {
-    let path = CString::new(request.path).context("invalid HID interface path")?;
-    let api = HidApi::new().context("failed initializing HID access")?;
-    let device = api
-        .open_path(path.as_c_str())
-        .context("could not open HID interface")?;
-    device
-        .send_feature_report(&request.request)
-        .context("send_feature_report failed")?;
-    thread::sleep(Duration::from_millis(request.response_wait_ms));
-    let mut response = request.response;
-    let count = device
-        .get_feature_report(&mut response)
-        .context("get_feature_report failed")?;
-    Ok((count, response))
 }
 
 enum RequestAttempt {
@@ -904,12 +827,12 @@ fn scale_percent(raw: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence, candidate_probe_plan,
-        charge_probe_plan, charge_query_result, collect_child_output, display_name,
+        FEATURE_IO_ALLOWANCE, FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence,
+        candidate_probe_plan, charge_probe_plan, charge_query_result, display_name,
         format_error_chain, mark_unsupported_incomplete, merge_query_failure,
-        no_candidate_transport_failure, prioritize_probe_candidate, probe_request_with,
-        record_query_result, scale_percent, successful_probe_warnings, update_cache_after_success,
-        with_probe_coverage,
+        minimum_operation_timeout, no_candidate_transport_failure, operation_timeout,
+        prioritize_probe_candidate, probe_budget, probe_request_with, record_query_result,
+        scale_percent, successful_probe_warnings, update_cache_after_success, with_probe_coverage,
     };
     use crate::config::PidCache;
     use crate::hid::protocol::{
@@ -1097,31 +1020,18 @@ mod tests {
     }
 
     #[test]
-    fn review_round_26_worker_process_timeout_terminates_isolated_operation() {
-        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "hid::client::tests::review_round_26_timeout_child",
-                "--ignored",
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("start isolated child");
-        let started = Instant::now();
+    fn review_round_27_long_wait_targets_keep_startup_and_io_allowance() {
+        let response_wait = Duration::from_millis(400);
+        let minimum = minimum_operation_timeout(response_wait);
+        let mut remaining = probe_budget(20, response_wait, Duration::ZERO);
 
-        let error = collect_child_output(child, &[], Duration::from_millis(20))
-            .expect_err("slow isolated operation should time out");
-
-        assert!(started.elapsed() < Duration::from_millis(250));
-        assert!(format!("{error:#}").contains("timing out"));
-    }
-
-    #[test]
-    #[ignore]
-    fn review_round_26_timeout_child() {
-        std::thread::sleep(Duration::from_secs(5));
+        assert_eq!(minimum, response_wait + FEATURE_IO_ALLOWANCE);
+        for remaining_targets in (1..=20).rev() {
+            let timeout = operation_timeout(remaining, remaining_targets, response_wait)
+                .expect("each first-round target should retain a meaningful attempt");
+            assert!(timeout >= minimum);
+            remaining = remaining.saturating_sub(timeout);
+        }
     }
 
     #[test]

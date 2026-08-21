@@ -5,12 +5,11 @@ use crate::application::{
 use crate::autostart;
 use crate::config::{self, AlertScope, AppConfig, ConfigRecovery, PidCache, ViewMode};
 use crate::error_tracker::{ErrorNotice, ErrorTracker};
-use crate::hid::client;
+use crate::hid::worker;
 use crate::icon;
 use crate::model::{PollError, PollErrorScope, PollOutcome, PollResult, SubsystemComponent};
 use crate::notify::{self, Notifier};
 use anyhow::{Context, Result};
-use hidapi::HidApi;
 use std::collections::BTreeSet;
 use std::sync::mpsc;
 use std::thread;
@@ -531,8 +530,6 @@ fn spawn_poll_worker(
         let mut poll_interval = initial_interval.clamp(5, 3_600);
         let mut empty_backoff = EMPTY_RETRY_START_SECS;
         let mut next_wait = poll_interval;
-        let mut api: Option<HidApi> = None;
-        let mut api_init_error: Option<PollError> = None;
         let mut cache_dirty = false;
         let mut cache_issue = cache_diagnostic.take().map(PidCacheIssue::Load);
         let mut poll_number = 0_u64;
@@ -546,36 +543,14 @@ fn spawn_poll_worker(
                 poll_number = poll_number.saturating_add(1);
                 let poll_id = PollId::new(poll_number);
                 let _ = proxy.send_event(UserEvent::PollStarted(poll_id));
-                if api.is_none() {
-                    match HidApi::new() {
-                        Ok(handle) => {
-                            api = Some(handle);
-                            api_init_error = None;
-                        }
-                        Err(err) => {
-                            let error = PollError::subsystem(format!(
-                                "failed initializing HID access: {err}"
-                            ));
-                            tracing::warn!("{}", error.message);
-                            api_init_error = Some(error);
-                        }
+                let outcome = match worker::poll(&mut cache) {
+                    Ok(batch) => {
+                        cache_dirty |= batch.cache_changed;
+                        Ok(batch.result)
                     }
-                }
-
-                let outcome = match api.as_mut() {
-                    Some(handle) => match handle.refresh_devices() {
-                        Ok(()) => {
-                            let batch = client::poll_devices(handle, &mut cache);
-                            cache_dirty |= batch.cache_changed;
-                            Ok(batch.result)
-                        }
-                        Err(err) => Err(PollError::subsystem(format!(
-                            "could not refresh HID devices: {err}"
-                        ))),
-                    },
-                    None => Err(api_init_error
-                        .clone()
-                        .unwrap_or_else(|| PollError::subsystem("HID access is unavailable"))),
+                    Err(error) => Err(PollError::subsystem(format!(
+                        "HID scan unavailable: {error:#}"
+                    ))),
                 };
                 persist_pid_cache(&mut cache_dirty, &mut cache_issue, || {
                     config::save_pid_cache(&cache)

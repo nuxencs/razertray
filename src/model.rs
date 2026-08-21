@@ -1,8 +1,8 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Instant;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChargeState {
     Charging,
@@ -17,7 +17,7 @@ impl ChargeState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BatteryState {
     pub device_key: String,
     pub display_name: String,
@@ -29,7 +29,7 @@ pub struct BatteryState {
     pub(crate) observed_at: Option<Instant>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PollErrorKind {
     AccessDenied,
@@ -85,7 +85,7 @@ impl fmt::Display for PollErrorKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PollErrorScope {
     Device,
@@ -95,7 +95,7 @@ pub enum PollErrorScope {
     Subsystem,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SubsystemComponent {
     Hid,
@@ -123,7 +123,7 @@ impl fmt::Display for PollErrorScope {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PollError {
     pub device_key: String,
     pub display_name: String,
@@ -193,7 +193,7 @@ mod tests {
 
 pub type PollOutcome = Result<PollResult, PollError>;
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PollResult {
     pub devices: Vec<BatteryState>,
     pub errors: Vec<PollError>,

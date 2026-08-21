@@ -1,8 +1,7 @@
 use crate::config::{self, AppConfig, PidCacheLoadState};
-use crate::hid::client;
+use crate::hid::{client::PollBatch, worker};
 use crate::model::{PollError, PollResult};
 use anyhow::{Context, Result};
-use hidapi::HidApi;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -28,8 +27,7 @@ pub enum OnceStatus {
 
 #[doc(hidden)]
 pub fn run_hid_worker() -> Result<()> {
-    HidApi::disable_device_discovery();
-    client::run_feature_worker()
+    worker::run()
 }
 
 pub fn run_once(output: OnceOutput) -> Result<OnceStatus> {
@@ -44,11 +42,7 @@ pub fn run_once(output: OnceOutput) -> Result<OnceStatus> {
         mut cache,
         state: cache_state,
     } = config::load_pid_cache_for_polling();
-    let batch = poll_batch_or_diagnostic(
-        HidApi::new()
-            .context("failed to initialize hidapi")
-            .map(|api| client::poll_devices(&api, &mut cache)),
-    );
+    let batch = poll_batch_or_diagnostic(worker::poll(&mut cache));
     let mut result = batch.result;
     finish_cache_poll(&mut result, batch.cache_changed, cache_state, || {
         config::save_pid_cache(&cache)
@@ -157,8 +151,8 @@ fn once_status(result: &crate::model::PollResult) -> OnceStatus {
     }
 }
 
-fn poll_batch_or_diagnostic(result: Result<client::PollBatch>) -> client::PollBatch {
-    result.unwrap_or_else(|error| client::PollBatch {
+fn poll_batch_or_diagnostic(result: Result<PollBatch>) -> PollBatch {
+    result.unwrap_or_else(|error| PollBatch {
         result: PollResult {
             devices: Vec::new(),
             errors: vec![PollError::subsystem(format!("{error:#}"))],
