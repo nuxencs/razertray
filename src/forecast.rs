@@ -263,19 +263,19 @@ mod tests {
 
         assert_eq!(
             forecaster.observe(
-                &reading(200, ChargeState::NotCharging),
+                &reading(100, ChargeState::NotCharging),
                 now + Duration::from_secs(8 * 60 * 60),
             ),
             None
         );
         let reset = forecaster
             .observe(
-                &reading(190, ChargeState::NotCharging),
+                &reading(90, ChargeState::NotCharging),
                 now + Duration::from_secs(9 * 60 * 60),
             )
             .expect("reset estimate");
 
-        assert_eq!(reset.remaining, Duration::from_secs(19 * 60 * 60));
+        assert_eq!(reset.remaining, Duration::from_secs(9 * 60 * 60));
         assert!(reset.remaining > first.remaining);
     }
 }
