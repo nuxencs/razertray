@@ -31,13 +31,22 @@ enum QueryFailure {
         evidence: UnsupportedEvidence,
         auxiliary: Vec<anyhow::Error>,
     },
-    Failed(anyhow::Error),
+    Failed {
+        errors: Vec<anyhow::Error>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UnsupportedEvidence {
     Conclusive,
     Partial,
+}
+
+#[derive(Debug)]
+struct ProbeSuccess {
+    candidate_index: usize,
+    transaction_id: u8,
+    report: RazerReport,
 }
 
 pub fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollBatch {
@@ -93,7 +102,9 @@ fn record_query_result(
                 .errors
                 .extend(auxiliary.into_iter().map(|err| poll_error(device, err)));
         }
-        Err(QueryFailure::Failed(err)) => result.errors.push(poll_error(&device, err)),
+        Err(QueryFailure::Failed { errors }) => result
+            .errors
+            .extend(errors.into_iter().map(|error| poll_error(device, error))),
     }
 }
 
@@ -106,17 +117,22 @@ fn query_device(
     let known = device_map::known_device_support(device.pid);
     let display_name = display_name(device);
     let (candidates, truncation_warning) = candidate_probe_plan(&device.candidates);
-    let mut failures: Vec<_> = truncation_warning.into_iter().collect();
+    let mut failures: Vec<_> = truncation_warning
+        .into_iter()
+        .map(anyhow::Error::msg)
+        .collect();
     let overall_deadline = Instant::now() + DEVICE_POLL_BUDGET;
     let mut opened = Vec::new();
     for candidate in candidates {
         if Instant::now() >= overall_deadline {
-            failures.push("poll time budget exhausted while opening interfaces".to_string());
+            failures.push(anyhow::anyhow!(
+                "poll time budget exhausted while opening interfaces"
+            ));
             break;
         }
         match api.open_path(candidate.path.as_c_str()) {
             Ok(handle) => opened.push((candidate.interface_number, handle)),
-            Err(err) => failures.push(format!(
+            Err(err) => failures.push(anyhow::anyhow!(
                 "interface {} could not be opened: {err}",
                 candidate.interface_number
             )),
@@ -125,7 +141,7 @@ fn query_device(
 
     let cached = pid_cache.get(device.pid);
     let transaction_ids = battery_transaction_ids(cached, known);
-    let transports: Vec<_> = opened
+    let mut transports: Vec<_> = opened
         .iter()
         .map(|(interface_number, handle)| (*interface_number, HidTransport(handle)))
         .collect();
@@ -137,7 +153,11 @@ fn query_device(
         overall_deadline,
     );
 
-    let (_, transaction_id, battery_report) = match battery_probe {
+    let ProbeSuccess {
+        candidate_index,
+        transaction_id,
+        report: battery_report,
+    } = match battery_probe {
         Ok(found) => found,
         Err(failure) => {
             if cached.is_some() {
@@ -156,6 +176,7 @@ fn query_device(
     {
         (ChargeState::Unsupported, Vec::new())
     } else {
+        prioritize_probe_candidate(&mut transports, candidate_index);
         let charge_probe = probe_request_with(
             &transports,
             &[transaction_id],
@@ -182,10 +203,10 @@ fn query_device(
 
 fn charge_query_result(
     device: &DiscoveredDevice,
-    query: std::result::Result<(usize, u8, RazerReport), QueryFailure>,
+    query: std::result::Result<ProbeSuccess, QueryFailure>,
 ) -> (ChargeState, Vec<PollError>) {
     match query {
-        Ok((_, _, report)) if report.arguments[1] > 0 => (ChargeState::Charging, Vec::new()),
+        Ok(success) if success.report.arguments[1] > 0 => (ChargeState::Charging, Vec::new()),
         Ok(_) => (ChargeState::NotCharging, Vec::new()),
         Err(QueryFailure::Unsupported {
             evidence: UnsupportedEvidence::Conclusive,
@@ -210,35 +231,40 @@ fn charge_query_result(
             }));
             (ChargeState::Unavailable, warnings)
         }
-        Err(QueryFailure::Failed(error)) => (
-            ChargeState::Unavailable,
-            vec![scoped_poll_error(
-                device,
-                PollErrorScope::ChargeState,
-                error.context("charging status unavailable"),
-            )],
-        ),
+        Err(QueryFailure::Failed { errors }) => {
+            let warnings = errors
+                .into_iter()
+                .map(|error| {
+                    scoped_poll_error(
+                        device,
+                        PollErrorScope::ChargeState,
+                        error.context("charging status unavailable"),
+                    )
+                })
+                .collect();
+            (ChargeState::Unavailable, warnings)
+        }
     }
 }
 
-fn merge_query_failure(failure: QueryFailure, mut auxiliary: Vec<String>) -> QueryFailure {
+fn merge_query_failure(failure: QueryFailure, mut auxiliary: Vec<anyhow::Error>) -> QueryFailure {
     match failure {
         QueryFailure::Unsupported {
             mut evidence,
-            auxiliary: mut errors,
+            auxiliary: errors,
         } => {
             if !auxiliary.is_empty() {
                 evidence = UnsupportedEvidence::Partial;
-                errors.push(anyhow::anyhow!(auxiliary.join("; ")));
             }
+            auxiliary.extend(errors);
             QueryFailure::Unsupported {
                 evidence,
-                auxiliary: errors,
+                auxiliary,
             }
         }
-        QueryFailure::Failed(err) => {
-            auxiliary.push(format_error_chain(&err));
-            QueryFailure::Failed(anyhow::anyhow!(auxiliary.join("; ")))
+        QueryFailure::Failed { errors } => {
+            auxiliary.extend(errors);
+            QueryFailure::Failed { errors: auxiliary }
         }
     }
 }
@@ -249,6 +275,12 @@ fn candidate_probe_plan<T>(candidates: &[T]) -> (&[T], Option<String>) {
     let warning = (omitted > 0)
         .then(|| format!("{omitted} candidate interface(s) skipped by the bounded probe limit"));
     (&candidates[..attempted], warning)
+}
+
+fn prioritize_probe_candidate<T>(candidates: &mut [T], candidate_index: usize) {
+    if candidate_index < candidates.len() {
+        candidates[..=candidate_index].rotate_right(1);
+    }
 }
 
 fn battery_transaction_ids(
@@ -291,7 +323,7 @@ fn probe_request_with<T: FeatureTransport, F: Fn(u8) -> RazerReport>(
     build_request: F,
     response_wait: Duration,
     deadline: Instant,
-) -> std::result::Result<(usize, u8, RazerReport), QueryFailure> {
+) -> std::result::Result<ProbeSuccess, QueryFailure> {
     let target_count = candidates.len() * transaction_ids.len();
     let mut states: Vec<_> = (0..target_count).map(|_| ProbeState::Pending).collect();
     let mut budget_exhausted = false;
@@ -314,7 +346,11 @@ fn probe_request_with<T: FeatureTransport, F: Fn(u8) -> RazerReport>(
                 states[target_index] =
                     match attempt_request_with(transport, &request, response_wait) {
                         RequestAttempt::Success(report) => {
-                            return Ok((candidate_index, transaction_id, report));
+                            return Ok(ProbeSuccess {
+                                candidate_index,
+                                transaction_id,
+                                report,
+                            });
                         }
                         RequestAttempt::Retry(err) => ProbeState::Retry(err),
                         RequestAttempt::Failed(err) => ProbeState::Failed(err),
@@ -341,7 +377,7 @@ fn probe_request_with<T: FeatureTransport, F: Fn(u8) -> RazerReport>(
                 ProbeState::Pending | ProbeState::Unsupported => None,
             };
             if let Some(err) = error {
-                failures.push(format!(
+                failures.push(anyhow::anyhow!(
                     "interface {interface_number}, tx 0x{transaction_id:02X}: {}",
                     format_error_chain(err)
                 ));
@@ -349,7 +385,7 @@ fn probe_request_with<T: FeatureTransport, F: Fn(u8) -> RazerReport>(
         }
     }
     if budget_exhausted {
-        failures.push("poll time budget exhausted".to_string());
+        failures.push(anyhow::anyhow!("poll time budget exhausted"));
     }
     let unsupported_observed = states
         .iter()
@@ -366,13 +402,15 @@ fn probe_request_with<T: FeatureTransport, F: Fn(u8) -> RazerReport>(
         };
         return Err(QueryFailure::Unsupported {
             evidence,
-            auxiliary: failures.into_iter().map(anyhow::Error::msg).collect(),
+            auxiliary: failures,
         });
     }
     if failures.is_empty() {
-        failures.push("no candidate interface produced a completed response".to_string());
+        failures.push(anyhow::anyhow!(
+            "no candidate interface produced a completed response"
+        ));
     }
-    Err(QueryFailure::Failed(anyhow::anyhow!(failures.join(", "))))
+    Err(QueryFailure::Failed { errors: failures })
 }
 
 fn update_cache_after_success(
@@ -521,8 +559,8 @@ fn scale_percent(raw: u8) -> u8 {
 mod tests {
     use super::{
         FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence, candidate_probe_plan,
-        charge_query_result, format_error_chain, merge_query_failure, probe_request_with,
-        record_query_result, scale_percent, update_cache_after_success,
+        charge_query_result, format_error_chain, merge_query_failure, prioritize_probe_candidate,
+        probe_request_with, record_query_result, scale_percent, update_cache_after_success,
     };
     use crate::config::PidCache;
     use crate::hid::protocol::{
@@ -646,7 +684,7 @@ mod tests {
             FakeTransport::new(vec![Ok(invalid), Ok(feature_response(0x1F, 128))]),
         )];
 
-        let (_, _, response) = probe_request_with(
+        let success = probe_request_with(
             &candidates,
             &[0x1F],
             build_battery_request,
@@ -655,7 +693,7 @@ mod tests {
         )
         .expect("second response should succeed");
 
-        assert_eq!(response.arguments[1], 128);
+        assert_eq!(success.report.arguments[1], 128);
         assert_eq!(candidates[0].1.attempts.get(), 2);
     }
 
@@ -669,7 +707,7 @@ mod tests {
             ]),
         )];
 
-        let (_, _, response) = probe_request_with(
+        let success = probe_request_with(
             &candidates,
             &[0x3F],
             build_battery_request,
@@ -678,7 +716,7 @@ mod tests {
         )
         .expect("retry should recover");
 
-        assert_eq!(response.arguments[1], 200);
+        assert_eq!(success.report.arguments[1], 200);
         assert_eq!(candidates[0].1.attempts.get(), 2);
     }
 
@@ -692,7 +730,7 @@ mod tests {
             ]),
         )];
 
-        let (_, _, response) = probe_request_with(
+        let success = probe_request_with(
             &candidates,
             &[0x1F],
             build_battery_request,
@@ -701,7 +739,7 @@ mod tests {
         )
         .expect("completed response should succeed after busy status");
 
-        assert_eq!(response.arguments[1], 120);
+        assert_eq!(success.report.arguments[1], 120);
         assert_eq!(candidates[0].1.attempts.get(), 2);
     }
 
@@ -725,7 +763,7 @@ mod tests {
         )
         .expect_err("busy payload must not become a reading");
 
-        assert!(matches!(failure, QueryFailure::Failed(_)));
+        assert!(matches!(failure, QueryFailure::Failed { .. }));
         assert_eq!(candidates[0].1.attempts.get(), MAX_RETRIES);
     }
 
@@ -788,7 +826,7 @@ mod tests {
                 evidence: UnsupportedEvidence::Conclusive,
                 auxiliary: Vec::new(),
             },
-            vec!["interface access denied".to_string()],
+            vec![anyhow::anyhow!("interface access denied")],
         );
         record_query_result(&mut result, &device, Err(failure));
 
@@ -827,15 +865,44 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
         )
         .expect_err("transport retries should fail");
-        let QueryFailure::Failed(aggregate) = failure else {
+        let QueryFailure::Failed { errors } = failure else {
             panic!("transport error should remain a failed query")
         };
 
+        assert_eq!(errors.len(), 1);
         assert_eq!(
-            PollErrorKind::classify_message(&format_error_chain(&aggregate)),
+            PollErrorKind::classify_message(&format_error_chain(&errors[0])),
             PollErrorKind::AccessDenied
         );
-        assert!(format_error_chain(&aggregate).contains("access denied by operating system"));
+        assert!(format_error_chain(&errors[0]).contains("access denied by operating system"));
+    }
+
+    #[test]
+    fn review_mixed_failures_preserve_each_typed_diagnostic() {
+        let device = DiscoveredDevice {
+            key: "mouse".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            candidates: Vec::new(),
+        };
+        let failure = merge_query_failure(
+            QueryFailure::Failed {
+                errors: vec![anyhow::anyhow!("device returned STATUS_FAILURE")],
+            },
+            vec![anyhow::anyhow!(
+                "interface 0 could not be opened: access denied"
+            )],
+        );
+        let mut result = PollResult::default();
+
+        record_query_result(&mut result, &device, Err(failure));
+
+        assert_eq!(result.errors.len(), 2);
+        assert_eq!(result.errors[0].kind, PollErrorKind::AccessDenied);
+        assert_eq!(result.errors[1].kind, PollErrorKind::Protocol);
+        let json = serde_json::to_value(result).expect("serialize poll result");
+        assert_eq!(json["errors"][0]["kind"], "access-denied");
+        assert_eq!(json["errors"][1]["kind"], "protocol");
     }
 
     #[test]
@@ -853,7 +920,7 @@ mod tests {
             })
             .collect();
 
-        let (candidate_index, transaction_id, response) = probe_request_with(
+        let success = probe_request_with(
             &candidates,
             &[0x1F, 0x3F, 0xFF],
             build_battery_request,
@@ -862,9 +929,9 @@ mod tests {
         )
         .expect("0xFF fallback should succeed before any retry");
 
-        assert_eq!(candidate_index, 0);
-        assert_eq!(transaction_id, 0xFF);
-        assert_eq!(response.arguments[1], 180);
+        assert_eq!(success.candidate_index, 0);
+        assert_eq!(success.transaction_id, 0xFF);
+        assert_eq!(success.report.arguments[1], 180);
         assert_eq!(
             *attempts.borrow(),
             vec![
@@ -1002,6 +1069,44 @@ mod tests {
     }
 
     #[test]
+    fn review_charge_probe_prioritizes_battery_winning_candidate() {
+        let mut candidates = [
+            (
+                0,
+                FakeTransport::new(vec![Ok(charging_response_with_status(
+                    0x1F,
+                    0,
+                    STATUS_NO_RESPONSE,
+                ))]),
+            ),
+            (
+                1,
+                FakeTransport::new(vec![Ok(charging_response_with_status(
+                    0x1F,
+                    1,
+                    STATUS_SUCCESSFUL,
+                ))]),
+            ),
+        ];
+
+        prioritize_probe_candidate(&mut candidates, 1);
+        let success = probe_request_with(
+            &candidates,
+            &[0x1F],
+            build_charging_request,
+            Duration::ZERO,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("battery-winning candidate should answer first");
+
+        assert_eq!(candidates[0].0, 1);
+        assert_eq!(success.candidate_index, 0);
+        assert_eq!(success.report.arguments[1], 1);
+        assert_eq!(candidates[0].1.attempts.get(), 1);
+        assert_eq!(candidates[1].1.attempts.get(), 0);
+    }
+
+    #[test]
     fn review_charge_probe_preserves_partial_unsupported_evidence() {
         let candidates = [
             (
@@ -1061,7 +1166,7 @@ mod tests {
                 evidence: UnsupportedEvidence::Conclusive,
                 auxiliary: Vec::new(),
             },
-            vec![warning],
+            vec![anyhow::Error::msg(warning)],
         );
         let mut result = PollResult::default();
 
