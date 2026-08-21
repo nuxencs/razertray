@@ -1,5 +1,7 @@
 use crate::APP_ID;
-use crate::application::{AppCore, AppEvent, Command, PollId, TrayIconState, TrayView};
+use crate::application::{
+    AppCore, AppEvent, Command, ConfigRollback, PollId, TrayIconState, TrayView, Update,
+};
 use crate::autostart;
 use crate::config::{self, AlertScope, AppConfig, PidCache, ViewMode};
 use crate::error_tracker::{ErrorNotice, ErrorTracker};
@@ -240,13 +242,15 @@ pub fn run_tray_app(config: AppConfig, startup_warning: Option<String>) -> Resul
         let _ = notify::show_error("Configuration was reset", &warning);
     }
 
-    if !core.config().welcome_shown {
-        if let Err(err) = notify::show_welcome() {
-            tracing::warn!("failed showing welcome notification: {err}");
+    match welcome_update(&mut core, notify::show_welcome, Instant::now()) {
+        Ok(Some(update)) => {
+            if let Some(rollback) = execute_commands(&update.commands, &mut notifier, &cmd_tx) {
+                core.handle(AppEvent::RestoreConfig(rollback), Instant::now());
+            }
         }
-        let update = core.handle(AppEvent::MarkWelcomeShown, Instant::now());
-        if let Some(rollback) = execute_commands(&update.commands, &mut notifier, &cmd_tx) {
-            core.handle(AppEvent::RestoreConfig(rollback), Instant::now());
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!("failed showing welcome notification: {err}");
         }
     }
 
@@ -366,11 +370,23 @@ pub fn run_tray_app(config: AppConfig, startup_warning: Option<String>) -> Resul
     });
 }
 
+fn welcome_update<F>(core: &mut AppCore, show: F, now: Instant) -> Result<Option<Update>>
+where
+    F: FnOnce() -> Result<()>,
+{
+    if core.config().welcome_shown {
+        return Ok(None);
+    }
+
+    show()?;
+    Ok(Some(core.handle(AppEvent::MarkWelcomeShown, now)))
+}
+
 fn execute_commands(
     commands: &[Command],
     notifier: &mut Notifier,
     worker: &mpsc::Sender<WorkerCommand>,
-) -> Option<AppConfig> {
+) -> Option<ConfigRollback> {
     for command in commands {
         match command {
             Command::SaveConfig { config, rollback } => {
@@ -583,8 +599,11 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::subsystem_error;
+    use super::{subsystem_error, welcome_update};
+    use crate::application::AppCore;
+    use crate::config::AppConfig;
     use crate::model::PollErrorKind;
+    use std::time::Instant;
 
     #[test]
     fn subsystem_access_failure_keeps_actionable_kind() {
@@ -593,5 +612,25 @@ mod tests {
 
         assert_eq!(denied.kind, PollErrorKind::AccessDenied);
         assert_eq!(unknown.kind, PollErrorKind::Unknown);
+    }
+
+    #[test]
+    fn reliability_welcome_is_marked_only_after_successful_delivery() {
+        let now = Instant::now();
+        let (mut core, _, _) = AppCore::new(AppConfig::default(), now);
+
+        let failed = welcome_update(&mut core, || anyhow::bail!("toast delivery failed"), now);
+
+        assert!(failed.is_err());
+        assert!(!core.config().welcome_shown);
+
+        let delivered = welcome_update(&mut core, || Ok(()), now)
+            .expect("deliver welcome")
+            .expect("welcome update");
+        assert!(core.config().welcome_shown);
+        assert!(matches!(
+            delivered.commands.as_slice(),
+            [crate::application::Command::SaveConfig { .. }]
+        ));
     }
 }

@@ -48,6 +48,7 @@ pub struct DeviceChoiceView {
 pub struct TrayView {
     pub polling: PollActivity,
     pub observation: ObservationView,
+    pub diagnostic: Option<PollError>,
     pub status_text: String,
     pub tooltip: String,
     pub icon: TrayIconState,
@@ -76,14 +77,20 @@ pub enum AppEvent {
     SetLowBatteryThreshold(u8),
     SetPollInterval(u64),
     MarkWelcomeShown,
-    RestoreConfig(AppConfig),
+    RestoreConfig(ConfigRollback),
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigRollback {
+    config: AppConfig,
+    last_displayed_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub enum Command {
     SaveConfig {
         config: AppConfig,
-        rollback: AppConfig,
+        rollback: ConfigRollback,
     },
     ApplyPollInterval(u64),
     NotifyCandidate {
@@ -198,28 +205,31 @@ impl AppCore {
                 }
             }
             AppEvent::SelectDevice(id) => {
-                let rollback = self.config.clone();
+                let rollback = self.config_rollback();
+                if self.available.contains(&id) {
+                    self.last_displayed_id = Some(id.clone());
+                }
                 self.config.selected_device_id = id;
                 self.save_config_command(rollback, &mut commands);
             }
             AppEvent::SetViewMode(mode) => {
-                let rollback = self.config.clone();
+                let rollback = self.config_rollback();
                 self.config.view_mode = mode;
                 self.save_config_command(rollback, &mut commands);
             }
             AppEvent::SetAlertScope(scope) => {
-                let rollback = self.config.clone();
+                let rollback = self.config_rollback();
                 self.config.alert_scope = scope;
                 self.save_config_command(rollback, &mut commands);
             }
             AppEvent::SetLowBatteryThreshold(threshold) => {
-                let rollback = self.config.clone();
+                let rollback = self.config_rollback();
                 self.config.low_battery_threshold = threshold;
                 self.config.validate();
                 self.save_config_command(rollback, &mut commands);
             }
             AppEvent::SetPollInterval(seconds) => {
-                let rollback = self.config.clone();
+                let rollback = self.config_rollback();
                 self.config.poll_interval_seconds = seconds;
                 self.config.validate();
                 if self.save_config_command(rollback, &mut commands) {
@@ -229,12 +239,13 @@ impl AppCore {
                 }
             }
             AppEvent::MarkWelcomeShown => {
-                let rollback = self.config.clone();
+                let rollback = self.config_rollback();
                 self.config.welcome_shown = true;
                 self.save_config_command(rollback, &mut commands);
             }
-            AppEvent::RestoreConfig(config) => {
-                self.config = config;
+            AppEvent::RestoreConfig(rollback) => {
+                self.config = rollback.config;
+                self.last_displayed_id = rollback.last_displayed_id;
             }
         }
         self.update(now, commands)
@@ -244,8 +255,15 @@ impl AppCore {
         &self.config
     }
 
-    fn save_config_command(&self, rollback: AppConfig, commands: &mut Vec<Command>) -> bool {
-        if self.config != rollback {
+    fn config_rollback(&self) -> ConfigRollback {
+        ConfigRollback {
+            config: self.config.clone(),
+            last_displayed_id: self.last_displayed_id.clone(),
+        }
+    }
+
+    fn save_config_command(&self, rollback: ConfigRollback, commands: &mut Vec<Command>) -> bool {
+        if self.config != rollback.config {
             commands.push(Command::SaveConfig {
                 config: self.config.clone(),
                 rollback,
@@ -292,6 +310,7 @@ impl AppCore {
 
     fn project(&self, now: Instant) -> TrayView {
         let displayed = self.displayed_reading();
+        let diagnostic = self.projected_diagnostic(displayed).cloned();
         let observation = if let Some(tracked) = displayed {
             if self.available.contains(&tracked.reading.device_key) {
                 ObservationView::Fresh {
@@ -305,7 +324,7 @@ impl AppCore {
             }
         } else if !self.has_polled {
             ObservationView::NeverObserved
-        } else if let Some(error) = self.last_errors.first() {
+        } else if let Some(error) = &diagnostic {
             ObservationView::Failed {
                 kind: error.kind,
                 message: error.message.clone(),
@@ -318,11 +337,13 @@ impl AppCore {
             ObservationView::Fresh { reading } => self.forecasts.get(&reading.device_key).copied(),
             _ => None,
         };
-        let (status_text, tooltip, icon) = presentation(&observation, self.polling, forecast);
+        let (status_text, tooltip, icon) =
+            presentation(&observation, self.polling, forecast, diagnostic.as_ref());
         let devices = self.device_choices();
         TrayView {
             polling: self.polling,
             observation,
+            diagnostic,
             status_text,
             tooltip,
             icon,
@@ -346,6 +367,28 @@ impl AppCore {
                     .get(&self.config.selected_device_id)
                     .filter(|_| !self.config.selected_device_id.is_empty())
             })
+    }
+
+    fn projected_diagnostic(&self, displayed: Option<&TrackedReading>) -> Option<&PollError> {
+        if !self.config.selected_device_id.is_empty()
+            && let Some(error) = self
+                .last_errors
+                .iter()
+                .find(|error| error.device_key == self.config.selected_device_id)
+        {
+            return Some(error);
+        }
+
+        if let Some(displayed) = displayed
+            && let Some(error) = self
+                .last_errors
+                .iter()
+                .find(|error| error.device_key == displayed.reading.device_key)
+        {
+            return Some(error);
+        }
+
+        self.last_errors.first()
     }
 
     fn available_display_id(&self) -> Option<&str> {
@@ -404,6 +447,7 @@ fn presentation(
     observation: &ObservationView,
     polling: PollActivity,
     forecast: Option<Estimate>,
+    diagnostic: Option<&PollError>,
 ) -> (String, String, TrayIconState) {
     match observation {
         ObservationView::NeverObserved => {
@@ -421,6 +465,7 @@ fn presentation(
                 text.push_str(" - ");
                 text.push_str(&format_estimate(estimate));
             }
+            append_diagnostic(&mut text, diagnostic);
             let status = if polling == PollActivity::Checking {
                 format!("{text} - refreshing...")
             } else {
@@ -436,13 +481,14 @@ fn presentation(
             )
         }
         ObservationView::Stale { reading, age } => {
-            let text = format!(
+            let mut text = format!(
                 "{}: {}%{} - last updated {}",
                 reading.display_name,
                 reading.battery_percent,
                 charge_suffix(reading.charge_state),
                 format_age(*age)
             );
+            append_diagnostic(&mut text, diagnostic);
             (
                 text.clone(),
                 text,
@@ -457,26 +503,34 @@ fn presentation(
             (text.clone(), text, TrayIconState::Unknown)
         }
         ObservationView::Failed { kind, .. } => {
-            let text = match kind {
-                crate::model::PollErrorKind::AccessDenied => {
-                    "Device access denied - check permissions and refresh"
-                }
-                crate::model::PollErrorKind::DeviceUnavailable => {
-                    "Device unavailable - wake or reconnect it"
-                }
-                crate::model::PollErrorKind::Unsupported => {
-                    "Battery reporting is unsupported by this device"
-                }
-                crate::model::PollErrorKind::Protocol => {
-                    "Battery response invalid - refresh to retry"
-                }
-                crate::model::PollErrorKind::Unknown => {
-                    "Battery reading unavailable - refresh to retry"
-                }
-            }
-            .to_string();
+            let text = poll_error_status(*kind).to_string();
             (text.clone(), text, TrayIconState::Unknown)
         }
+    }
+}
+
+fn append_diagnostic(text: &mut String, diagnostic: Option<&PollError>) {
+    if let Some(error) = diagnostic {
+        text.push_str(" - ");
+        text.push_str(&error.display_name);
+        text.push_str(": ");
+        text.push_str(poll_error_status(error.kind));
+    }
+}
+
+fn poll_error_status(kind: crate::model::PollErrorKind) -> &'static str {
+    match kind {
+        crate::model::PollErrorKind::AccessDenied => {
+            "Device access denied - check permissions and refresh"
+        }
+        crate::model::PollErrorKind::DeviceUnavailable => {
+            "Device unavailable - wake or reconnect it"
+        }
+        crate::model::PollErrorKind::Unsupported => {
+            "Battery reporting is unsupported by this device"
+        }
+        crate::model::PollErrorKind::Protocol => "Battery response invalid - refresh to retry",
+        crate::model::PollErrorKind::Unknown => "Battery reading unavailable - refresh to retry",
     }
 }
 
@@ -514,6 +568,16 @@ mod tests {
             battery_raw: percent,
             battery_percent: percent,
             charge_state: ChargeState::NotCharging,
+        }
+    }
+
+    fn unsupported_error(id: &str) -> PollError {
+        PollError {
+            device_key: id.to_string(),
+            display_name: format!("Mouse {id}"),
+            pid: 1,
+            kind: PollErrorKind::Unsupported,
+            message: "battery status is not supported by this device".to_string(),
         }
     }
 
@@ -713,6 +777,166 @@ mod tests {
     }
 
     #[test]
+    fn reliability_selected_device_becomes_the_stale_view() {
+        let now = Instant::now();
+        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: vec![reading("a", 70), reading("b", 60)],
+                    errors: Vec::new(),
+                }),
+            ),
+            now,
+        );
+
+        let selected = core.handle(AppEvent::SelectDevice("b".to_string()), now);
+        assert!(
+            matches!(selected.view.observation, ObservationView::Fresh { reading } if reading.device_key == "b")
+        );
+        let second = core.next_poll_id();
+        core.handle(AppEvent::PollStarted(second), now);
+        let stale = core.handle(
+            AppEvent::PollFinished(second, Ok(PollResult::default())),
+            now + Duration::from_secs(60),
+        );
+
+        assert!(
+            matches!(stale.view.observation, ObservationView::Stale { reading, .. } if reading.device_key == "b")
+        );
+    }
+
+    #[test]
+    fn reliability_failed_selection_save_restores_display_history() {
+        let now = Instant::now();
+        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: vec![reading("a", 70), reading("b", 60)],
+                    errors: Vec::new(),
+                }),
+            ),
+            now,
+        );
+
+        let selected = core.handle(AppEvent::SelectDevice("b".to_string()), now);
+        let rollback = match selected.commands.as_slice() {
+            [Command::SaveConfig { rollback, .. }] => rollback.clone(),
+            commands => panic!("unexpected commands: {commands:?}"),
+        };
+        core.handle(AppEvent::RestoreConfig(rollback), now);
+        let second = core.next_poll_id();
+        core.handle(AppEvent::PollStarted(second), now);
+        let stale = core.handle(
+            AppEvent::PollFinished(second, Ok(PollResult::default())),
+            now + Duration::from_secs(60),
+        );
+
+        assert!(
+            matches!(stale.view.observation, ObservationView::Stale { reading, .. } if reading.device_key == "a")
+        );
+        assert!(core.config().selected_device_id.is_empty());
+    }
+
+    #[test]
+    fn reliability_stale_reading_keeps_current_unsupported_diagnostic() {
+        let now = Instant::now();
+        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: vec![reading("mouse", 70)],
+                    errors: Vec::new(),
+                }),
+            ),
+            now,
+        );
+        let second = core.next_poll_id();
+        core.handle(AppEvent::PollStarted(second), now);
+
+        let update = core.handle(
+            AppEvent::PollFinished(
+                second,
+                Ok(PollResult {
+                    devices: Vec::new(),
+                    errors: vec![unsupported_error("mouse")],
+                }),
+            ),
+            now + Duration::from_secs(60),
+        );
+
+        assert!(
+            matches!(update.view.observation, ObservationView::Stale { reading, .. } if reading.device_key == "mouse")
+        );
+        assert_eq!(
+            update.view.diagnostic.as_ref().map(|error| error.kind),
+            Some(PollErrorKind::Unsupported)
+        );
+        assert!(
+            update
+                .view
+                .status_text
+                .contains("Battery reporting is unsupported by this device")
+        );
+    }
+
+    #[test]
+    fn reliability_fallback_reading_keeps_preferred_device_diagnostic() {
+        let now = Instant::now();
+        let cfg = AppConfig {
+            selected_device_id: "preferred".to_string(),
+            ..AppConfig::default()
+        };
+        let (mut core, first, _) = AppCore::new(cfg, now);
+        core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: vec![reading("preferred", 70), reading("fallback", 60)],
+                    errors: Vec::new(),
+                }),
+            ),
+            now,
+        );
+        let second = core.next_poll_id();
+        core.handle(AppEvent::PollStarted(second), now);
+
+        let update = core.handle(
+            AppEvent::PollFinished(
+                second,
+                Ok(PollResult {
+                    devices: vec![reading("fallback", 59)],
+                    errors: vec![unsupported_error("preferred")],
+                }),
+            ),
+            now + Duration::from_secs(60),
+        );
+
+        assert!(
+            matches!(update.view.observation, ObservationView::Fresh { reading } if reading.device_key == "fallback")
+        );
+        assert_eq!(
+            update
+                .view
+                .diagnostic
+                .as_ref()
+                .map(|error| error.device_key.as_str()),
+            Some("preferred")
+        );
+        assert!(update.view.status_text.contains("Mouse preferred"));
+        assert!(
+            update
+                .view
+                .tooltip
+                .contains("Battery reporting is unsupported by this device")
+        );
+    }
+
+    #[test]
     fn unsupported_battery_query_has_explicit_tray_status() {
         let now = Instant::now();
         let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
@@ -722,13 +946,7 @@ mod tests {
                 first,
                 Ok(PollResult {
                     devices: Vec::new(),
-                    errors: vec![PollError {
-                        device_key: "mouse".to_string(),
-                        display_name: "Razer Mouse".to_string(),
-                        pid: 1,
-                        kind: PollErrorKind::Unsupported,
-                        message: "battery status is not supported by this device".to_string(),
-                    }],
+                    errors: vec![unsupported_error("mouse")],
                 }),
             ),
             now,
@@ -744,6 +962,10 @@ mod tests {
         assert_eq!(
             update.view.status_text,
             "Battery reporting is unsupported by this device"
+        );
+        assert_eq!(
+            update.view.diagnostic.as_ref().map(|error| error.kind),
+            Some(PollErrorKind::Unsupported)
         );
     }
 }

@@ -20,6 +20,7 @@ This split keeps the core testable without a Windows tray or physical hardware.
 - Poll activity and device observation are separate states.
 - A successful poll controls which readings are current.
 - An old reading can remain visible only as stale data.
+- Current poll diagnostics remain visible with fresh or stale readings.
 - The preferred device changes only after an explicit user selection.
 - A readable fallback does not replace the saved preference.
 - A failed configuration write restores the prior in-memory setting.
