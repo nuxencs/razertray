@@ -58,6 +58,7 @@ impl PollErrorKind {
             || normalized.contains("crc")
             || normalized.contains("status")
             || normalized.contains("response")
+            || (normalized.contains("expected ") && normalized.contains(" bytes, got "))
         {
             Self::Protocol
         } else {

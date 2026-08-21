@@ -98,8 +98,13 @@ fn write_poll_errors(
         if output == OnceOutput::Diagnose {
             writeln!(
                 writer,
-                "- {} ({:04X}) scope={} kind={}: {}",
-                error.display_name, error.pid, error.scope, error.kind, error.message
+                "- {} ({:04X}) key={} scope={} kind={}: {}",
+                error.display_name,
+                error.pid,
+                error.device_key,
+                error.scope,
+                error.kind,
+                error.message
             )?;
         } else {
             writeln!(
@@ -334,7 +339,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(diagnostic).expect("diagnostic output is UTF-8"),
-            "Errors:\n- Mouse (0001) scope=device kind=access-denied: interface access denied\n"
+            "Errors:\n- Mouse (0001) key=mouse scope=device kind=access-denied: interface access denied\n"
         );
         assert_eq!(
             String::from_utf8(human).expect("human output is UTF-8"),

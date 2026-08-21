@@ -223,10 +223,11 @@ fn charge_query_result(
                     .to_string(),
             }];
             warnings.extend(auxiliary.into_iter().map(|error| {
-                scoped_poll_error(
+                contextual_poll_error(
                     device,
                     PollErrorScope::ChargeState,
-                    error.context("charging status probe incomplete"),
+                    error,
+                    "charging status probe incomplete",
                 )
             }));
             (ChargeState::Unavailable, warnings)
@@ -235,10 +236,11 @@ fn charge_query_result(
             let warnings = errors
                 .into_iter()
                 .map(|error| {
-                    scoped_poll_error(
+                    contextual_poll_error(
                         device,
                         PollErrorScope::ChargeState,
-                        error.context("charging status unavailable"),
+                        error,
+                        "charging status unavailable",
                     )
                 })
                 .collect();
@@ -544,6 +546,24 @@ fn scoped_poll_error(
     }
 }
 
+fn contextual_poll_error(
+    device: &DiscoveredDevice,
+    scope: PollErrorScope,
+    err: anyhow::Error,
+    context: &'static str,
+) -> PollError {
+    let kind = PollErrorKind::classify_message(&format_error_chain(&err));
+    let err = err.context(context);
+    PollError {
+        device_key: device.key.clone(),
+        display_name: display_name(device),
+        pid: device.pid,
+        scope,
+        kind,
+        message: format_error_chain(&err),
+    }
+}
+
 fn format_error_chain(err: &anyhow::Error) -> String {
     format!("{err:#}")
 }
@@ -790,6 +810,43 @@ mod tests {
 
         assert!(matches!(failure, QueryFailure::Failed { .. }));
         assert_eq!(candidates[0].1.attempts.get(), MAX_RETRIES);
+    }
+
+    #[test]
+    fn review_short_feature_report_is_a_protocol_diagnostic() {
+        let candidates = [(
+            0,
+            FakeTransport::new(
+                (0..MAX_RETRIES)
+                    .map(|_| Ok(vec![0; FEATURE_REPORT_LENGTH - 1]))
+                    .collect(),
+            ),
+        )];
+        let failure = probe_request_with(
+            &candidates,
+            &[0x1F],
+            build_battery_request,
+            Duration::ZERO,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect_err("short reports must not become readings");
+        let device = DiscoveredDevice {
+            key: "mouse".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            candidates: Vec::new(),
+        };
+        let mut result = PollResult::default();
+
+        record_query_result(&mut result, &device, Err(failure));
+
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].kind, PollErrorKind::Protocol);
+        assert!(
+            result.errors[0]
+                .message
+                .contains("expected 91 bytes, got 90")
+        );
     }
 
     #[test]
@@ -1173,6 +1230,28 @@ mod tests {
         assert_eq!(warnings[0].kind, PollErrorKind::PartialUnsupported);
         assert_eq!(warnings[1].scope, PollErrorScope::ChargeState);
         assert_eq!(warnings[1].kind, PollErrorKind::DeviceUnavailable);
+    }
+
+    #[test]
+    fn review_charge_context_preserves_underlying_protocol_kind() {
+        let device = DiscoveredDevice {
+            key: "mouse".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            candidates: Vec::new(),
+        };
+        let query = Err(QueryFailure::Failed {
+            errors: vec![anyhow::anyhow!("invalid response crc")],
+        });
+
+        let (state, warnings) = charge_query_result(&device, query);
+
+        assert_eq!(state, crate::model::ChargeState::Unavailable);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].scope, PollErrorScope::ChargeState);
+        assert_eq!(warnings[0].kind, PollErrorKind::Protocol);
+        assert!(warnings[0].message.contains("charging status unavailable"));
+        assert!(warnings[0].message.contains("invalid response crc"));
     }
 
     #[test]

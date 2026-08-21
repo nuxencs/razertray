@@ -533,11 +533,18 @@ fn diagnostic_summary(diagnostics: &[PollError]) -> Option<String> {
     }
 
     if let Some((scope, kind)) = diagnostic_classification(diagnostics) {
-        return Some(format!(
-            "{} ({} reports)",
-            poll_error_status(scope, kind),
-            diagnostics.len()
-        ));
+        let device_count = diagnostics
+            .iter()
+            .filter(|error| !error.device_key.is_empty())
+            .map(|error| error.device_key.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let status = if device_count > 1 {
+            multi_device_poll_error_status(scope, kind, device_count)
+        } else {
+            poll_error_status(scope, kind).to_string()
+        };
+        return Some(format!("{} ({} reports)", status, diagnostics.len()));
     }
 
     Some(format!(
@@ -602,6 +609,51 @@ fn poll_error_status(scope: PollErrorScope, kind: crate::model::PollErrorKind) -
             "HID subsystem support is indeterminate - refresh to retry"
         }
         (PollErrorScope::Subsystem, _) => "HID access unavailable - refresh to retry",
+    }
+}
+
+fn multi_device_poll_error_status(
+    scope: PollErrorScope,
+    kind: crate::model::PollErrorKind,
+    device_count: usize,
+) -> String {
+    match (scope, kind) {
+        (PollErrorScope::Device, crate::model::PollErrorKind::AccessDenied) => {
+            format!("Access denied for {device_count} devices - check permissions and refresh")
+        }
+        (PollErrorScope::Device, crate::model::PollErrorKind::DeviceUnavailable) => {
+            format!("{device_count} devices unavailable - wake or reconnect them")
+        }
+        (PollErrorScope::Device, crate::model::PollErrorKind::Unsupported) => {
+            format!("Battery reporting is unsupported by {device_count} devices")
+        }
+        (PollErrorScope::Device, crate::model::PollErrorKind::PartialUnsupported) => {
+            format!(
+                "Battery support is indeterminate for {device_count} devices - refresh to retry"
+            )
+        }
+        (PollErrorScope::Device, crate::model::PollErrorKind::Protocol) => {
+            format!("Battery responses invalid for {device_count} devices - refresh to retry")
+        }
+        (PollErrorScope::Device, crate::model::PollErrorKind::Unknown) => {
+            format!("Battery readings unavailable for {device_count} devices - refresh to retry")
+        }
+        (PollErrorScope::ChargeState, crate::model::PollErrorKind::AccessDenied) => format!(
+            "Charging status access denied for {device_count} devices - check permissions and refresh"
+        ),
+        (PollErrorScope::ChargeState, crate::model::PollErrorKind::Unsupported) => {
+            format!("Charging status is not reported by {device_count} devices")
+        }
+        (PollErrorScope::ChargeState, crate::model::PollErrorKind::PartialUnsupported) => format!(
+            "Charging status support is indeterminate for {device_count} devices - refresh to retry"
+        ),
+        (PollErrorScope::ChargeState, crate::model::PollErrorKind::Protocol) => format!(
+            "Charging status responses invalid for {device_count} devices - refresh to retry"
+        ),
+        (PollErrorScope::ChargeState, _) => {
+            format!("Charging status unavailable for {device_count} devices - refresh to retry")
+        }
+        (PollErrorScope::Subsystem, _) => poll_error_status(scope, kind).to_string(),
     }
 }
 
@@ -1091,6 +1143,8 @@ mod tests {
             }
         ));
         assert!(!update.view.status_text.contains("indeterminate"));
+        assert!(update.view.status_text.contains("unsupported by 2 devices"));
+        assert!(!update.view.status_text.contains("this device"));
         assert!(update.view.status_text.contains("2 reports"));
         assert_eq!(
             update

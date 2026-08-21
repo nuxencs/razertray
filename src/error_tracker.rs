@@ -90,26 +90,33 @@ impl ErrorTracker {
             }
         }
 
-        let recovered: Vec<_> = self
+        let absent: Vec<_> = self
             .active
             .keys()
-            .filter(|key| {
-                !current.contains(*key)
-                    && if key.device_key.is_empty() {
-                        poll_completed
-                    } else {
-                        successful_device_ids.contains(&key.device_key)
-                    }
-            })
+            .filter(|key| !current.contains(*key) && poll_completed)
             .cloned()
             .collect();
-        for key in recovered {
+        for key in absent {
+            let replacement_is_active = current.iter().any(|current_key| {
+                current_key.device_key == key.device_key
+                    && current_key.pid == key.pid
+                    && current_key.scope == key.scope
+                    && current_key.kind == key.kind
+            });
+            let recovered = !replacement_is_active
+                && if key.device_key.is_empty() {
+                    true
+                } else {
+                    successful_device_ids.contains(&key.device_key)
+                };
             if let Some(active) = self.active.remove(&key) {
-                notices.push(ErrorNotice::Recovered {
-                    display_name: active.error.display_name,
-                    scope: active.error.scope,
-                    kind: active.error.kind,
-                });
+                if recovered {
+                    notices.push(ErrorNotice::Recovered {
+                        display_name: active.error.display_name,
+                        scope: active.error.scope,
+                        kind: active.error.kind,
+                    });
+                }
             }
         }
 
@@ -252,6 +259,37 @@ mod tests {
                     now + Duration::from_secs(60)
                 )
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn review_replaced_detail_is_retired_without_false_recovery() {
+        let now = Instant::now();
+        let mut tracker = ErrorTracker::default();
+        let mut first = error();
+        first.message = "interface 0 returned no response".to_string();
+        let mut second = error();
+        second.message = "interface 1 returned no response".to_string();
+        let no_success = std::collections::BTreeSet::new();
+
+        tracker.observe(std::slice::from_ref(&first), &no_success, true, now);
+        assert_eq!(
+            tracker.observe(
+                std::slice::from_ref(&second),
+                &no_success,
+                true,
+                now + Duration::from_secs(60)
+            ),
+            vec![ErrorNotice::Started(second)]
+        );
+        assert_eq!(
+            tracker.observe(
+                std::slice::from_ref(&first),
+                &no_success,
+                true,
+                now + Duration::from_secs(120)
+            ),
+            vec![ErrorNotice::Started(first)]
         );
     }
 }
