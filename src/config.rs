@@ -160,6 +160,9 @@ pub struct ConfigLoad {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfigRecovery {
+    DefaultsNotSaved {
+        persistence_error: String,
+    },
     InvalidFileReset {
         backup_path: Option<PathBuf>,
         parse_error: String,
@@ -173,6 +176,7 @@ pub enum ConfigRecovery {
 impl ConfigRecovery {
     pub fn title(&self) -> &'static str {
         match self {
+            Self::DefaultsNotSaved { .. } => "Configuration defaults are active",
             Self::InvalidFileReset {
                 backup_path: None, ..
             } => "Configuration defaults are active",
@@ -183,6 +187,9 @@ impl ConfigRecovery {
 
     pub fn diagnostic_message(&self) -> String {
         match self {
+            Self::DefaultsNotSaved { persistence_error } => format!(
+                "The default configuration is active for this run but could not be saved: {persistence_error}"
+            ),
             Self::InvalidFileReset {
                 backup_path: Some(backup_path),
                 parse_error,
@@ -222,6 +229,9 @@ impl ConfigRecovery {
 
     pub fn notification_message(&self) -> &'static str {
         match self {
+            Self::DefaultsNotSaved { .. } => {
+                "Defaults are in use for this run but could not be saved. Open the app folder."
+            }
             Self::InvalidFileReset {
                 persistence_error: Some(_),
                 ..
@@ -368,10 +378,14 @@ where
     restore_interrupted_replacement(path)?;
     if !path.exists() {
         let default_cfg = AppConfig::default();
-        save_config_at(path, &default_cfg)?;
+        let recovery = save_config_at(path, &default_cfg).err().map(|error| {
+            ConfigRecovery::DefaultsNotSaved {
+                persistence_error: format!("{error:#}"),
+            }
+        });
         return Ok(ConfigLoad {
             config: default_cfg,
-            recovery: None,
+            recovery,
         });
     }
 
@@ -637,7 +651,9 @@ welcome_shown = true
                     "Defaults were restored. Open Preferences to review them."
                 );
             }
-            ConfigRecovery::ValuesAdjusted { .. } => panic!("expected invalid-file reset"),
+            ConfigRecovery::DefaultsNotSaved { .. } | ConfigRecovery::ValuesAdjusted { .. } => {
+                panic!("expected invalid-file reset")
+            }
         }
         let parsed: AppConfig =
             toml::from_str(&fs::read_to_string(&path).expect("read replacement config"))
@@ -719,6 +735,29 @@ welcome_shown = true
         assert!(error.contains("quarantine access denied"));
         assert_eq!(recovery.title(), "Configuration defaults are active");
         assert!(recovery.diagnostic_message().contains("remains in place"));
+    }
+
+    #[test]
+    fn review_round_31_missing_config_uses_defaults_when_save_fails() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("config.toml");
+        fs::create_dir(
+            temp.path()
+                .join(format!(".config.toml.{}.tmp", std::process::id())),
+        )
+        .expect("block default persistence");
+
+        let loaded = load_or_create_config_at(&path).expect("return safe defaults");
+
+        assert_eq!(loaded.config, AppConfig::default());
+        assert!(!path.exists());
+        let recovery = loaded.recovery.expect("typed persistence warning");
+        let ConfigRecovery::DefaultsNotSaved { persistence_error } = &recovery else {
+            panic!("expected unsaved-default warning")
+        };
+        assert!(persistence_error.contains("failed creating"));
+        assert_eq!(recovery.title(), "Configuration defaults are active");
+        assert!(recovery.diagnostic_message().contains(persistence_error));
     }
 
     #[test]

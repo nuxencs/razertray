@@ -5,7 +5,9 @@ use crate::model::PollResult;
 use anyhow::{Context, Result};
 use hidapi::HidApi;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::ffi::CString;
+use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,6 +25,10 @@ const FRAME_PREFIX: &str = "RAZERTRAY-HID:";
 const PROCESS_TREE_ENV: &str = "RAZERTRAY_HID_PROCESS_TREE";
 
 static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+static QUARANTINED_PATHS: LazyLock<Mutex<BTreeSet<Vec<u8>>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
+static NEW_STALLED_PATHS: LazyLock<Mutex<BTreeSet<Vec<u8>>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
 static RETIRED_WORKERS: LazyLock<Mutex<Vec<RetiredWorker>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 static REAPER: LazyLock<()> = LazyLock::new(|| {
@@ -56,6 +62,7 @@ static REAPER: LazyLock<()> = LazyLock::new(|| {
 enum WorkerRequest {
     Poll {
         cache: PidCache,
+        quarantined_paths: Vec<Vec<u8>>,
     },
     Feature {
         path: Vec<u8>,
@@ -73,6 +80,7 @@ enum WorkerReply {
         cache: PidCache,
         cache_changed: bool,
         observation_ages_ms: Vec<Option<u64>>,
+        stalled_paths: Vec<Vec<u8>>,
     },
     Feature {
         count: usize,
@@ -88,6 +96,23 @@ enum WorkerFrame {
     PollPlan { timeout_ms: u64 },
     Reply(WorkerReply),
 }
+
+#[derive(Debug)]
+struct WorkerTimeout {
+    timeout: Duration,
+}
+
+impl fmt::Display for WorkerTimeout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "HID operation unavailable after timing out at {} ms",
+            self.timeout.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for WorkerTimeout {}
 
 struct WorkerPermit;
 
@@ -197,19 +222,29 @@ pub(crate) fn poll(cache: &mut PidCache) -> Result<PollBatch> {
     let reply = run_process(
         &WorkerRequest::Poll {
             cache: cache.clone(),
+            quarantined_paths: quarantined_paths(),
         },
         INITIAL_POLL_TIMEOUT,
     )
     .context("bounded HID scan failed")?;
-    let (mut result, returned_cache, cache_changed, observation_ages_ms) = match reply {
-        WorkerReply::Poll {
-            result,
-            cache,
-            cache_changed,
-            observation_ages_ms,
-        } => (result, cache, cache_changed, observation_ages_ms),
-        reply => return worker_failure(reply, "poll"),
-    };
+    let (mut result, returned_cache, cache_changed, observation_ages_ms, stalled_paths) =
+        match reply {
+            WorkerReply::Poll {
+                result,
+                cache,
+                cache_changed,
+                observation_ages_ms,
+                stalled_paths,
+            } => (
+                result,
+                cache,
+                cache_changed,
+                observation_ages_ms,
+                stalled_paths,
+            ),
+            reply => return worker_failure(reply, "poll"),
+        };
+    remember_stalled_paths(stalled_paths);
     if observation_ages_ms.len() != result.devices.len() {
         anyhow::bail!(
             "HID worker returned {} observation ages for {} devices",
@@ -241,6 +276,9 @@ pub(crate) fn exchange_feature(
     response_wait: Duration,
     timeout: Duration,
 ) -> Result<usize> {
+    if path_is_quarantined(path) {
+        anyhow::bail!("HID interface unavailable after a stalled operation; path quarantined");
+    }
     let reply = run_process(
         &WorkerRequest::Feature {
             path: path.to_vec(),
@@ -251,6 +289,10 @@ pub(crate) fn exchange_feature(
         },
         timeout,
     )
+    .map_err(|error| {
+        record_stalled_path_from_error(path, &error);
+        error
+    })
     .context("HID feature operation unavailable")?;
     let (count, received) = match reply {
         WorkerReply::Feature { count, response } => (count, response),
@@ -272,6 +314,64 @@ fn worker_failure<T>(reply: WorkerReply, expected: &str) -> Result<T> {
         WorkerReply::Failure { message } => Err(anyhow::Error::msg(message)),
         _ => anyhow::bail!("HID worker returned an unexpected reply for {expected}"),
     }
+}
+
+fn quarantined_paths() -> Vec<Vec<u8>> {
+    QUARANTINED_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect()
+}
+
+fn replace_quarantined_paths(paths: Vec<Vec<u8>>) {
+    *QUARANTINED_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = paths.into_iter().collect();
+    NEW_STALLED_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+fn remember_stalled_paths(paths: impl IntoIterator<Item = Vec<u8>>) {
+    QUARANTINED_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(paths);
+}
+
+fn record_stalled_path(path: &[u8]) {
+    let path = path.to_vec();
+    remember_stalled_paths([path.clone()]);
+    NEW_STALLED_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path);
+}
+
+fn record_stalled_path_from_error(path: &[u8], error: &anyhow::Error) {
+    if error.is::<WorkerTimeout>() {
+        record_stalled_path(path);
+    }
+}
+
+fn path_is_quarantined(path: &[u8]) -> bool {
+    QUARANTINED_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(path)
+}
+
+fn take_new_stalled_paths() -> Vec<Vec<u8>> {
+    std::mem::take(
+        &mut *NEW_STALLED_PATHS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .into_iter()
+    .collect()
 }
 
 fn run_process(request: &WorkerRequest, timeout: Duration) -> Result<WorkerReply> {
@@ -367,10 +467,7 @@ fn supervise_child(
         }
 
         if Instant::now() >= deadline {
-            anyhow::bail!(
-                "HID operation unavailable after timing out at {} ms",
-                timeout.as_millis()
-            );
+            return Err(anyhow::Error::new(WorkerTimeout { timeout }));
         }
     }
 }
@@ -479,7 +576,11 @@ pub(crate) fn run() -> Result<()> {
 
 fn execute<W: Write>(request: WorkerRequest, output: &mut W) -> Result<WorkerReply> {
     match request {
-        WorkerRequest::Poll { mut cache } => {
+        WorkerRequest::Poll {
+            mut cache,
+            quarantined_paths,
+        } => {
+            replace_quarantined_paths(quarantined_paths);
             let api = HidApi::new().context("failed initializing HID access")?;
             let discovered = scan_devices(&api);
             let timeout = client::maximum_poll_duration(discovered.len())
@@ -511,6 +612,7 @@ fn execute<W: Write>(request: WorkerRequest, output: &mut W) -> Result<WorkerRep
                 cache,
                 cache_changed: batch.cache_changed,
                 observation_ages_ms,
+                stalled_paths: take_new_stalled_paths(),
             })
         }
         WorkerRequest::Feature {
@@ -720,15 +822,17 @@ mod process_tree {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::RetiredWorker;
     use super::{
-        INITIAL_POLL_TIMEOUT, STATUS_POLL_INTERVAL, WorkerFrame, WorkerPermit, WorkerReply,
+        ACTIVE_WORKERS, INITIAL_POLL_TIMEOUT, STATUS_POLL_INTERVAL, WorkerFrame, WorkerPermit,
+        WorkerReply, WorkerTimeout, exchange_feature, record_stalled_path_from_error,
         supervise_child, write_frame,
     };
     #[cfg(windows)]
-    use super::RetiredWorker;
-    #[cfg(windows)]
     use std::io::{Read, Write};
     use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -817,6 +921,32 @@ mod tests {
 
         assert!(matches!(reply, WorkerReply::Failure { message } if message == "planned"));
         assert_eq!(INITIAL_POLL_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn review_round_31_stalled_path_is_quarantined_without_new_workers() {
+        let path = b"review-round-31-stalled-path";
+        record_stalled_path_from_error(
+            path,
+            &anyhow::Error::new(WorkerTimeout {
+                timeout: Duration::from_millis(20),
+            }),
+        );
+        let active_before = ACTIVE_WORKERS.load(Ordering::Acquire);
+
+        for _ in 0..5 {
+            let error = exchange_feature(
+                path,
+                &[0; 91],
+                &mut [0; 91],
+                Duration::ZERO,
+                Duration::from_millis(20),
+            )
+            .expect_err("quarantined path must not start another worker");
+            assert!(format!("{error:#}").contains("quarantined"));
+        }
+
+        assert_eq!(ACTIVE_WORKERS.load(Ordering::Acquire), active_before);
     }
 
     #[cfg(windows)]
