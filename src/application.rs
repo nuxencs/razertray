@@ -201,10 +201,12 @@ impl AppCore {
                         if let Some(id) = self.available_display_id().map(str::to_string) {
                             self.last_displayed_id = Some(id);
                         }
-                        self.enqueue_notification_candidates(&mut commands);
+                        self.invalidate_unavailable_forecasts();
+                        self.enqueue_notification_candidates(&mut commands, now);
                     }
                     Err(error) => {
                         self.available.clear();
+                        self.invalidate_unavailable_forecasts();
                         self.last_errors = vec![error];
                     }
                 }
@@ -280,7 +282,27 @@ impl AppCore {
         }
     }
 
-    fn enqueue_notification_candidates(&self, commands: &mut Vec<Command>) {
+    fn invalidate_unavailable_forecasts(&mut self) {
+        let unavailable: Vec<_> = self
+            .readings
+            .keys()
+            .filter(|id| !self.available.contains(*id))
+            .cloned()
+            .collect();
+        for id in unavailable {
+            self.forecaster.invalidate(&id);
+            self.forecasts.remove(&id);
+        }
+    }
+
+    fn projected_forecast(&self, device_key: &str, now: Instant) -> Option<Estimate> {
+        self.forecasts
+            .get(device_key)
+            .copied()
+            .and_then(|estimate| estimate.project(now))
+    }
+
+    fn enqueue_notification_candidates(&self, commands: &mut Vec<Command>, now: Instant) {
         let Some(displayed) = self.displayed_reading() else {
             return;
         };
@@ -290,7 +312,7 @@ impl AppCore {
                 if self.available.contains(&displayed.reading.device_key) {
                     commands.push(Command::NotifyCandidate {
                         reading: displayed.reading.clone(),
-                        estimate: self.forecasts.get(&displayed.reading.device_key).copied(),
+                        estimate: self.projected_forecast(&displayed.reading.device_key, now),
                     });
                 }
             }
@@ -299,7 +321,7 @@ impl AppCore {
                     if let Some(reading) = self.readings.get(id) {
                         commands.push(Command::NotifyCandidate {
                             reading: reading.reading.clone(),
-                            estimate: self.forecasts.get(id).copied(),
+                            estimate: self.projected_forecast(id, now),
                         });
                     }
                 }
@@ -347,11 +369,7 @@ impl AppCore {
         };
 
         let forecast = match &observation {
-            ObservationView::Fresh { reading } => self
-                .forecasts
-                .get(&reading.device_key)
-                .copied()
-                .and_then(|estimate| estimate.project(now)),
+            ObservationView::Fresh { reading } => self.projected_forecast(&reading.device_key, now),
             _ => None,
         };
         let stale_refresh_at = match displayed {
@@ -532,9 +550,13 @@ fn append_diagnostics(text: &mut String, diagnostics: &[PollError]) {
         [] => {}
         [error] => {
             text.push_str(" - ");
-            text.push_str(&error.display_name);
-            text.push_str(": ");
-            text.push_str(poll_error_status(error.scope, error.kind));
+            if error.scope == PollErrorScope::Subsystem {
+                text.push_str(&diagnostic_status(error));
+            } else {
+                text.push_str(&error.display_name);
+                text.push_str(": ");
+                text.push_str(poll_error_status(error.scope, error.kind));
+            }
         }
         _ => {
             if let Some(summary) = diagnostic_summary(diagnostics) {
@@ -548,7 +570,7 @@ fn append_diagnostics(text: &mut String, diagnostics: &[PollError]) {
 fn diagnostic_summary(diagnostics: &[PollError]) -> Option<String> {
     let first = diagnostics.first()?;
     if diagnostics.len() == 1 {
-        return Some(poll_error_status(first.scope, first.kind).to_string());
+        return Some(diagnostic_status(first));
     }
 
     if let Some((scope, kind)) = diagnostic_classification(diagnostics) {
@@ -570,6 +592,32 @@ fn diagnostic_summary(diagnostics: &[PollError]) -> Option<String> {
         "Hardware state indeterminate ({} reports) - run --diagnose for details",
         diagnostics.len()
     ))
+}
+
+fn diagnostic_status(error: &PollError) -> String {
+    if error.scope == PollErrorScope::Subsystem {
+        format!(
+            "{}: {}",
+            error.display_name,
+            subsystem_error_status(error.kind)
+        )
+    } else {
+        poll_error_status(error.scope, error.kind).to_string()
+    }
+}
+
+fn subsystem_error_status(kind: crate::model::PollErrorKind) -> &'static str {
+    match kind {
+        crate::model::PollErrorKind::AccessDenied => {
+            "Access denied - check permissions and refresh"
+        }
+        crate::model::PollErrorKind::Protocol => "Response invalid - refresh to retry",
+        crate::model::PollErrorKind::Unsupported => "Unsupported by this system",
+        crate::model::PollErrorKind::PartialUnsupported => {
+            "Support is indeterminate - refresh to retry"
+        }
+        _ => "Unavailable - refresh to retry",
+    }
 }
 
 fn diagnostic_classification(
@@ -616,18 +664,18 @@ fn poll_error_status(scope: PollErrorScope, kind: crate::model::PollErrorKind) -
         }
         (PollErrorScope::ChargeState, _) => "Charging status unavailable - refresh to retry",
         (PollErrorScope::Subsystem, crate::model::PollErrorKind::AccessDenied) => {
-            "HID access denied - check permissions and refresh"
+            "System component access denied - check permissions and refresh"
         }
         (PollErrorScope::Subsystem, crate::model::PollErrorKind::Protocol) => {
-            "HID response invalid - refresh to retry"
+            "System component response invalid - refresh to retry"
         }
         (PollErrorScope::Subsystem, crate::model::PollErrorKind::Unsupported) => {
-            "HID subsystem is unsupported"
+            "System component is unsupported"
         }
         (PollErrorScope::Subsystem, crate::model::PollErrorKind::PartialUnsupported) => {
-            "HID subsystem support is indeterminate - refresh to retry"
+            "System component support is indeterminate - refresh to retry"
         }
-        (PollErrorScope::Subsystem, _) => "HID access unavailable - refresh to retry",
+        (PollErrorScope::Subsystem, _) => "System component unavailable - refresh to retry",
     }
 }
 
@@ -965,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn review_round_17_forecast_uses_observation_time() {
+    fn review_round_18_forecast_projects_tray_and_notification() {
         let now = Instant::now();
         let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
         let mut first_reading = reading("mouse", 100);
@@ -1001,6 +1049,109 @@ mod tests {
             update.view.forecast.map(|estimate| estimate.remaining),
             Some(Duration::from_secs(30 * 60 - 16))
         );
+        assert!(matches!(
+            update.commands.as_slice(),
+            [Command::NotifyCandidate {
+                estimate: Some(estimate),
+                ..
+            }] if estimate.remaining == Duration::from_secs(30 * 60 - 16)
+        ));
+    }
+
+    #[test]
+    fn review_round_18_unavailable_poll_resets_forecast_calibration() {
+        let now = Instant::now();
+        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let mut initial = reading("mouse", 78);
+        initial.battery_raw = 200;
+        initial.observed_at = Some(now);
+        core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: vec![initial],
+                    errors: Vec::new(),
+                }),
+            ),
+            now,
+        );
+
+        let unavailable = core.next_poll_id();
+        core.handle(
+            AppEvent::PollStarted(unavailable),
+            now + Duration::from_secs(2 * 60 * 60),
+        );
+        core.handle(
+            AppEvent::PollFinished(unavailable, Ok(PollResult::default())),
+            now + Duration::from_secs(2 * 60 * 60),
+        );
+
+        let returned = core.next_poll_id();
+        let returned_at = now + Duration::from_secs(5 * 60 * 60);
+        core.handle(AppEvent::PollStarted(returned), returned_at);
+        let mut returned_reading = reading("mouse", 74);
+        returned_reading.battery_raw = 190;
+        returned_reading.observed_at = Some(returned_at);
+        let reset = core.handle(
+            AppEvent::PollFinished(
+                returned,
+                Ok(PollResult {
+                    devices: vec![returned_reading],
+                    errors: Vec::new(),
+                }),
+            ),
+            returned_at,
+        );
+        assert_eq!(reset.view.forecast, None);
+
+        let recalibration = core.next_poll_id();
+        let recalibrated_at = returned_at + Duration::from_secs(30 * 60);
+        core.handle(AppEvent::PollStarted(recalibration), recalibrated_at);
+        let mut recalibrated_reading = reading("mouse", 70);
+        recalibrated_reading.battery_raw = 180;
+        recalibrated_reading.observed_at = Some(recalibrated_at);
+        let recalibrated = core.handle(
+            AppEvent::PollFinished(
+                recalibration,
+                Ok(PollResult {
+                    devices: vec![recalibrated_reading],
+                    errors: Vec::new(),
+                }),
+            ),
+            recalibrated_at,
+        );
+        assert_eq!(
+            recalibrated
+                .view
+                .forecast
+                .map(|estimate| estimate.remaining),
+            Some(Duration::from_secs(9 * 60 * 60))
+        );
+    }
+
+    #[test]
+    fn review_round_18_cache_diagnostic_preserves_component_name() {
+        let now = Instant::now();
+        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let update = core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: Vec::new(),
+                    errors: vec![PollError::subsystem_component(
+                        "PID cache",
+                        "PID cache unavailable: permission denied",
+                    )],
+                }),
+            ),
+            now,
+        );
+
+        assert_eq!(
+            update.view.status_text,
+            "PID cache: Access denied - check permissions and refresh"
+        );
+        assert!(!update.view.status_text.contains("HID"));
     }
 
     #[test]

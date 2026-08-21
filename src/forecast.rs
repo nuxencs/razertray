@@ -81,6 +81,10 @@ pub struct Forecaster {
 }
 
 impl Forecaster {
+    pub fn invalidate(&mut self, device_key: &str) {
+        self.segments.remove(device_key);
+    }
+
     pub fn observe(&mut self, reading: &BatteryState, now: Instant) -> Option<Estimate> {
         if reading.charge_state != ChargeState::NotCharging {
             self.segments.remove(&reading.device_key);

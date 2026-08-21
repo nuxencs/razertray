@@ -559,7 +559,8 @@ fn spawn_poll_worker(
                         .clone()
                         .unwrap_or_else(|| PollError::subsystem("HID access is unavailable"))),
                 };
-                let outcome = attach_poll_diagnostic(outcome, cache_diagnostic.as_ref());
+                let outcome =
+                    attach_cache_diagnostic(outcome, cache_diagnostic.as_ref(), cache_recovered);
                 if cache_recovered {
                     cache_diagnostic = None;
                 }
@@ -591,7 +592,14 @@ fn spawn_poll_worker(
     });
 }
 
-fn attach_poll_diagnostic(outcome: PollOutcome, diagnostic: Option<&PollError>) -> PollOutcome {
+fn attach_cache_diagnostic(
+    outcome: PollOutcome,
+    diagnostic: Option<&PollError>,
+    recovered: bool,
+) -> PollOutcome {
+    if recovered {
+        return outcome;
+    }
     let Some(diagnostic) = diagnostic else {
         return outcome;
     };
@@ -634,7 +642,7 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_poll_diagnostic, welcome_update};
+    use super::{attach_cache_diagnostic, welcome_update};
     use crate::application::AppCore;
     use crate::config::AppConfig;
     use crate::model::{PollError, PollErrorKind, PollErrorScope};
@@ -675,7 +683,7 @@ mod tests {
         let cache_error =
             PollError::subsystem_component("PID cache", "PID cache unavailable: permission denied");
 
-        let result = attach_poll_diagnostic(Err(hid_error.clone()), Some(&cache_error))
+        let result = attach_cache_diagnostic(Err(hid_error.clone()), Some(&cache_error), false)
             .expect("typed poll result");
 
         assert!(result.devices.is_empty());
@@ -686,5 +694,20 @@ mod tests {
                 .iter()
                 .all(|error| error.scope == PollErrorScope::Subsystem)
         );
+    }
+
+    #[test]
+    fn review_round_18_repaired_cache_diagnostic_is_not_projected() {
+        let cache_error =
+            PollError::subsystem_component("PID cache", "PID cache unavailable: access denied");
+
+        let result = attach_cache_diagnostic(
+            Ok(crate::model::PollResult::default()),
+            Some(&cache_error),
+            true,
+        )
+        .expect("poll result");
+
+        assert!(result.errors.is_empty());
     }
 }

@@ -56,8 +56,9 @@ details. A later successful poll records recovery.
 ## Forecast
 
 Forecasting is private application state. It consumes successful, timestamped
-readings only. It resets after charging, large gaps, or implausible upward
-changes. An expired estimate restarts calibration instead of remaining at zero.
+readings only. It resets after charging, unavailable polls, large gaps, or
+implausible upward changes. An expired estimate restarts calibration instead
+of remaining at zero.
 Each projected estimate carries its timestamp. The tray refreshes at the next
 forecast or stale-age display boundary and removes an expired estimate between
 hardware polls.
