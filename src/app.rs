@@ -29,8 +29,8 @@ pub fn run_once(output: OnceOutput) -> Result<OnceStatus> {
     let loaded = config::load_or_create_config()?;
     let cfg = loaded.config;
     init_logging(&cfg);
-    if let Some(warning) = loaded.warning {
-        eprintln!("Warning: {warning}");
+    if let Some(recovery) = loaded.recovery {
+        eprintln!("Warning: {}", recovery.message());
     }
 
     let mut cache = config::load_or_create_pid_cache()?;
@@ -105,7 +105,7 @@ pub fn run_tray() -> Result<()> {
     };
     let loaded = config::load_or_create_config()?;
     init_logging(&loaded.config);
-    crate::tray::run_tray_app(loaded.config, loaded.warning)
+    crate::tray::run_tray_app(loaded.config, loaded.recovery)
 }
 
 #[cfg(not(target_os = "windows"))]

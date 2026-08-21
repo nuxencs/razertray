@@ -133,7 +133,40 @@ pub fn log_path() -> PathBuf {
 #[derive(Clone, Debug)]
 pub struct ConfigLoad {
     pub config: AppConfig,
-    pub warning: Option<String>,
+    pub recovery: Option<ConfigRecovery>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigRecovery {
+    InvalidFileReset {
+        backup_path: PathBuf,
+        parse_error: String,
+    },
+    ValuesAdjusted,
+}
+
+impl ConfigRecovery {
+    pub fn title(&self) -> &'static str {
+        match self {
+            Self::InvalidFileReset { .. } => "Configuration was reset",
+            Self::ValuesAdjusted => "Configuration was adjusted",
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::InvalidFileReset {
+                backup_path,
+                parse_error,
+            } => format!(
+                "The configuration was invalid and was reset. The old file is {}. Parse error: {parse_error}",
+                backup_path.display()
+            ),
+            Self::ValuesAdjusted => {
+                "Unsafe configuration values were adjusted to supported limits.".to_string()
+            }
+        }
+    }
 }
 
 fn write_atomic(path: &Path, raw: &[u8]) -> Result<()> {
@@ -258,7 +291,7 @@ fn load_or_create_config_at(path: &Path) -> Result<ConfigLoad> {
         save_config_at(path, &default_cfg)?;
         return Ok(ConfigLoad {
             config: default_cfg,
-            warning: None,
+            recovery: None,
         });
     }
 
@@ -272,24 +305,24 @@ fn load_or_create_config_at(path: &Path) -> Result<ConfigLoad> {
             save_config_at(path, &config)?;
             return Ok(ConfigLoad {
                 config,
-                warning: Some(format!(
-                    "The configuration was invalid and was reset. The old file is {}. Parse error: {err}",
-                    backup.display()
-                )),
+                recovery: Some(ConfigRecovery::InvalidFileReset {
+                    backup_path: backup,
+                    parse_error: err.to_string(),
+                }),
             });
         }
     };
     let before = parsed.clone();
     parsed.validate();
-    let warning = if parsed != before {
+    let recovery = if parsed != before {
         save_config_at(path, &parsed)?;
-        Some("Unsafe configuration values were adjusted to supported limits.".to_string())
+        Some(ConfigRecovery::ValuesAdjusted)
     } else {
         None
     };
     Ok(ConfigLoad {
         config: parsed,
-        warning,
+        recovery,
     })
 }
 
@@ -349,7 +382,7 @@ fn save_pid_cache_at(path: &Path, cache: &PidCache) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, PidCache, load_or_create_config_at, load_or_create_pid_cache_at,
+        AppConfig, ConfigRecovery, PidCache, load_or_create_config_at, load_or_create_pid_cache_at,
         replacement_backup_path, restore_interrupted_replacement,
     };
     use std::fs;
@@ -431,7 +464,7 @@ welcome_shown = true
         assert_eq!(loaded.config.log_level, "debug");
         assert_eq!(loaded.config.alert_scope, super::AlertScope::All);
         assert!(loaded.config.welcome_shown);
-        assert!(loaded.warning.is_none());
+        assert!(loaded.recovery.is_none());
         let serialized = toml::Value::try_from(&loaded.config).expect("serialize loaded config");
         assert_eq!(serialized["view_mode"].as_str(), Some("text"));
     }
@@ -463,7 +496,7 @@ welcome_shown = true
     }
 
     #[test]
-    fn invalid_config_is_preserved_and_replaced_with_defaults() {
+    fn config_recovery_resets_invalid_file() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let path = temp.path().join("config.toml");
         fs::write(&path, "not = [valid").expect("write invalid config");
@@ -471,7 +504,18 @@ welcome_shown = true
         let loaded = load_or_create_config_at(&path).expect("recover invalid config");
 
         assert_eq!(loaded.config, AppConfig::default());
-        assert!(loaded.warning.is_some());
+        let recovery = loaded.recovery.as_ref().expect("config recovery");
+        assert_eq!(recovery.title(), "Configuration was reset");
+        match recovery {
+            ConfigRecovery::InvalidFileReset {
+                backup_path,
+                parse_error,
+            } => {
+                assert!(backup_path.exists());
+                assert!(!parse_error.is_empty());
+            }
+            ConfigRecovery::ValuesAdjusted => panic!("expected invalid-file reset"),
+        }
         let parsed: AppConfig =
             toml::from_str(&fs::read_to_string(&path).expect("read replacement config"))
                 .expect("replacement config is valid");
@@ -491,6 +535,51 @@ welcome_shown = true
             fs::read_to_string(backups[0].path()).expect("read preserved config"),
             "not = [valid"
         );
+    }
+
+    #[test]
+    fn config_recovery_adjusts_values_without_reset() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("config.toml");
+        let config = AppConfig {
+            poll_interval_seconds: 1,
+            low_battery_threshold: 25,
+            low_battery_cooldown_minutes: 240,
+            selected_device_id: "preferred-mouse".to_string(),
+            log_level: "debug".to_string(),
+            view_mode: super::ViewMode::Text,
+            alert_scope: super::AlertScope::All,
+            welcome_shown: true,
+        };
+        fs::write(
+            &path,
+            toml::to_string_pretty(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let loaded = load_or_create_config_at(&path).expect("adjust config");
+
+        assert_eq!(loaded.recovery, Some(ConfigRecovery::ValuesAdjusted));
+        assert_eq!(
+            loaded.recovery.as_ref().map(ConfigRecovery::title),
+            Some("Configuration was adjusted")
+        );
+        assert_eq!(
+            loaded.recovery.as_ref().map(ConfigRecovery::message),
+            Some("Unsafe configuration values were adjusted to supported limits.".to_string())
+        );
+        assert_eq!(loaded.config.poll_interval_seconds, 5);
+        assert_eq!(loaded.config.low_battery_threshold, 25);
+        assert_eq!(loaded.config.low_battery_cooldown_minutes, 240);
+        assert_eq!(loaded.config.selected_device_id, "preferred-mouse");
+        assert_eq!(loaded.config.log_level, "debug");
+        assert_eq!(loaded.config.view_mode, super::ViewMode::Text);
+        assert_eq!(loaded.config.alert_scope, super::AlertScope::All);
+        assert!(loaded.config.welcome_shown);
+        let persisted: AppConfig =
+            toml::from_str(&fs::read_to_string(&path).expect("read adjusted config"))
+                .expect("parse adjusted config");
+        assert_eq!(persisted, loaded.config);
     }
 
     #[test]

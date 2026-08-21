@@ -3,7 +3,7 @@ use crate::application::{
     AppCore, AppEvent, Command, ConfigRollback, PollId, TrayIconState, TrayView, Update,
 };
 use crate::autostart;
-use crate::config::{self, AlertScope, AppConfig, PidCache, ViewMode};
+use crate::config::{self, AlertScope, AppConfig, ConfigRecovery, PidCache, ViewMode};
 use crate::error_tracker::{ErrorNotice, ErrorTracker};
 use crate::hid::client;
 use crate::icon;
@@ -202,7 +202,7 @@ impl MenuHandles {
     }
 }
 
-pub fn run_tray_app(config: AppConfig, startup_warning: Option<String>) -> Result<()> {
+pub fn run_tray_app(config: AppConfig, startup_recovery: Option<ConfigRecovery>) -> Result<()> {
     let exe_path = std::env::current_exe().context("failed resolving executable path")?;
     let autostart_enabled = match autostart::is_enabled(&exe_path) {
         Ok(enabled) => Some(enabled),
@@ -237,9 +237,10 @@ pub fn run_tray_app(config: AppConfig, startup_warning: Option<String>) -> Resul
     );
     let mut error_tracker = ErrorTracker::default();
 
-    if let Some(warning) = startup_warning {
-        tracing::warn!("configuration recovery: {warning}");
-        let _ = notify::show_error("Configuration was reset", &warning);
+    if let Some(recovery) = startup_recovery {
+        let message = recovery.message();
+        tracing::warn!("configuration recovery: {message}");
+        let _ = notify::show_error(recovery.title(), &message);
     }
 
     match welcome_update(&mut core, notify::show_welcome, Instant::now()) {

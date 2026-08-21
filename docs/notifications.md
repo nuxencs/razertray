@@ -20,9 +20,10 @@ its own cooldown.
 
 ## Information and error notifications
 
-The first run explains how to open the tray menu. Recoverable configuration and
-settings failures show a short action message. Detailed errors remain in the
-log file.
+The first run explains how to open the tray menu. A valid configuration with
+unsafe values shows **Configuration was adjusted**. An invalid file that was
+preserved and replaced shows **Configuration was reset**. Settings failures
+show a short action message. Detailed errors remain in the log file.
 
 ## Sender identity
 
