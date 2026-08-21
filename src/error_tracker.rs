@@ -25,6 +25,12 @@ impl From<&PollError> for ErrorKey {
     }
 }
 
+impl ErrorKey {
+    fn same_incident(&self, other: &Self) -> bool {
+        self.device_key == other.device_key && self.pid == other.pid && self.scope == other.scope
+    }
+}
+
 struct ActiveError {
     error: PollError,
     last_reported: Instant,
@@ -97,12 +103,9 @@ impl ErrorTracker {
             .cloned()
             .collect();
         for key in absent {
-            let replacement_is_active = current.iter().any(|current_key| {
-                current_key.device_key == key.device_key
-                    && current_key.pid == key.pid
-                    && current_key.scope == key.scope
-                    && current_key.kind == key.kind
-            });
+            let replacement_is_active = current
+                .iter()
+                .any(|current_key| current_key.same_incident(&key));
             let recovered = !replacement_is_active
                 && if key.device_key.is_empty() {
                     true
@@ -290,6 +293,29 @@ mod tests {
                 now + Duration::from_secs(120)
             ),
             vec![ErrorNotice::Started(first)]
+        );
+    }
+
+    #[test]
+    fn review_error_kind_transition_does_not_report_recovery() {
+        let now = Instant::now();
+        let mut tracker = ErrorTracker::default();
+        let mut timeout = error();
+        timeout.scope = PollErrorScope::ChargeState;
+        timeout.message = "charging status unavailable".to_string();
+        let mut protocol = timeout.clone();
+        protocol.kind = PollErrorKind::Protocol;
+        protocol.message = "invalid charging response crc".to_string();
+
+        tracker.observe(std::slice::from_ref(&timeout), &successful(), true, now);
+        assert_eq!(
+            tracker.observe(
+                std::slice::from_ref(&protocol),
+                &successful(),
+                true,
+                now + Duration::from_secs(60)
+            ),
+            vec![ErrorNotice::Started(protocol)]
         );
     }
 }

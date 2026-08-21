@@ -139,6 +139,13 @@ fn query_device(
         }
     }
 
+    if opened.is_empty() {
+        if pid_cache.get(device.pid).is_some() {
+            *cache_changed |= pid_cache.remove(device.pid);
+        }
+        return Err(no_open_transport_failure(failures));
+    }
+
     let cached = pid_cache.get(device.pid);
     let transaction_ids = battery_transaction_ids(cached, known);
     let mut transports: Vec<_> = opened
@@ -199,6 +206,15 @@ fn query_device(
         },
         warnings,
     ))
+}
+
+fn no_open_transport_failure(mut failures: Vec<anyhow::Error>) -> QueryFailure {
+    if failures.is_empty() {
+        failures.push(anyhow::anyhow!(
+            "candidate interfaces unavailable for battery query"
+        ));
+    }
+    QueryFailure::Failed { errors: failures }
 }
 
 fn charge_query_result(
@@ -409,7 +425,7 @@ fn probe_request_with<T: FeatureTransport, F: Fn(u8) -> RazerReport>(
     }
     if failures.is_empty() {
         failures.push(anyhow::anyhow!(
-            "no candidate interface produced a completed response"
+            "candidate interfaces unavailable for battery query"
         ));
     }
     Err(QueryFailure::Failed { errors: failures })
@@ -579,8 +595,9 @@ fn scale_percent(raw: u8) -> u8 {
 mod tests {
     use super::{
         FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence, candidate_probe_plan,
-        charge_query_result, format_error_chain, merge_query_failure, prioritize_probe_candidate,
-        probe_request_with, record_query_result, scale_percent, update_cache_after_success,
+        charge_query_result, format_error_chain, merge_query_failure, no_open_transport_failure,
+        prioritize_probe_candidate, probe_request_with, record_query_result, scale_percent,
+        update_cache_after_success,
     };
     use crate::config::PidCache;
     use crate::hid::protocol::{
@@ -847,6 +864,29 @@ mod tests {
                 .message
                 .contains("expected 91 bytes, got 90")
         );
+    }
+
+    #[test]
+    fn review_open_failures_remain_the_only_empty_transport_diagnostics() {
+        let device = DiscoveredDevice {
+            key: "mouse".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            candidates: Vec::new(),
+        };
+        let mut result = PollResult::default();
+
+        record_query_result(
+            &mut result,
+            &device,
+            Err(no_open_transport_failure(vec![anyhow::anyhow!(
+                "interface 2 could not be opened: access denied"
+            )])),
+        );
+
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].kind, PollErrorKind::AccessDenied);
+        assert!(result.errors[0].message.contains("interface 2"));
     }
 
     #[test]

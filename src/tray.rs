@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tao::event::Event;
+use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -255,104 +255,112 @@ pub fn run_tray_app(config: AppConfig, startup_recovery: Option<ConfigRecovery>)
         }
     }
 
+    let mut next_projection_at = None;
     event_loop.run(move |event, _target, control_flow| {
-        *control_flow = ControlFlow::Wait;
-        let Event::UserEvent(user_event) = event else {
-            return;
-        };
+        *control_flow = next_projection_at
+            .map(ControlFlow::WaitUntil)
+            .unwrap_or(ControlFlow::Wait);
 
-        let update = match user_event {
-            UserEvent::PollStarted(id) => core.handle(AppEvent::PollStarted(id), Instant::now()),
-            UserEvent::PollFinished(id, result) => {
-                let (poll_errors, successful_ids, poll_completed) = match &result {
-                    Ok(poll_result) => (
-                        poll_result.errors.clone(),
-                        poll_result
-                            .devices
-                            .iter()
-                            .map(|device| device.device_key.clone())
-                            .collect::<BTreeSet<_>>(),
-                        true,
-                    ),
-                    Err(error) => (vec![error.clone()], BTreeSet::new(), false),
-                };
-                for notice in error_tracker.observe(
-                    &poll_errors,
-                    &successful_ids,
-                    poll_completed,
-                    Instant::now(),
-                ) {
-                    log_error_notice(notice);
-                }
-                core.handle(AppEvent::PollFinished(id, result), Instant::now())
+        let update = match event {
+            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+                core.handle(AppEvent::ProjectionTick, Instant::now())
             }
-            UserEvent::Menu(menu_id) => {
-                if menu_id == "refresh" {
-                    let _ = cmd_tx.send(WorkerCommand::Refresh);
-                    return;
+            Event::UserEvent(user_event) => match user_event {
+                UserEvent::PollStarted(id) => {
+                    core.handle(AppEvent::PollStarted(id), Instant::now())
                 }
-                if menu_id == "exit" {
-                    let _ = cmd_tx.send(WorkerCommand::Exit);
-                    *control_flow = ControlFlow::Exit;
-                    return;
-                }
-                if menu_id == "open-folder" {
-                    if let Err(err) = open_app_folder() {
-                        tracing::warn!("failed opening app folder: {err}");
-                        let _ = notify::show_error(
-                            "Could not open the app folder",
-                            "Open %APPDATA%\\razertray in File Explorer.",
-                        );
-                    }
-                    return;
-                }
-                if menu_id == "autostart" {
-                    let requested = menu.autostart_item.is_checked();
-                    match autostart::set_enabled(&exe_path, requested) {
-                        Ok(()) => return,
-                        Err(err) => {
-                            menu.autostart_item.set_checked(!requested);
-                            tracing::warn!("failed setting autostart: {err}");
-                            let _ = notify::show_error(
-                                "Start at login was not changed",
-                                "Try again, or check Windows startup-app permissions.",
-                            );
-                            return;
-                        }
-                    }
-                } else if menu_id == "viewmode" {
-                    let mode = if menu.view_mode_item.is_checked() {
-                        ViewMode::Text
-                    } else {
-                        ViewMode::Icon
+                UserEvent::PollFinished(id, result) => {
+                    let (poll_errors, successful_ids, poll_completed) = match &result {
+                        Ok(poll_result) => (
+                            poll_result.errors.clone(),
+                            poll_result
+                                .devices
+                                .iter()
+                                .map(|device| device.device_key.clone())
+                                .collect::<BTreeSet<_>>(),
+                            true,
+                        ),
+                        Err(error) => (vec![error.clone()], BTreeSet::new(), false),
                     };
-                    core.handle(AppEvent::SetViewMode(mode), Instant::now())
-                } else if menu_id == "alertscope" {
-                    let scope = if menu.alert_scope_item.is_checked() {
-                        AlertScope::All
-                    } else {
-                        AlertScope::Selected
-                    };
-                    core.handle(AppEvent::SetAlertScope(scope), Instant::now())
-                } else if let Some(raw) = menu_id.strip_prefix("threshold:") {
-                    let Ok(threshold) = raw.parse::<u8>() else {
-                        return;
-                    };
-                    core.handle(AppEvent::SetLowBatteryThreshold(threshold), Instant::now())
-                } else if let Some(raw) = menu_id.strip_prefix("interval:") {
-                    let Ok(seconds) = raw.parse::<u64>() else {
-                        return;
-                    };
-                    core.handle(AppEvent::SetPollInterval(seconds), Instant::now())
-                } else if let Some(device_id) = menu_id.strip_prefix("device:") {
-                    core.handle(
-                        AppEvent::SelectDevice(device_id.to_string()),
+                    for notice in error_tracker.observe(
+                        &poll_errors,
+                        &successful_ids,
+                        poll_completed,
                         Instant::now(),
-                    )
-                } else {
-                    return;
+                    ) {
+                        log_error_notice(notice);
+                    }
+                    core.handle(AppEvent::PollFinished(id, result), Instant::now())
                 }
-            }
+                UserEvent::Menu(menu_id) => {
+                    if menu_id == "refresh" {
+                        let _ = cmd_tx.send(WorkerCommand::Refresh);
+                        return;
+                    }
+                    if menu_id == "exit" {
+                        let _ = cmd_tx.send(WorkerCommand::Exit);
+                        *control_flow = ControlFlow::Exit;
+                        return;
+                    }
+                    if menu_id == "open-folder" {
+                        if let Err(err) = open_app_folder() {
+                            tracing::warn!("failed opening app folder: {err}");
+                            let _ = notify::show_error(
+                                "Could not open the app folder",
+                                "Open %APPDATA%\\razertray in File Explorer.",
+                            );
+                        }
+                        return;
+                    }
+                    if menu_id == "autostart" {
+                        let requested = menu.autostart_item.is_checked();
+                        match autostart::set_enabled(&exe_path, requested) {
+                            Ok(()) => return,
+                            Err(err) => {
+                                menu.autostart_item.set_checked(!requested);
+                                tracing::warn!("failed setting autostart: {err}");
+                                let _ = notify::show_error(
+                                    "Start at login was not changed",
+                                    "Try again, or check Windows startup-app permissions.",
+                                );
+                                return;
+                            }
+                        }
+                    } else if menu_id == "viewmode" {
+                        let mode = if menu.view_mode_item.is_checked() {
+                            ViewMode::Text
+                        } else {
+                            ViewMode::Icon
+                        };
+                        core.handle(AppEvent::SetViewMode(mode), Instant::now())
+                    } else if menu_id == "alertscope" {
+                        let scope = if menu.alert_scope_item.is_checked() {
+                            AlertScope::All
+                        } else {
+                            AlertScope::Selected
+                        };
+                        core.handle(AppEvent::SetAlertScope(scope), Instant::now())
+                    } else if let Some(raw) = menu_id.strip_prefix("threshold:") {
+                        let Ok(threshold) = raw.parse::<u8>() else {
+                            return;
+                        };
+                        core.handle(AppEvent::SetLowBatteryThreshold(threshold), Instant::now())
+                    } else if let Some(raw) = menu_id.strip_prefix("interval:") {
+                        let Ok(seconds) = raw.parse::<u64>() else {
+                            return;
+                        };
+                        core.handle(AppEvent::SetPollInterval(seconds), Instant::now())
+                    } else if let Some(device_id) = menu_id.strip_prefix("device:") {
+                        core.handle(
+                            AppEvent::SelectDevice(device_id.to_string()),
+                            Instant::now(),
+                        )
+                    } else {
+                        return;
+                    }
+                }
+            },
+            _ => return,
         };
 
         let update =
@@ -368,6 +376,10 @@ pub fn run_tray_app(config: AppConfig, startup_recovery: Option<ConfigRecovery>)
         if let Err(err) = apply_projection(&mut menu, &mut tray_icon, &update.view) {
             tracing::warn!("failed applying tray view: {err}");
         }
+        next_projection_at = update.view.forecast.map(|estimate| estimate.refresh_at());
+        *control_flow = next_projection_at
+            .map(ControlFlow::WaitUntil)
+            .unwrap_or(ControlFlow::Wait);
     });
 }
 

@@ -73,6 +73,7 @@ impl PollId {
 pub enum AppEvent {
     PollStarted(PollId),
     PollFinished(PollId, PollOutcome),
+    ProjectionTick,
     SelectDevice(String),
     SetViewMode(ViewMode),
     SetAlertScope(AlertScope),
@@ -206,6 +207,7 @@ impl AppCore {
                     }
                 }
             }
+            AppEvent::ProjectionTick => {}
             AppEvent::SelectDevice(id) => {
                 let rollback = self.config_rollback();
                 if self.available.contains(&id) {
@@ -343,7 +345,11 @@ impl AppCore {
         };
 
         let forecast = match &observation {
-            ObservationView::Fresh { reading } => self.forecasts.get(&reading.device_key).copied(),
+            ObservationView::Fresh { reading } => self
+                .forecasts
+                .get(&reading.device_key)
+                .copied()
+                .and_then(|estimate| estimate.project(now)),
             _ => None,
         };
         let (status_text, tooltip, icon) =
@@ -858,6 +864,56 @@ mod tests {
             changed.commands.as_slice(),
             [Command::SaveConfig { .. }, Command::ApplyPollInterval(300)]
         ));
+    }
+
+    #[test]
+    fn review_forecast_projection_counts_down_and_expires_between_polls() {
+        let now = Instant::now();
+        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: vec![reading("mouse", 100)],
+                    errors: Vec::new(),
+                }),
+            ),
+            now,
+        );
+        let second = core.next_poll_id();
+        let measured_at = now + Duration::from_secs(30 * 60);
+        core.handle(AppEvent::PollStarted(second), measured_at);
+        let measured = core.handle(
+            AppEvent::PollFinished(
+                second,
+                Ok(PollResult {
+                    devices: vec![reading("mouse", 50)],
+                    errors: Vec::new(),
+                }),
+            ),
+            measured_at,
+        );
+        assert_eq!(
+            measured.view.forecast.map(|estimate| estimate.remaining),
+            Some(Duration::from_secs(30 * 60))
+        );
+
+        let countdown = core.handle(
+            AppEvent::ProjectionTick,
+            measured_at + Duration::from_secs(10 * 60 + 1),
+        );
+        assert_eq!(
+            countdown.view.forecast.map(|estimate| estimate.remaining),
+            Some(Duration::from_secs(20 * 60 - 1))
+        );
+        assert!(countdown.view.status_text.contains("~19 min left"));
+
+        let expired = core.handle(
+            AppEvent::ProjectionTick,
+            measured_at + Duration::from_secs(30 * 60),
+        );
+        assert_eq!(expired.view.forecast, None);
+        assert!(!expired.view.status_text.contains("left"));
     }
 
     #[test]

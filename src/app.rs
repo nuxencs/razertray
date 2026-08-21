@@ -40,10 +40,10 @@ pub fn run_once(output: OnceOutput) -> Result<OnceStatus> {
             .context("failed to initialize hidapi")
             .map(|api| client::poll_devices(&api, &mut cache)),
     );
+    let mut result = batch.result;
     if batch.cache_changed {
-        config::save_pid_cache(&cache)?;
+        record_cache_save_result(&mut result, config::save_pid_cache(&cache));
     }
-    let result = batch.result;
 
     if output == OnceOutput::Json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -86,6 +86,21 @@ pub fn run_once(output: OnceOutput) -> Result<OnceStatus> {
     }
 
     Ok(once_status(&result))
+}
+
+fn record_cache_save_result(result: &mut PollResult, save_result: Result<()>) {
+    let Err(error) = save_result else {
+        return;
+    };
+    let message = format!("failed saving PID cache: {error:#}");
+    result.errors.push(PollError {
+        device_key: String::new(),
+        display_name: "PID cache".to_string(),
+        pid: 0,
+        scope: crate::model::PollErrorScope::Subsystem,
+        kind: crate::model::PollErrorKind::classify_message(&message),
+        message,
+    });
 }
 
 fn write_poll_errors(
@@ -281,8 +296,13 @@ fn rotated_log_path(base_path: &Path, index: usize) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OnceOutput, OnceStatus, once_status, poll_batch_or_diagnostic, write_poll_errors};
-    use crate::model::{PollError, PollErrorKind, PollErrorScope, PollResult};
+    use super::{
+        OnceOutput, OnceStatus, once_status, poll_batch_or_diagnostic, record_cache_save_result,
+        write_poll_errors,
+    };
+    use crate::model::{
+        BatteryState, ChargeState, PollError, PollErrorKind, PollErrorScope, PollResult,
+    };
 
     #[test]
     fn unsupported_device_is_a_failure_not_no_device() {
@@ -314,6 +334,34 @@ mod tests {
         assert_eq!(json["devices"], serde_json::json!([]));
         assert_eq!(json["errors"][0]["scope"], "subsystem");
         assert_eq!(json["errors"][0]["kind"], "access-denied");
+    }
+
+    #[test]
+    fn review_cache_save_failure_preserves_poll_result() {
+        let mut result = PollResult {
+            devices: vec![BatteryState {
+                device_key: "mouse".to_string(),
+                display_name: "Mouse".to_string(),
+                pid: 1,
+                battery_raw: 128,
+                battery_percent: 50,
+                charge_state: ChargeState::NotCharging,
+            }],
+            errors: Vec::new(),
+        };
+
+        record_cache_save_result(
+            &mut result,
+            Err(anyhow::anyhow!("permission denied while replacing cache")),
+        );
+
+        assert_eq!(once_status(&result), OnceStatus::PartialFailure);
+        let json = serde_json::to_value(result).expect("serialize poll result");
+        assert_eq!(json["devices"][0]["device_key"], "mouse");
+        assert_eq!(json["devices"][0]["battery_percent"], 50);
+        assert_eq!(json["errors"][0]["scope"], "subsystem");
+        assert_eq!(json["errors"][0]["kind"], "access-denied");
+        assert_eq!(json["errors"][0]["display_name"], "PID cache");
     }
 
     #[test]

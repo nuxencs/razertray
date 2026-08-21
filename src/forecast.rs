@@ -10,6 +10,42 @@ const MAX_ESTIMATE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Estimate {
     pub remaining: Duration,
+    projected_at: Instant,
+}
+
+impl Estimate {
+    fn new(remaining: Duration, projected_at: Instant) -> Self {
+        Self {
+            remaining,
+            projected_at,
+        }
+    }
+
+    pub fn project(self, now: Instant) -> Option<Self> {
+        let elapsed = now.saturating_duration_since(self.projected_at);
+        let remaining = self.remaining.checked_sub(elapsed)?;
+        (!remaining.is_zero()).then(|| Self::new(remaining, now))
+    }
+
+    pub fn refresh_at(self) -> Instant {
+        self.projected_at + self.refresh_after()
+    }
+
+    fn refresh_after(self) -> Duration {
+        let seconds = self.remaining.as_secs();
+        if seconds < 60 {
+            return self.remaining;
+        }
+        let unit_seconds = if seconds < 3_600 {
+            60
+        } else if seconds < 48 * 3_600 {
+            3_600
+        } else {
+            24 * 3_600
+        };
+        let displayed_boundary = Duration::from_secs(seconds / unit_seconds * unit_seconds);
+        self.remaining - displayed_boundary + Duration::from_nanos(1)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -87,7 +123,7 @@ impl Forecaster {
             observed_at: now,
             remaining,
         });
-        Some(Estimate { remaining })
+        Some(Estimate::new(remaining, now))
     }
 }
 
@@ -119,6 +155,10 @@ mod tests {
             battery_percent: (u16::from(raw) * 100 / 255) as u8,
             charge_state,
         }
+    }
+
+    fn estimate(remaining: Duration) -> Estimate {
+        Estimate::new(remaining, Instant::now())
     }
 
     #[test]
@@ -197,29 +237,36 @@ mod tests {
     #[test]
     fn estimate_format_uses_conservative_whole_units() {
         assert_eq!(
-            format_estimate(Estimate {
-                remaining: Duration::from_secs(30),
-            }),
+            format_estimate(estimate(Duration::from_secs(30))),
             "~<1 min left"
         );
         assert_eq!(
-            format_estimate(Estimate {
-                remaining: Duration::from_secs(6 * 60 + 59),
-            }),
+            format_estimate(estimate(Duration::from_secs(6 * 60 + 59))),
             "~6 min left"
         );
         assert_eq!(
-            format_estimate(Estimate {
-                remaining: Duration::from_secs(47 * 3_600 + 59 * 60),
-            }),
+            format_estimate(estimate(Duration::from_secs(47 * 3_600 + 59 * 60))),
             "~47 h left"
         );
         assert_eq!(
-            format_estimate(Estimate {
-                remaining: Duration::from_secs(48 * 3_600 + 59 * 60),
-            }),
+            format_estimate(estimate(Duration::from_secs(48 * 3_600 + 59 * 60))),
             "~2 days left"
         );
+    }
+
+    #[test]
+    fn review_estimate_projection_counts_down_and_expires() {
+        let now = Instant::now();
+        let estimate = Estimate::new(Duration::from_secs(6 * 60), now);
+
+        assert_eq!(estimate.refresh_at(), now + Duration::from_nanos(1));
+        assert_eq!(
+            estimate
+                .project(now + Duration::from_secs(61))
+                .map(|projected| projected.remaining),
+            Some(Duration::from_secs(5 * 60 - 1))
+        );
+        assert_eq!(estimate.project(now + Duration::from_secs(6 * 60)), None);
     }
 
     #[test]

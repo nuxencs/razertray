@@ -58,5 +58,7 @@ details. A later successful poll records recovery.
 Forecasting is private application state. It consumes successful, timestamped
 readings only. It resets after charging, large gaps, or implausible upward
 changes. An expired estimate restarts calibration instead of remaining at zero.
+Each projected estimate carries its timestamp. The tray refreshes at the next
+display boundary and removes an expired estimate between hardware polls.
 The tray and notification commands receive the current estimate. Forecast
 samples and discharge-rate state remain private to `AppCore`.
