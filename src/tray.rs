@@ -20,6 +20,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 const EMPTY_RETRY_START_SECS: u64 = 2;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const THRESHOLD_OPTIONS: &[u8] = &[10, 15, 20, 25];
 const INTERVAL_OPTIONS: &[(u64, &str)] = &[
     (30, "30 seconds"),
@@ -320,6 +321,7 @@ pub fn run_tray_app(config: AppConfig, startup_recovery: Option<ConfigRecovery>)
                     }
                     if menu_id == "exit" {
                         let _ = cmd_tx.send(WorkerCommand::Exit);
+                        worker::shutdown(SHUTDOWN_TIMEOUT);
                         *control_flow = ControlFlow::Exit;
                         return;
                     }

@@ -25,7 +25,7 @@ tag = false
 
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.7.2"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 winreg = "0.55.0"
 
 [dev-dependencies]

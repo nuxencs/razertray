@@ -47,9 +47,12 @@ every first-round target. If the bounded candidate set is truncated,
 unsupported evidence remains partial. Each interface open and feature exchange
 runs in its own short-lived worker process. At a deadline, the caller requests
 termination and returns without waiting for process cleanup. A bounded
-background supervisor retains every non-exited process until it is reaped, so
-stalled processes cannot accumulate without limit. The next candidate or
-transaction ID then runs in fresh isolation while supervised capacity remains.
+background supervisor retains every non-exited poll process until it is reaped.
+On Windows, each poll and its feature-operation descendants belong to a
+kill-on-close process tree owned by the long-lived app process. Feature stalls
+cannot consume capacity reserved for later devices. Tray shutdown terminates
+active process trees within a bounded wait. The next candidate or transaction
+ID runs in fresh isolation while supervised capacity remains.
 Verified devices try the battery-winning interface first for charging status,
 then bounded fallbacks. Ambiguous serialless groups retain probe results only as
 typed diagnostics, never as a definitive device reading. Excluded charge

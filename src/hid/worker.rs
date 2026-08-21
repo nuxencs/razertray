@@ -20,6 +20,7 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_SUPERVISED_WORKERS: usize = 4;
 const OBSERVATION_TRANSIT_ALLOWANCE_MS: u64 = 10;
 const FRAME_PREFIX: &str = "RAZERTRAY-HID:";
+const PROCESS_TREE_ENV: &str = "RAZERTRAY_HID_PROCESS_TREE";
 
 static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static RETIRED_WORKERS: LazyLock<Mutex<Vec<RetiredWorker>>> =
@@ -112,7 +113,8 @@ impl Drop for WorkerPermit {
 struct RetiredWorker {
     child: Child,
     reader: Option<thread::JoinHandle<()>>,
-    _permit: WorkerPermit,
+    _permit: Option<WorkerPermit>,
+    _tree: Option<process_tree::Owned>,
 }
 
 struct OutputReader {
@@ -124,14 +126,18 @@ struct SupervisedChild {
     child: Option<Child>,
     reader: Option<thread::JoinHandle<()>>,
     permit: Option<WorkerPermit>,
+    tree: Option<process_tree::Owned>,
+    retain_locally: bool,
 }
 
 impl SupervisedChild {
-    fn new(child: Child, permit: WorkerPermit) -> Self {
+    fn new(child: Child, permit: Option<WorkerPermit>, retain_locally: bool) -> Self {
         Self {
             child: Some(child),
             reader: None,
-            permit: Some(permit),
+            permit,
+            tree: None,
+            retain_locally,
         }
     }
 
@@ -142,13 +148,24 @@ impl SupervisedChild {
     fn mark_exited(&mut self) {
         self.child.take();
         self.permit.take();
+        self.tree.take();
     }
 }
 
 impl Drop for SupervisedChild {
     fn drop(&mut self) {
-        if let (Some(child), Some(permit)) = (self.child.take(), self.permit.take()) {
-            retire_worker(child, self.reader.take(), permit);
+        if let Some(child) = self.child.take() {
+            if self.retain_locally {
+                retire_worker(
+                    child,
+                    self.reader.take(),
+                    self.permit.take(),
+                    self.tree.take(),
+                );
+            } else {
+                let mut child = child;
+                let _ = child.kill();
+            }
         }
     }
 }
@@ -235,26 +252,38 @@ fn worker_failure<T>(reply: WorkerReply, expected: &str) -> Result<T> {
 }
 
 fn run_process(request: &WorkerRequest, timeout: Duration) -> Result<WorkerReply> {
-    let permit = WorkerPermit::acquire()?;
+    let inherited_tree = uses_inherited_process_tree(request);
+    let permit = if inherited_tree {
+        None
+    } else {
+        Some(WorkerPermit::acquire()?)
+    };
     let input = serde_json::to_vec(request).context("failed encoding HID worker request")?;
     let executable = std::env::current_exe().context("failed resolving HID worker executable")?;
-    let child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("--hid-worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    if matches!(request, WorkerRequest::Poll { .. }) {
+        command.env(PROCESS_TREE_ENV, "1");
+    }
+    let child = command
         .spawn()
         .context("failed starting HID worker process")?;
-    supervise_child(child, &input, timeout, permit)
+    let mut worker = SupervisedChild::new(child, permit, !inherited_tree);
+    if matches!(request, WorkerRequest::Poll { .. }) {
+        worker.tree = process_tree::assign(worker.child_mut())?;
+    }
+    supervise_child(worker, &input, timeout)
 }
 
 fn supervise_child(
-    child: Child,
+    mut worker: SupervisedChild,
     input: &[u8],
     initial_timeout: Duration,
-    permit: WorkerPermit,
 ) -> Result<WorkerReply> {
-    let mut worker = SupervisedChild::new(child, permit);
     let stdout = worker
         .child_mut()
         .stdout
@@ -323,6 +352,17 @@ fn supervise_child(
     }
 }
 
+fn uses_inherited_process_tree(request: &WorkerRequest) -> bool {
+    #[cfg(windows)]
+    return matches!(request, WorkerRequest::Feature { .. })
+        && std::env::var_os(PROCESS_TREE_ENV).is_some();
+    #[cfg(not(windows))]
+    {
+        let _ = request;
+        false
+    }
+}
+
 fn start_output_reader(stdout: ChildStdout) -> Result<OutputReader> {
     let (sender, receiver) = mpsc::channel();
     let handle = thread::Builder::new()
@@ -360,7 +400,15 @@ fn read_output_frames(
     }
 }
 
-fn retire_worker(mut child: Child, reader: Option<thread::JoinHandle<()>>, permit: WorkerPermit) {
+fn retire_worker(
+    mut child: Child,
+    reader: Option<thread::JoinHandle<()>>,
+    permit: Option<WorkerPermit>,
+    tree: Option<process_tree::Owned>,
+) {
+    if let Some(tree) = &tree {
+        process_tree::terminate(tree);
+    }
     let _ = child.kill();
     RETIRED_WORKERS
         .lock()
@@ -369,8 +417,13 @@ fn retire_worker(mut child: Child, reader: Option<thread::JoinHandle<()>>, permi
             child,
             reader,
             _permit: permit,
+            _tree: tree,
         });
     LazyLock::force(&REAPER);
+}
+
+pub(crate) fn shutdown(timeout: Duration) {
+    process_tree::shutdown(timeout);
 }
 
 pub(crate) fn run() -> Result<()> {
@@ -480,6 +533,127 @@ fn terminate_current_process() -> ! {
     std::process::abort()
 }
 
+#[cfg(windows)]
+mod process_tree {
+    use super::{Child, Duration, Instant, LazyLock, Mutex, Result, STATUS_POLL_INTERVAL};
+    use anyhow::Context;
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use std::sync::{Arc, Weak};
+    use std::thread;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject,
+    };
+
+    pub(super) type Owned = Arc<Job>;
+
+    pub(super) struct Job {
+        handle: HANDLE,
+    }
+
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    static ACTIVE_JOBS: LazyLock<Mutex<Vec<Weak<Job>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+    pub(super) fn assign(child: &Child) -> Result<Option<Owned>> {
+        let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("failed creating HID process tree");
+        }
+        let job = Arc::new(Job { handle });
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const c_void,
+                std::mem::size_of_val(&limits)
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+            )
+        };
+        if configured == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed configuring HID process tree");
+        }
+        let assigned = unsafe { AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) };
+        if assigned == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed assigning HID worker to process tree");
+        }
+        let mut active = ACTIVE_JOBS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.retain(|job| job.strong_count() > 0);
+        active.push(Arc::downgrade(&job));
+        Ok(Some(job))
+    }
+
+    pub(super) fn terminate(job: &Owned) {
+        unsafe {
+            TerminateJobObject(job.handle, 124);
+        }
+    }
+
+    pub(super) fn shutdown(timeout: Duration) {
+        let jobs = {
+            let mut active = ACTIVE_JOBS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let jobs = active.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+            active.retain(|job| job.strong_count() > 0);
+            jobs
+        };
+        for job in &jobs {
+            terminate(job);
+        }
+        drop(jobs);
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let active = ACTIVE_JOBS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|job| job.strong_count() > 0);
+            if !active || Instant::now() >= deadline {
+                return;
+            }
+            thread::sleep(STATUS_POLL_INTERVAL);
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod process_tree {
+    use super::{Child, Duration, Result};
+
+    pub(super) type Owned = ();
+
+    pub(super) fn assign(_child: &Child) -> Result<Option<Owned>> {
+        Ok(None)
+    }
+
+    pub(super) fn terminate(_job: &Owned) {}
+
+    pub(super) fn shutdown(_timeout: Duration) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -506,10 +680,13 @@ mod tests {
         let timeout = Duration::from_millis(20);
 
         let error = supervise_child(
-            child,
+            super::SupervisedChild::new(
+                child,
+                Some(WorkerPermit::acquire().expect("worker capacity")),
+                true,
+            ),
             &[],
             timeout,
-            WorkerPermit::acquire().expect("worker capacity"),
         )
         .expect_err("slow isolated operation should time out");
 
@@ -528,10 +705,13 @@ mod tests {
     fn review_round_28_large_worker_response_does_not_fill_pipe() {
         let child = child_test("hid::worker::tests::review_round_28_large_output_child");
         let reply = supervise_child(
-            child,
+            super::SupervisedChild::new(
+                child,
+                Some(WorkerPermit::acquire().expect("worker capacity")),
+                true,
+            ),
             &[],
             Duration::from_secs(2),
-            WorkerPermit::acquire().expect("worker capacity"),
         )
         .expect("large reply should be drained while the child runs");
 
@@ -557,15 +737,43 @@ mod tests {
     fn review_round_28_poll_plan_extends_initial_deadline() {
         let child = child_test("hid::worker::tests::review_round_28_planned_poll_child");
         let reply = supervise_child(
-            child,
+            super::SupervisedChild::new(
+                child,
+                Some(WorkerPermit::acquire().expect("worker capacity")),
+                true,
+            ),
             &[],
             Duration::from_millis(20),
-            WorkerPermit::acquire().expect("worker capacity"),
         )
         .expect("work-derived poll deadline should replace the enumeration deadline");
 
         assert!(matches!(reply, WorkerReply::Failure { message } if message == "planned"));
         assert_eq!(INITIAL_POLL_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn review_round_29_process_tree_shutdown_terminates_worker() {
+        let mut child = child_test("hid::worker::tests::review_round_27_timeout_child");
+        let _tree = super::process_tree::assign(&child)
+            .expect("create process tree")
+            .expect("Windows process tree");
+        let started = Instant::now();
+
+        super::process_tree::shutdown(Duration::from_millis(100));
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if child.try_wait().expect("wait for worker").is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker process survived shutdown"
+            );
+            std::thread::sleep(STATUS_POLL_INTERVAL);
+        }
     }
 
     #[test]

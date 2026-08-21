@@ -163,6 +163,7 @@ pub enum ConfigRecovery {
     InvalidFileReset {
         backup_path: PathBuf,
         parse_error: String,
+        persistence_error: Option<String>,
     },
     ValuesAdjusted {
         persistence_error: Option<String>,
@@ -182,6 +183,15 @@ impl ConfigRecovery {
             Self::InvalidFileReset {
                 backup_path,
                 parse_error,
+                persistence_error: Some(error),
+            } => format!(
+                "The configuration was invalid and was reset for this run. The old file is {}. The replacement could not be saved: {error}. Parse error: {parse_error}",
+                backup_path.display()
+            ),
+            Self::InvalidFileReset {
+                backup_path,
+                parse_error,
+                persistence_error: None,
             } => format!(
                 "The configuration was invalid and was reset. The old file is {}. Parse error: {parse_error}",
                 backup_path.display()
@@ -199,9 +209,14 @@ impl ConfigRecovery {
 
     pub fn notification_message(&self) -> &'static str {
         match self {
-            Self::InvalidFileReset { .. } => {
-                "Defaults were restored. Open Preferences to review them."
-            }
+            Self::InvalidFileReset {
+                persistence_error: Some(_),
+                ..
+            } => "Defaults are in use for this run but could not be saved. Open the app folder.",
+            Self::InvalidFileReset {
+                persistence_error: None,
+                ..
+            } => "Defaults were restored. Open Preferences to review them.",
             Self::ValuesAdjusted {
                 persistence_error: Some(_),
             } => {
@@ -347,12 +362,15 @@ fn load_or_create_config_at(path: &Path) -> Result<ConfigLoad> {
         Err(err) => {
             let backup = quarantine_invalid_file(path)?;
             let config = AppConfig::default();
-            save_config_at(path, &config)?;
+            let persistence_error = save_config_at(path, &config)
+                .err()
+                .map(|error| format!("{error:#}"));
             return Ok(ConfigLoad {
                 config,
                 recovery: Some(ConfigRecovery::InvalidFileReset {
                     backup_path: backup,
                     parse_error: err.to_string(),
+                    persistence_error,
                 }),
             });
         }
@@ -579,9 +597,11 @@ welcome_shown = true
             ConfigRecovery::InvalidFileReset {
                 backup_path,
                 parse_error,
+                persistence_error,
             } => {
                 assert!(backup_path.exists());
                 assert!(!parse_error.is_empty());
+                assert_eq!(persistence_error, &None);
                 let diagnostic = recovery.diagnostic_message();
                 assert!(diagnostic.contains(&backup_path.display().to_string()));
                 assert!(diagnostic.contains(parse_error));
@@ -610,6 +630,39 @@ welcome_shown = true
         assert_eq!(
             fs::read_to_string(backups[0].path()).expect("read preserved config"),
             "not = [valid"
+        );
+    }
+
+    #[test]
+    fn review_round_29_invalid_config_uses_defaults_when_replacement_fails() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("config.toml");
+        fs::write(&path, "not = [valid").expect("write invalid config");
+        fs::create_dir(
+            temp.path()
+                .join(format!(".config.toml.{}.tmp", std::process::id())),
+        )
+        .expect("block atomic replacement");
+
+        let loaded = load_or_create_config_at(&path).expect("return safe default config");
+
+        assert_eq!(loaded.config, AppConfig::default());
+        let recovery = loaded.recovery.expect("config recovery");
+        let ConfigRecovery::InvalidFileReset {
+            backup_path,
+            persistence_error: Some(error),
+            ..
+        } = &recovery
+        else {
+            panic!("expected invalid-file persistence warning")
+        };
+        assert!(backup_path.exists());
+        assert!(!path.exists());
+        assert!(error.contains("failed creating"));
+        assert!(recovery.diagnostic_message().contains(error));
+        assert_eq!(
+            recovery.notification_message(),
+            "Defaults are in use for this run but could not be saved. Open the app folder."
         );
     }
 
