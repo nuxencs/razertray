@@ -527,15 +527,23 @@ fn append_diagnostics(text: &mut String, diagnostics: &[PollError]) {
 }
 
 fn diagnostic_summary(diagnostics: &[PollError]) -> Option<String> {
-    match diagnostics {
-        [] => None,
-        [error] => Some(poll_error_status(error.scope, error.kind).to_string()),
-        errors if diagnostic_classification(errors).is_some() => Some(diagnostic_details(errors)),
-        errors => Some(format!(
-            "Hardware state indeterminate - {}",
-            diagnostic_details(errors)
-        )),
+    let first = diagnostics.first()?;
+    if diagnostics.len() == 1 {
+        return Some(poll_error_status(first.scope, first.kind).to_string());
     }
+
+    if let Some((scope, kind)) = diagnostic_classification(diagnostics) {
+        return Some(format!(
+            "{} ({} reports)",
+            poll_error_status(scope, kind),
+            diagnostics.len()
+        ));
+    }
+
+    Some(format!(
+        "Hardware state indeterminate ({} reports) - run --diagnose for details",
+        diagnostics.len()
+    ))
 }
 
 fn diagnostic_classification(
@@ -546,14 +554,6 @@ fn diagnostic_classification(
         .iter()
         .all(|error| error.scope == first.scope && error.kind == first.kind)
         .then_some((first.scope, first.kind))
-}
-
-fn diagnostic_details(diagnostics: &[PollError]) -> String {
-    diagnostics
-        .iter()
-        .map(|error| format!("{}: {}", error.display_name, error.message))
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 fn poll_error_status(scope: PollErrorScope, kind: crate::model::PollErrorKind) -> &'static str {
@@ -567,6 +567,9 @@ fn poll_error_status(scope: PollErrorScope, kind: crate::model::PollErrorKind) -
         (PollErrorScope::Device, crate::model::PollErrorKind::Unsupported) => {
             "Battery reporting is unsupported by this device"
         }
+        (PollErrorScope::Device, crate::model::PollErrorKind::PartialUnsupported) => {
+            "Battery support is indeterminate - refresh to retry"
+        }
         (PollErrorScope::Device, crate::model::PollErrorKind::Protocol) => {
             "Battery response invalid - refresh to retry"
         }
@@ -578,6 +581,9 @@ fn poll_error_status(scope: PollErrorScope, kind: crate::model::PollErrorKind) -
         }
         (PollErrorScope::ChargeState, crate::model::PollErrorKind::Unsupported) => {
             "Charging status is not reported by this device"
+        }
+        (PollErrorScope::ChargeState, crate::model::PollErrorKind::PartialUnsupported) => {
+            "Charging status support is indeterminate - refresh to retry"
         }
         (PollErrorScope::ChargeState, crate::model::PollErrorKind::Protocol) => {
             "Charging status response invalid - refresh to retry"
@@ -591,6 +597,9 @@ fn poll_error_status(scope: PollErrorScope, kind: crate::model::PollErrorKind) -
         }
         (PollErrorScope::Subsystem, crate::model::PollErrorKind::Unsupported) => {
             "HID subsystem is unsupported"
+        }
+        (PollErrorScope::Subsystem, crate::model::PollErrorKind::PartialUnsupported) => {
+            "HID subsystem support is indeterminate - refresh to retry"
         }
         (PollErrorScope::Subsystem, _) => "HID access unavailable - refresh to retry",
     }
@@ -1048,9 +1057,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["preferred", "fallback", "other"]
         );
-        assert!(update.view.status_text.contains("Mouse preferred"));
-        assert!(update.view.status_text.contains("Mouse fallback"));
-        assert!(update.view.status_text.contains("Mouse other"));
+        assert!(update.view.status_text.contains("3 reports"));
+        assert!(!update.view.status_text.contains("invalid response"));
+        assert!(
+            !update
+                .view
+                .status_text
+                .contains("charging status access denied")
+        );
+        assert!(update.view.status_text.len() < 160);
     }
 
     #[test]
@@ -1076,8 +1091,16 @@ mod tests {
             }
         ));
         assert!(!update.view.status_text.contains("indeterminate"));
-        assert!(update.view.status_text.contains("Mouse a"));
-        assert!(update.view.status_text.contains("Mouse b"));
+        assert!(update.view.status_text.contains("2 reports"));
+        assert_eq!(
+            update
+                .view
+                .diagnostics
+                .iter()
+                .map(|error| error.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Mouse a", "Mouse b"]
+        );
     }
 
     #[test]
@@ -1118,6 +1141,7 @@ mod tests {
         let now = Instant::now();
         let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
         let mut unsupported = unsupported_error("mouse");
+        unsupported.kind = PollErrorKind::PartialUnsupported;
         unsupported.message = "one or more battery probes reported unsupported status".to_string();
 
         let update = core.handle(
@@ -1155,8 +1179,21 @@ mod tests {
                 .status_text
                 .contains("Hardware state indeterminate")
         );
-        assert!(update.view.status_text.contains("unsupported status"));
-        assert!(update.view.status_text.contains("access denied"));
+        assert!(update.view.status_text.contains("2 reports"));
+        assert!(!update.view.status_text.contains("unsupported status"));
+        assert!(!update.view.status_text.contains("access denied"));
+        assert_eq!(
+            update
+                .view
+                .diagnostics
+                .iter()
+                .map(|error| error.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "one or more battery probes reported unsupported status",
+                "interface access denied"
+            ]
+        );
     }
 
     #[test]

@@ -33,7 +33,8 @@ tries candidates in a deterministic order. It tries a cached transaction ID,
 known device metadata, and bounded protocol fallbacks. Failed cached IDs are
 removed. Battery and charging queries aggregate relevant candidate results
 before declaring a state unsupported. Transport and protocol failures can retry
-within a per-device time budget.
+within a per-device time budget. If the bounded candidate set is truncated,
+unsupported evidence remains partial.
 
 The private transport seam supports retry tests without exposing HID mechanics
 to the rest of the app.
@@ -43,6 +44,9 @@ to the rest of the app.
 `PollResult` is the structured diagnostic boundary. It preserves raw battery
 values, charge-state uncertainty, typed error scopes and kinds, and readable
 devices in the same result. JSON output uses this type directly.
+
+The tray shows a bounded diagnostic summary. Logs and CLI or JSON output retain
+the complete typed details.
 
 Repeated errors are throttled in logs. A later successful poll records recovery.
 

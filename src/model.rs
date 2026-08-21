@@ -31,8 +31,35 @@ pub enum PollErrorKind {
     AccessDenied,
     DeviceUnavailable,
     Unsupported,
+    PartialUnsupported,
     Protocol,
     Unknown,
+}
+
+impl PollErrorKind {
+    pub(crate) fn classify_message(message: &str) -> Self {
+        let normalized = message.to_ascii_lowercase();
+        if ((normalized.contains("access") || normalized.contains("permission"))
+            && normalized.contains("denied"))
+            || normalized.contains("not permitted")
+        {
+            Self::AccessDenied
+        } else if normalized.contains("open")
+            || normalized.contains("unavailable")
+            || normalized.contains("no response")
+            || normalized.contains("time budget")
+        {
+            Self::DeviceUnavailable
+        } else if normalized.contains("busy")
+            || normalized.contains("crc")
+            || normalized.contains("status")
+            || normalized.contains("response")
+        {
+            Self::Protocol
+        } else {
+            Self::Unknown
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -56,14 +83,7 @@ pub struct PollError {
 impl PollError {
     pub(crate) fn subsystem(message: impl Into<String>) -> Self {
         let message = message.into();
-        let normalized = message.to_ascii_lowercase();
-        let kind = if normalized.contains("access")
-            && (normalized.contains("denied") || normalized.contains("permission"))
-        {
-            PollErrorKind::AccessDenied
-        } else {
-            PollErrorKind::Unknown
-        };
+        let kind = PollErrorKind::classify_message(&message);
         Self {
             device_key: String::new(),
             display_name: "HID subsystem".to_string(),
@@ -72,6 +92,27 @@ impl PollError {
             kind,
             message,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PollError, PollErrorKind};
+
+    #[test]
+    fn review_error_classification_handles_permission_denied_consistently() {
+        assert_eq!(
+            PollError::subsystem("permission denied while initializing HID").kind,
+            PollErrorKind::AccessDenied
+        );
+        assert_eq!(
+            PollErrorKind::classify_message("permission denied while opening interface"),
+            PollErrorKind::AccessDenied
+        );
+        assert_eq!(
+            PollError::subsystem("HID access is unavailable").kind,
+            PollErrorKind::DeviceUnavailable
+        );
     }
 }
 

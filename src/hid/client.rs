@@ -76,7 +76,10 @@ fn record_query_result(
                 display_name: display_name(device),
                 pid: device.pid,
                 scope: PollErrorScope::Device,
-                kind: PollErrorKind::Unsupported,
+                kind: match evidence {
+                    UnsupportedEvidence::Conclusive => PollErrorKind::Unsupported,
+                    UnsupportedEvidence::Partial => PollErrorKind::PartialUnsupported,
+                },
                 message: match evidence {
                     UnsupportedEvidence::Conclusive => {
                         "battery status is not supported by this device".to_string()
@@ -102,10 +105,11 @@ fn query_device(
 ) -> std::result::Result<(BatteryState, Vec<PollError>), QueryFailure> {
     let known = device_map::known_device_support(device.pid);
     let display_name = display_name(device);
-    let mut failures = Vec::new();
+    let (candidates, truncation_warning) = candidate_probe_plan(&device.candidates);
+    let mut failures: Vec<_> = truncation_warning.into_iter().collect();
     let overall_deadline = Instant::now() + DEVICE_POLL_BUDGET;
     let mut opened = Vec::new();
-    for candidate in device.candidates.iter().take(MAX_CANDIDATES_PER_DEVICE) {
+    for candidate in candidates {
         if Instant::now() >= overall_deadline {
             failures.push("poll time budget exhausted while opening interfaces".to_string());
             break;
@@ -193,7 +197,7 @@ fn charge_query_result(
                 display_name: display_name(device),
                 pid: device.pid,
                 scope: PollErrorScope::ChargeState,
-                kind: PollErrorKind::Unsupported,
+                kind: PollErrorKind::PartialUnsupported,
                 message: "one or more charging-status probes reported unsupported status"
                     .to_string(),
             }];
@@ -237,6 +241,14 @@ fn merge_query_failure(failure: QueryFailure, mut auxiliary: Vec<String>) -> Que
             QueryFailure::Failed(anyhow::anyhow!(auxiliary.join("; ")))
         }
     }
+}
+
+fn candidate_probe_plan<T>(candidates: &[T]) -> (&[T], Option<String>) {
+    let attempted = candidates.len().min(MAX_CANDIDATES_PER_DEVICE);
+    let omitted = candidates.len() - attempted;
+    let warning = (omitted > 0)
+        .then(|| format!("{omitted} candidate interface(s) skipped by the bounded probe limit"));
+    (&candidates[..attempted], warning)
 }
 
 fn battery_transaction_ids(
@@ -489,29 +501,8 @@ fn scoped_poll_error(
         display_name: display_name(device),
         pid: device.pid,
         scope,
-        kind: classify_error(&err),
+        kind: PollErrorKind::classify_message(&format_error_chain(&err)),
         message: format_error_chain(&err),
-    }
-}
-
-fn classify_error(err: &anyhow::Error) -> PollErrorKind {
-    let message = format_error_chain(err).to_ascii_lowercase();
-    if message.contains("access") || message.contains("permission") {
-        PollErrorKind::AccessDenied
-    } else if message.contains("open")
-        || message.contains("unavailable")
-        || message.contains("no response")
-        || message.contains("time budget")
-    {
-        PollErrorKind::DeviceUnavailable
-    } else if message.contains("busy")
-        || message.contains("crc")
-        || message.contains("status")
-        || message.contains("response")
-    {
-        PollErrorKind::Protocol
-    } else {
-        PollErrorKind::Unknown
     }
 }
 
@@ -529,8 +520,8 @@ fn scale_percent(raw: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence, charge_query_result,
-        classify_error, format_error_chain, merge_query_failure, probe_request_with,
+        FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence, candidate_probe_plan,
+        charge_query_result, format_error_chain, merge_query_failure, probe_request_with,
         record_query_result, scale_percent, update_cache_after_success,
     };
     use crate::config::PidCache;
@@ -803,7 +794,7 @@ mod tests {
 
         assert_eq!(result.errors.len(), 2);
         assert_eq!(result.errors[0].scope, PollErrorScope::Device);
-        assert_eq!(result.errors[0].kind, PollErrorKind::Unsupported);
+        assert_eq!(result.errors[0].kind, PollErrorKind::PartialUnsupported);
         assert_eq!(result.errors[0].device_key, "mouse");
         assert_eq!(result.errors[0].pid, 0xFFFF);
         assert!(
@@ -813,7 +804,7 @@ mod tests {
         );
         assert_eq!(result.errors[1].kind, PollErrorKind::AccessDenied);
         let json = serde_json::to_value(result).expect("serialize poll result");
-        assert_eq!(json["errors"][0]["kind"], "unsupported");
+        assert_eq!(json["errors"][0]["kind"], "partial-unsupported");
         assert_eq!(json["errors"][0]["scope"], "device");
         assert_eq!(json["errors"][1]["kind"], "access-denied");
     }
@@ -840,7 +831,10 @@ mod tests {
             panic!("transport error should remain a failed query")
         };
 
-        assert_eq!(classify_error(&aggregate), PollErrorKind::AccessDenied);
+        assert_eq!(
+            PollErrorKind::classify_message(&format_error_chain(&aggregate)),
+            PollErrorKind::AccessDenied
+        );
         assert!(format_error_chain(&aggregate).contains("access denied by operating system"));
     }
 
@@ -961,7 +955,7 @@ mod tests {
         record_query_result(&mut result, &device, Err(failure));
 
         assert_eq!(result.errors.len(), 2);
-        assert_eq!(result.errors[0].kind, PollErrorKind::Unsupported);
+        assert_eq!(result.errors[0].kind, PollErrorKind::PartialUnsupported);
         assert_eq!(result.errors[1].kind, PollErrorKind::DeviceUnavailable);
     }
 
@@ -1046,9 +1040,41 @@ mod tests {
         assert_eq!(state, crate::model::ChargeState::Unavailable);
         assert_eq!(warnings.len(), 2);
         assert_eq!(warnings[0].scope, PollErrorScope::ChargeState);
-        assert_eq!(warnings[0].kind, PollErrorKind::Unsupported);
+        assert_eq!(warnings[0].kind, PollErrorKind::PartialUnsupported);
         assert_eq!(warnings[1].scope, PollErrorScope::ChargeState);
         assert_eq!(warnings[1].kind, PollErrorKind::DeviceUnavailable);
+    }
+
+    #[test]
+    fn review_candidate_truncation_prevents_conclusive_unsupported() {
+        let device = DiscoveredDevice {
+            key: "mouse".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            candidates: Vec::new(),
+        };
+        let candidates = [0, 1, 2, 3, 4];
+        let (attempted, warning) = candidate_probe_plan(&candidates);
+        let warning = warning.expect("fifth candidate is omitted");
+        let failure = merge_query_failure(
+            QueryFailure::Unsupported {
+                evidence: UnsupportedEvidence::Conclusive,
+                auxiliary: Vec::new(),
+            },
+            vec![warning],
+        );
+        let mut result = PollResult::default();
+
+        record_query_result(&mut result, &device, Err(failure));
+
+        assert_eq!(attempted, &[0, 1, 2, 3]);
+        assert_eq!(result.errors[0].kind, PollErrorKind::PartialUnsupported);
+        assert!(
+            result.errors[0]
+                .message
+                .contains("one or more battery probes")
+        );
+        assert!(result.errors[1].message.contains("1 candidate interface"));
     }
 
     #[test]
