@@ -1,27 +1,39 @@
 # Notifications
 
-## Windows low-battery toast format
+## Low-battery notification
 
-Low-battery notifications use this collapsed title format:
+Title:
 
 - `{device_name}: {battery_percent}%`
 
-Toast body lines:
+Body:
 
-- `Battery low`
-- `Plug in charger soon`
+- the time-remaining estimate, when available, or `Battery low`
+- `Plug in the charger soon`
 
-## Sender identity (AUMID)
+If charge state could not be read, the recovery text is `Check the charger
+soon`. This avoids claiming that the device is not already charging.
 
-On Windows, the app registers an AppUserModelId (AUMID) under:
+Alerts apply to the displayed device by default. **Preferences > Alert for all
+devices** enables independent alerts for each readable device. Each device has
+its own cooldown.
 
-- `HKCU\\SOFTWARE\\Classes\\AppUserModelId\\razertray`
+## Information and error notifications
 
-Values written:
+The first run explains how to open the tray menu. Recoverable configuration and
+settings failures show a short action message. Detailed errors remain in the
+log file.
+
+## Sender identity
+
+On Windows, the app registers an AppUserModelId under:
+
+- `HKCU\SOFTWARE\Classes\AppUserModelId\razertray`
+
+Values:
 
 - `DisplayName = razertray`
-- `IconUri = <current executable path>` (best effort)
+- `IconUri = <current executable path>` when available
 
-Notifications are sent with app id `razertray` when registration succeeds.
-
-If AUMID registration fails, razertray falls back to `Toast::POWERSHELL_APP_ID` so the notification is still delivered.
+If registration fails, razertray uses the PowerShell notification sender so the
+notification can still be delivered.

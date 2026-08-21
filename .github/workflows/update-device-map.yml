@@ -24,7 +24,7 @@ jobs:
           python-version: "3.x"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93.1
         with:
           components: rustfmt
 

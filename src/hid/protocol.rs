@@ -63,7 +63,7 @@ impl RazerReport {
         })
     }
 
-    pub fn to_bytes(&self) -> [u8; REPORT_LENGTH] {
+    pub fn to_bytes(self) -> [u8; REPORT_LENGTH] {
         let mut out = [0u8; REPORT_LENGTH];
         out[0] = self.status;
         out[1] = self.transaction_id;

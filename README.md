@@ -1,158 +1,161 @@
 # razertray
 
-A tiny Windows tray app that shows your wireless Razer mouse's battery level
-and warns you before it dies — no Razer Synapse required.
-
-## What it does
-
-razertray sits quietly next to your clock in the Windows system tray. It shows
-a small battery icon for your wireless Razer mouse, checks the charge level
-about once a minute, and pops up a notification when the battery gets low so you
-can plug in before it runs out. If you have more than one Razer device, you can
-pick which one the icon tracks.
+razertray is a focused Windows tray utility for Razer wireless-device battery
+status. It reads HID feature reports directly. Razer Synapse is not required.
 
 ## Features
 
-- Live battery level for your wireless Razer mouse, right in the system tray
-- Color-coded battery icon: green when healthy, orange when getting low, red
-  when nearly empty, and blue while charging
-- Hover the icon for a tooltip with the device name, exact percentage, and
-  whether it's charging
-- Automatic low-battery alerts so you get a heads-up before the mouse dies
-- Pick which Razer device to watch when several are connected
-- "Refresh now" for an instant reading instead of waiting for the next check
-- Optionally starts with Windows so it's always running
-- Lightweight and quiet — just a tray icon, no heavy background software
-- Knows a wide range of Razer mice by name, and still shows a reading (under a
-  generic name) for newer ones it hasn't learned yet
+- Battery percentage and charge state in the Windows system tray
+- Battery-icon and percentage-text display modes
+- Explicit checking, current, stale, unavailable, and no-device states
+- Stable preferred-device selection with automatic display fallback
+- Low-battery notifications for the displayed device or all devices
+- Discharge-based time-remaining forecast after enough observations
+- Tray settings for display mode, alert scope, threshold, check interval, and
+  Windows startup
+- Manual refresh and direct access to the app data folder
+- Automatic recovery from an invalid configuration file
+- HID interface fallback, transaction-ID probing, bounded retries, and cache
+  invalidation
+- Human-readable, JSON, and diagnostic command-line output
 
-## Install & run
+## Install and run
 
-1. Download `razertray.exe` from the [latest release](../../releases/latest) —
-   there's no installer.
-2. Run it. It starts in the system tray with no main window and keeps working
-   in the background.
-3. By default it sets itself to start automatically when you log in to Windows.
-   You can turn this off any time from the tray menu.
+1. Download `razertray.exe` from the [latest release](../../releases/latest).
+2. Run the executable.
+3. Right-click the tray icon to view status or change settings.
 
-Quick check from a terminal (works without opening the tray):
+The app does not enable Windows startup by default. Use **Preferences > Start
+at login** if you want it.
+
+Only one tray instance runs for each Windows user session.
+
+## Tray states
+
+The icon and status line distinguish these states:
+
+- **Checking**: a poll is active. Manual refresh is disabled.
+- **Current**: the displayed reading came from the latest successful poll.
+- **Stale**: the last reading is retained, but the device is not currently
+  readable. The status includes the age of the reading.
+- **Unavailable**: polling failed and no prior reading can be shown.
+- **No device**: polling succeeded but found no battery-capable Razer device.
+
+If the preferred device is temporarily unavailable, razertray shows another
+readable device. It does not change the saved preference. The preferred device
+returns automatically when it becomes readable again.
+
+## Preferences
+
+Open the **Preferences** submenu to change:
+
+- percentage text or battery icon
+- alerts for the displayed device or all devices
+- low-battery threshold
+- check interval
+- Windows startup
+
+Changes are saved immediately. If a configuration write fails, the setting is
+restored in the menu and Windows shows an error notification.
+
+Advanced settings remain available in
+`%APPDATA%\razertray\config.toml`:
+
+```toml
+poll_interval_seconds = 60
+low_battery_threshold = 15
+low_battery_cooldown_minutes = 120
+selected_device_id = ""
+log_level = "info"
+view_mode = "icon"              # "icon" or "text"
+alert_scope = "selected"        # "selected" or "all"
+welcome_shown = true
+```
+
+Unsafe numeric values are clamped to supported limits. If the file cannot be
+parsed, razertray preserves it as `config.invalid.<time>.<pid>.toml` and creates
+a valid default file.
+
+Other files in the app data folder:
+
+- `pid_cache.toml`: working transaction IDs found during device probing
+- `razertray.log`, `.1`, and `.2`: bounded diagnostic logs
+
+## Battery forecast
+
+The tooltip and status line can show an estimate such as `~9 h left`. The
+forecast needs at least 30 minutes of uninterrupted discharge data and a
+meaningful battery drop. Charging, a long observation gap, or an upward battery
+jump starts a new sample window. No estimate is shown until the data is useful.
+
+The forecast is an estimate, not a battery-health measurement. Device firmware
+controls the precision of the source reading.
+
+## Command line
 
 ```text
 razertray.exe --once
+razertray.exe --json
+razertray.exe --diagnose
 ```
 
-This prints the battery level of every detected Razer device once and exits —
-handy for confirming your mouse is picked up.
+- `--once` prints one readable snapshot.
+- `--json` prints the complete structured poll result.
+- `--diagnose` also prints the device key, raw battery value, and cached
+  transaction ID.
 
-## In the tray
+Exit codes:
 
-Right-click the icon for the menu:
-
-- **Status line** — the watched device, its battery percentage, and `(charging)`
-  if it's plugged in (or "No supported Razer devices" if none are found)
-- **Select Device** — lists every Razer device found, each with its name,
-  battery percentage and charge state, with a checkmark on the one being tracked
-- **Refresh now** — check the battery immediately
-- **Start at login** — toggle starting automatically with Windows
-- **Exit** — close the app and remove the icon
-
-The icon itself is a small battery that fills up and changes color:
-**blue** while charging, **red** at 15% or below, **orange** up to 35%, and
-**green** above that. A device with no reading yet shows a faded mark.
+- `0`: one or more devices were read and no polling error occurred
+- `1`: no readable battery device was found
+- `2`: a partial or fatal failure occurred, or an argument was invalid
 
 ## Low-battery alerts
 
-When the watched mouse drops to or below the low-battery level (15% by default)
-and isn't charging, Windows shows a notification — for example
-`Razer Viper Ultimate: 12%`, with "Battery low / Plug in charger soon". To avoid
-nagging, it only repeats an alert for the same device every couple of hours, and
-alerts stop once you plug in. Each device is tracked separately.
+The default threshold is 15 percent. Alerts stop while the device reports that
+it is charging. Each device has its own cooldown. A time-remaining estimate is
+included when one is available. See [notification details](docs/notifications.md).
 
 ## Supported devices
 
-razertray looks at every Razer-branded device you have connected and shows the
-ones that report a battery level — in practice that's **wireless mice**, which is
-what it's built and tested for. It ships with a built-in list of around 65 known
-Razer mice and wireless receivers (Mamba, Viper, DeathAdder, Naga, Basilisk,
-Cobra, Pro Click, Orochi, Lancehead and more), shown by their proper product
-names.
+razertray polls Razer HID devices that expose the battery protocol used by
+OpenRazer. It is designed and tested for wireless mice. Some compatible Razer
+keyboards can also appear. Known products use names and protocol details from
+the community [OpenRazer](https://openrazer.github.io/) device database.
 
-That list is generated from the community [OpenRazer](https://openrazer.github.io/)
-project's device database and refreshed in new releases, so newer mice get added
-over time. A device that isn't on the list — a newer mouse, or another Razer
-device that reports its battery the same way (some wireless keyboards do) — still
-gets a reading where possible, shown under its system-reported name. Gear that
-doesn't report a battery this way is simply ignored.
-
-## Settings
-
-Settings live in a plain text file at
-`%APPDATA%\razertray\config.toml`, created on first run. The device you pick and
-the "Start at login" choice are saved here automatically.
-
-```toml
-poll_interval_seconds = 60        # how often to check the battery (minimum 5)
-low_battery_threshold = 15        # warn at or below this percentage
-low_battery_cooldown_minutes = 120  # minimum gap between repeat warnings
-selected_device_id = ""           # which device to watch (set from the menu)
-autostart = false                 # start with Windows (toggle from the tray menu)
-log_level = "info"                # detail level for the log file
-```
-
-Other files in the same `%APPDATA%\razertray\` folder:
-
-- `pid_cache.toml` — remembers how to talk to devices it had to probe
-- `razertray.log` (plus `.1`, `.2`) — a rolling log for troubleshooting; rotates
-  at about 1 MiB and keeps three files
+Unknown Razer products are probed with a bounded set of interfaces and
+transaction IDs. Unsupported devices are omitted.
 
 ## Limitations
 
-- **Windows only** for the tray app and notifications. (`--once` runs elsewhere
-  for a quick reading, but the tray mode does not.)
-- **Curated and tested for Razer wireless mice.** It polls every connected Razer
-  device for a battery level, so some other battery-reporting gear (e.g. certain
-  wireless keyboards) may also appear under its system-reported name — but only
-  mice are recognized by name and verified; non-battery devices are ignored.
-- The mouse (or its wireless dongle) must be connected and awake; a sleeping or
-  powered-off mouse may show no reading.
-- Battery and charging readings come straight from the device and can
-  occasionally be unavailable or off by a percent, especially for newer mice not
-  yet in the built-in list (some devices don't report charging status at all).
-- There's no settings window — advanced options are changed by editing
-  `config.toml`.
+- The tray app and notifications require Windows.
+- Sleeping, powered-off, or disconnected hardware can produce a stale reading.
+- Some devices do not report charge state.
+- Forecast history is held in memory and restarts with the app.
+- Multiple identical devices without serial numbers can be difficult to
+  distinguish because the HID metadata does not always expose a stable identity.
 
----
+## Development
 
-## For developers
-
-Build on Windows (MSVC toolchain + Visual Studio Build Tools):
+The pinned Rust toolchain and Windows target are defined in
+`rust-toolchain.toml`.
 
 ```bash
+cargo fmt --check
+cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+cargo test --all-targets
 cargo build --release --target x86_64-pc-windows-msvc
-# -> target/x86_64-pc-windows-msvc/release/razertray.exe
 ```
 
-The device support map (`src/device_map.rs`) is generated from a local OpenRazer
-checkout:
+Regenerate the device map from a local OpenRazer checkout:
 
 ```bash
 tools/extract_openrazer_map.py ~/dev/openrazer src/device_map.rs
 ```
 
-It reads battery info over HID feature reports using the Razer protocol,
-mirroring OpenRazer's mouse driver (`razermouse_driver.c`): per-device
-transaction IDs, the battery/charge commands, and which devices report charging
-status.
-
-CI keeps the device list in sync with OpenRazer and cuts releases automatically
-— see the workflows in [`.github/workflows/`](.github/workflows/).
+The main design seams are documented in [docs/architecture.md](docs/architecture.md).
 
 ## License
 
-razertray is licensed under the [GNU General Public License v2.0 or later](LICENSE)
-(`GPL-2.0-or-later`).
-
-The device support map (`src/device_map.rs`) and the Razer HID protocol code are
-derived from [OpenRazer](https://github.com/openrazer/openrazer), which is itself
-licensed under GPL-2.0-or-later. razertray matches that license out of respect for
-the OpenRazer project's reverse-engineering work, which this app builds on.
+razertray uses the [GNU General Public License v2.0 or later](LICENSE). The
+device map and Razer HID protocol work derive from GPL-licensed OpenRazer work.

@@ -9,12 +9,14 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  tag:
     if: >-
       github.event.pull_request.merged == true &&
       github.event.pull_request.head.ref == 'ci/device-map-sync' &&
       github.event.pull_request.base.ref == github.event.repository.default_branch
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - name: Checkout merge commit
         uses: actions/checkout@v6
@@ -23,9 +25,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
+        uses: dtolnay/rust-toolchain@1.93.1
 
       - name: Read release version
         id: version
@@ -36,9 +36,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
-      - name: Ensure release does not already exist
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Ensure tag does not already exist
         shell: bash
         run: |
           set -euo pipefail
@@ -46,11 +44,6 @@ jobs:
 
           if git ls-remote --tags origin "refs/tags/$tag" | grep -q .; then
             echo "::error::Tag '$tag' already exists. Refusing duplicate release."
-            exit 1
-          fi
-
-          if gh release view "$tag" > /dev/null 2>&1; then
-            echo "::error::Release '$tag' already exists. Refusing duplicate release."
             exit 1
           fi
 
@@ -64,46 +57,10 @@ jobs:
           git tag "$tag"
           git push origin "$tag"
 
-      - name: Build release binary
-        run: cargo build --release --target x86_64-pc-windows-msvc
-
-      - name: Prepare release assets
-        shell: pwsh
-        run: |
-          $exe = "target/x86_64-pc-windows-msvc/release/razertray.exe"
-          if (-not (Test-Path $exe)) {
-            throw "Expected binary not found at $exe"
-          }
-
-          Copy-Item $exe razertray.exe
-          $hash = (Get-FileHash razertray.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  razertray.exe" | Set-Content SHA256SUMS.txt
-
-      - name: Determine release notes range
-        id: release_notes
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${{ steps.version.outputs.tag }}"
-          if prev_tag=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null); then
-            echo "prev_tag=$prev_tag" >> "$GITHUB_OUTPUT"
-          else
-            echo "prev_tag=" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${{ steps.version.outputs.tag }}"
-          prev_tag="${{ steps.release_notes.outputs.prev_tag }}"
-          release_args=(--title "$tag" --generate-notes)
-
-          if [ -n "$prev_tag" ]; then
-            release_args+=(--notes-start-tag "$prev_tag")
-          fi
-
-          gh release create "$tag" razertray.exe SHA256SUMS.txt \
-            "${release_args[@]}"
+  release:
+    needs: tag
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-on-tag.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}

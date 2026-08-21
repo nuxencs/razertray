@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing version tag to release
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,14 +17,17 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93.1
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -26,12 +35,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ github.ref_name }}"
+          tag="$RELEASE_TAG"
           cargo_version="v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           if [ "$tag" != "$cargo_version" ]; then
             echo "::error::Tag '$tag' does not match Cargo.toml version '$cargo_version'"
             exit 1
           fi
+
+      - name: Run tests
+        run: cargo test --all-targets
 
       - name: Build release binary
         run: cargo build --release --target x86_64-pc-windows-msvc
@@ -53,7 +65,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ github.ref_name }}"
+          tag="$RELEASE_TAG"
           if prev_tag=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null); then
             echo "prev_tag=$prev_tag" >> "$GITHUB_OUTPUT"
           else
@@ -66,7 +78,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ github.ref_name }}"
+          tag="$RELEASE_TAG"
           prev_tag="${{ steps.release_notes.outputs.prev_tag }}"
           release_args=(--title "$tag" --generate-notes)
 

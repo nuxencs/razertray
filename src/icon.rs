@@ -20,6 +20,9 @@ pub fn text_icon(percent: u8, charging: bool) -> Result<Icon> {
     let mut pixels = vec![0u8; TEXT_SIZE * TEXT_SIZE * 4];
     let label = percent.min(100).to_string();
     draw_number(&mut pixels, &label, level_color(percent, charging));
+    if charging {
+        draw_text_charging_mark(&mut pixels);
+    }
     Icon::from_rgba(pixels, TEXT_SIZE as u32, TEXT_SIZE as u32)
         .context("failed building text tray icon")
 }
@@ -64,11 +67,11 @@ fn draw_number(pixels: &mut [u8], label: &str, color: [u8; 4]) {
         return;
     }
 
-    // Glyph cell is 3 units wide; 1 unit gap between glyphs. Fit to canvas
-    // (minus 1px padding each side) in both axes and pick the largest scale.
-    let units_w = 3 * n + (n - 1);
-    let scale = ((TEXT_SIZE - 2) / units_w).clamp(1, (TEXT_SIZE - 2) / 5);
-    let total_w = units_w * scale;
+    // Keep one-pixel gaps unscaled. This makes three-digit values large enough
+    // to survive Windows taskbar downscaling without making one digit enormous.
+    let gaps = n - 1;
+    let scale = ((TEXT_SIZE - 2 - gaps) / (3 * n)).clamp(1, 4);
+    let total_w = 3 * n * scale + gaps;
     let total_h = 5 * scale;
     let x0 = (TEXT_SIZE - total_w) / 2;
     let y0 = (TEXT_SIZE - total_h) / 2;
@@ -77,7 +80,7 @@ fn draw_number(pixels: &mut [u8], label: &str, color: [u8; 4]) {
     let mut mask = vec![false; TEXT_SIZE * TEXT_SIZE];
     for (gi, ch) in label.bytes().enumerate() {
         let glyph = digit_glyph(ch.wrapping_sub(b'0'));
-        let gx = x0 + gi * 4 * scale;
+        let gx = x0 + gi * (3 * scale + 1);
         for (row, bits) in glyph.iter().enumerate() {
             for col in 0..3 {
                 if bits & (0b100 >> col) != 0 {
@@ -154,7 +157,17 @@ fn build_icon(percent: Option<u8>, charging: bool) -> Result<Icon> {
 }
 
 fn draw_battery_shell(pixels: &mut [u8]) {
-    let border = [210, 210, 210, 255];
+    let shadow = [30, 30, 30, 255];
+    let border = [235, 235, 235, 255];
+
+    for x in 1..15 {
+        put(pixels, x, 3, shadow);
+        put(pixels, x, 12, shadow);
+    }
+    for y in 3..13 {
+        put(pixels, 1, y, shadow);
+        put(pixels, 14, y, shadow);
+    }
 
     // Body border
     for x in 2..14 {
@@ -178,19 +191,46 @@ fn draw_battery_fill(pixels: &mut [u8], percent: u8, charging: bool) {
 
     let clamped = percent.min(100) as usize;
     let width = (clamped * 10).div_ceil(100);
+    if width == 0 {
+        return;
+    }
 
-    for x in 3..(3 + width.max(1)) {
+    for x in 3..(3 + width) {
         for y in 5..11 {
             put(pixels, x, y, color);
         }
+    }
+
+    if charging {
+        let mark = [250, 250, 250, 255];
+        put(pixels, 8, 5, mark);
+        put(pixels, 7, 7, mark);
+        put(pixels, 8, 7, mark);
+        put(pixels, 7, 8, mark);
+        put(pixels, 7, 9, mark);
     }
 }
 
 fn draw_unknown_mark(pixels: &mut [u8]) {
     let color = [150, 150, 150, 255];
-    for i in 0..5 {
-        put(pixels, 5 + i, 6 + i, color);
-        put(pixels, 9 - i, 6 + i, color);
+    for x in 6..10 {
+        put(pixels, x, 6, color);
+    }
+    put(pixels, 9, 7, color);
+    put(pixels, 8, 8, color);
+    put(pixels, 8, 10, color);
+}
+
+fn draw_text_charging_mark(pixels: &mut [u8]) {
+    let outline = [25, 25, 25, 255];
+    let fill = [250, 250, 250, 255];
+    for x in 3..29 {
+        put_sized(pixels, TEXT_SIZE, x, 28, outline);
+        put_sized(pixels, TEXT_SIZE, x, 31, outline);
+    }
+    for x in 4..28 {
+        put_sized(pixels, TEXT_SIZE, x, 29, fill);
+        put_sized(pixels, TEXT_SIZE, x, 30, fill);
     }
 }
 

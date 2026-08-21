@@ -4,15 +4,18 @@ use std::ffi::CString;
 pub const RAZER_VID: u16 = 0x1532;
 
 #[derive(Clone, Debug)]
+pub struct InterfaceCandidate {
+    pub path: CString,
+    pub interface_number: i32,
+    pub priority_score: u8,
+}
+
+#[derive(Clone, Debug)]
 pub struct DiscoveredDevice {
     pub key: String,
     pub pid: u16,
-    pub path: CString,
     pub product_name: String,
-    pub interface_number: i32,
-    pub usage_page: u16,
-    pub usage: u16,
-    pub priority_score: u8,
+    pub candidates: Vec<InterfaceCandidate>,
 }
 
 pub fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
@@ -20,26 +23,24 @@ pub fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
         std::collections::BTreeMap::new();
 
     for dev in api.device_list().filter(|d| d.vendor_id() == RAZER_VID) {
-        let path = dev.path().to_owned();
         let key = dedupe_key(dev.product_id(), dev.serial_number());
+        let candidate = InterfaceCandidate {
+            path: dev.path().to_owned(),
+            interface_number: dev.interface_number(),
+            priority_score: candidate_score(dev.interface_number(), dev.usage_page(), dev.usage()),
+        };
 
         let discovered = DiscoveredDevice {
             key: key.clone(),
             pid: dev.product_id(),
-            path,
             product_name: non_empty_text(dev.product_string())
                 .unwrap_or_else(|| format!("Razer Device {:04X}", dev.product_id())),
-            interface_number: dev.interface_number(),
-            usage_page: dev.usage_page(),
-            usage: dev.usage(),
-            priority_score: candidate_score(dev.interface_number(), dev.usage_page(), dev.usage()),
+            candidates: vec![candidate],
         };
 
         match best_by_key.entry(key) {
             std::collections::btree_map::Entry::Occupied(mut e) => {
-                if discovered.priority_score < e.get().priority_score {
-                    e.insert(discovered);
-                }
+                e.get_mut().candidates.extend(discovered.candidates);
             }
             std::collections::btree_map::Entry::Vacant(e) => {
                 e.insert(discovered);
@@ -47,13 +48,19 @@ pub fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
         }
     }
 
-    let mut out: Vec<DiscoveredDevice> = best_by_key.into_values().collect();
-    out.sort_by(|a, b| {
-        a.priority_score
-            .cmp(&b.priority_score)
-            .then_with(|| a.pid.cmp(&b.pid))
-            .then_with(|| a.key.cmp(&b.key))
-    });
+    let mut out: Vec<DiscoveredDevice> = best_by_key
+        .into_values()
+        .map(|mut device| {
+            device.candidates.sort_by(|a, b| {
+                a.priority_score
+                    .cmp(&b.priority_score)
+                    .then_with(|| a.interface_number.cmp(&b.interface_number))
+                    .then_with(|| a.path.as_bytes().cmp(b.path.as_bytes()))
+            });
+            device
+        })
+        .collect();
+    out.sort_by(|a, b| a.pid.cmp(&b.pid).then_with(|| a.key.cmp(&b.key)));
     out
 }
 

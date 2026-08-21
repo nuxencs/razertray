@@ -1,11 +1,17 @@
-pub const APP_ID: &str = "razertray";
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
+pub(crate) const APP_ID: &str = "razertray";
 
 pub mod app;
-pub mod autostart;
-pub mod config;
-pub mod device_map;
-pub mod hid;
-pub mod icon;
-pub mod model;
-pub mod notify;
-pub mod tray;
+mod application;
+mod autostart;
+mod config;
+mod device_map;
+mod error_tracker;
+mod forecast;
+mod hid;
+mod icon;
+mod model;
+mod notify;
+mod single_instance;
+mod tray;

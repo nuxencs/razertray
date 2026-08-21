@@ -11,47 +11,101 @@ use tracing_subscriber::fmt::writer::MakeWriter;
 const LOG_FILES_TO_KEEP: usize = 3;
 const MAX_LOG_FILE_BYTES: u64 = 1_048_576;
 
-pub fn run_once() -> Result<()> {
-    let cfg = config::load_or_create_config()?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OnceOutput {
+    Human,
+    Json,
+    Diagnose,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OnceStatus {
+    Success,
+    NoDevice,
+    PartialFailure,
+}
+
+pub fn run_once(output: OnceOutput) -> Result<OnceStatus> {
+    let loaded = config::load_or_create_config()?;
+    let cfg = loaded.config;
     init_logging(&cfg);
+    if let Some(warning) = loaded.warning {
+        eprintln!("Warning: {warning}");
+    }
 
     let mut cache = config::load_or_create_pid_cache()?;
     let api = HidApi::new().context("failed to initialize hidapi")?;
 
-    let result = client::poll_devices(&api, &mut cache);
-    config::save_pid_cache(&cache)?;
+    let batch = client::poll_devices(&api, &mut cache);
+    if batch.cache_changed {
+        config::save_pid_cache(&cache)?;
+    }
+    let result = batch.result;
 
-    if result.devices.is_empty() {
-        println!("No supported Razer devices found.");
+    if output == OnceOutput::Json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if result.devices.is_empty() {
+        if result.errors.is_empty() {
+            println!("No supported Razer devices found.");
+        } else {
+            println!("No Razer battery reading was available.");
+        }
     } else {
         for dev in &result.devices {
-            let charging = if dev.is_charging {
-                "charging"
-            } else {
-                "not-charging"
+            let charging = match dev.charge_state {
+                crate::model::ChargeState::Charging => "charging",
+                crate::model::ChargeState::NotCharging => "not-charging",
+                crate::model::ChargeState::Unavailable => "charging-unknown",
+                crate::model::ChargeState::Unsupported => "charging-unsupported",
             };
             println!(
-                "{} pid=0x{:04X} battery={}% {}",
-                dev.display_name, dev.pid, dev.battery_percent, charging
+                "{} pid=0x{:04X} battery={}% {}{}",
+                dev.display_name,
+                dev.pid,
+                dev.battery_percent,
+                charging,
+                if output == OnceOutput::Diagnose {
+                    format!(
+                        " key={} raw={} transaction-cache={:?}",
+                        dev.device_key,
+                        dev.battery_raw,
+                        cache.get(dev.pid)
+                    )
+                } else {
+                    String::new()
+                }
             );
         }
     }
 
-    if !result.errors.is_empty() {
+    if output != OnceOutput::Json && !result.errors.is_empty() {
         eprintln!("Errors:");
-        for err in result.errors {
-            eprintln!("- {err}");
+        for err in &result.errors {
+            eprintln!("- {} ({:04X}): {}", err.display_name, err.pid, err.message);
         }
     }
 
-    Ok(())
+    Ok(once_status(&result))
+}
+
+fn once_status(result: &crate::model::PollResult) -> OnceStatus {
+    if !result.errors.is_empty() {
+        OnceStatus::PartialFailure
+    } else if result.devices.is_empty() {
+        OnceStatus::NoDevice
+    } else {
+        OnceStatus::Success
+    }
 }
 
 #[cfg(target_os = "windows")]
 pub fn run_tray() -> Result<()> {
-    let cfg = config::load_or_create_config()?;
-    init_logging(&cfg);
-    crate::tray::run_tray_app(cfg)
+    let Some(_instance_guard) = crate::single_instance::acquire()? else {
+        return Ok(());
+    };
+    let loaded = config::load_or_create_config()?;
+    init_logging(&loaded.config);
+    crate::tray::run_tray_app(loaded.config, loaded.warning)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -184,4 +238,27 @@ fn rotated_log_path(base_path: &Path, index: usize) -> Result<PathBuf> {
         .with_context(|| format!("missing file name for {}", base_path.display()))?
         .to_string_lossy();
     Ok(parent.join(format!("{file_name}.{index}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OnceStatus, once_status};
+    use crate::model::{PollError, PollErrorKind, PollResult};
+
+    #[test]
+    fn unreadable_device_is_a_failure_not_no_device() {
+        let result = PollResult {
+            devices: Vec::new(),
+            errors: vec![PollError {
+                device_key: "mouse".to_string(),
+                display_name: "Mouse".to_string(),
+                pid: 1,
+                kind: PollErrorKind::DeviceUnavailable,
+                message: "asleep".to_string(),
+            }],
+        };
+
+        assert_eq!(once_status(&result), OnceStatus::PartialFailure);
+        assert_eq!(once_status(&PollResult::default()), OnceStatus::NoDevice);
+    }
 }

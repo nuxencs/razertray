@@ -1,4 +1,6 @@
+use crate::forecast::Estimate;
 use crate::model::BatteryState;
+use crate::model::ChargeState;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -18,7 +20,7 @@ impl Notifier {
     }
 
     fn should_notify(&self, state: &BatteryState, now: Instant) -> bool {
-        if state.is_charging || state.battery_percent > self.threshold {
+        if state.charge_state == ChargeState::Charging || state.battery_percent > self.threshold {
             return false;
         }
 
@@ -31,13 +33,22 @@ impl Notifier {
         true
     }
 
-    pub fn maybe_notify_low_battery(&mut self, state: &BatteryState) -> bool {
+    pub fn set_policy(&mut self, threshold: u8, cooldown_minutes: u64) {
+        self.threshold = threshold;
+        self.cooldown = Duration::from_secs(cooldown_minutes.saturating_mul(60));
+    }
+
+    pub fn maybe_notify_low_battery(
+        &mut self,
+        state: &BatteryState,
+        estimate: Option<Estimate>,
+    ) -> bool {
         let now = Instant::now();
         if !self.should_notify(state, now) {
             return false;
         }
 
-        if send_toast_low_battery(state).is_ok() {
+        if send_toast_low_battery(state, estimate).is_ok() {
             self.last_sent.insert(state.device_key.clone(), now);
             return true;
         }
@@ -46,15 +57,51 @@ impl Notifier {
     }
 }
 
+pub fn show_welcome() -> anyhow::Result<()> {
+    show_information(
+        "razertray is running",
+        "Right-click the tray icon to view battery status and settings.",
+    )
+}
+
+pub fn show_error(title: &str, recovery: &str) -> anyhow::Result<()> {
+    show_information(title, recovery)
+}
+
 #[cfg(target_os = "windows")]
-fn send_toast_low_battery(state: &BatteryState) -> anyhow::Result<()> {
+fn show_information(title: &str, text: &str) -> anyhow::Result<()> {
+    use tauri_winrt_notification::Toast;
+    Toast::new(toast_app_id()).title(title).text1(text).show()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_information(_title: &str, _text: &str) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn send_toast_low_battery(state: &BatteryState, estimate: Option<Estimate>) -> anyhow::Result<()> {
     use tauri_winrt_notification::Toast;
     let app_id = toast_app_id();
 
+    let action = if matches!(
+        state.charge_state,
+        ChargeState::Unavailable | ChargeState::Unsupported
+    ) {
+        "Check the charger soon"
+    } else {
+        "Plug in the charger soon"
+    };
+    let detail = estimate.map_or_else(
+        || "Battery low".to_string(),
+        crate::forecast::format_estimate,
+    );
+
     Toast::new(app_id)
         .title(&low_battery_title(state))
-        .text1("Battery low")
-        .text2("Plug in charger soon")
+        .text1(&detail)
+        .text2(action)
         .show()?;
 
     Ok(())
@@ -107,7 +154,10 @@ fn register_toast_aumid() -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn send_toast_low_battery(_state: &BatteryState) -> anyhow::Result<()> {
+fn send_toast_low_battery(
+    _state: &BatteryState,
+    _estimate: Option<Estimate>,
+) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -119,7 +169,7 @@ fn low_battery_title(state: &BatteryState) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Notifier, low_battery_title};
-    use crate::model::BatteryState;
+    use crate::model::{BatteryState, ChargeState};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -130,11 +180,11 @@ mod tests {
             display_name: "Test Mouse".to_string(),
             pid: 0x0072,
             battery_percent: 10,
-            is_charging: true,
-            supports_charging_status: true,
+            battery_raw: 25,
+            charge_state: ChargeState::Charging,
         };
 
-        assert!(!notifier.maybe_notify_low_battery(&state));
+        assert!(!notifier.maybe_notify_low_battery(&state, None));
     }
 
     #[test]
@@ -144,8 +194,8 @@ mod tests {
             display_name: "Test Mouse".to_string(),
             pid: 0x0072,
             battery_percent: 10,
-            is_charging: false,
-            supports_charging_status: true,
+            battery_raw: 25,
+            charge_state: ChargeState::NotCharging,
         };
 
         assert_eq!(low_battery_title(&state), "Test Mouse: 10%");
@@ -159,8 +209,8 @@ mod tests {
             display_name: "Test Mouse".to_string(),
             pid: 0x0072,
             battery_percent: 10,
-            is_charging: false,
-            supports_charging_status: true,
+            battery_raw: 25,
+            charge_state: ChargeState::NotCharging,
         };
 
         let now = Instant::now();

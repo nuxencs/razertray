@@ -1,0 +1,51 @@
+# Architecture
+
+razertray uses a small event-driven core. Platform and HID details stay at the
+edges.
+
+## State flow
+
+1. The polling worker emits a poll ID and starts a bounded HID scan.
+2. The HID client returns typed readings and typed errors.
+3. `AppCore` accepts only the active poll ID, updates observations, and projects
+   one complete `TrayView`.
+4. The tray applies that view as an idempotent projection.
+5. Side effects use a small command set for configuration writes and
+   notifications.
+
+This split keeps the core testable without a Windows tray or physical hardware.
+
+## State truth rules
+
+- Poll activity and device observation are separate states.
+- A successful poll controls which readings are current.
+- An old reading can remain visible only as stale data.
+- The preferred device changes only after an explicit user selection.
+- A readable fallback does not replace the saved preference.
+- A failed configuration write restores the prior in-memory setting.
+- Windows startup state comes from the Windows Run registry key.
+
+## HID boundary
+
+The scanner groups candidate HID interfaces for each logical device. The client
+tries candidates in a deterministic order. It tries a cached transaction ID,
+known device metadata, and bounded protocol fallbacks. Failed cached IDs are
+removed. Transport and protocol failures can retry within a per-device time
+budget.
+
+The private transport seam supports retry tests without exposing HID mechanics
+to the rest of the app.
+
+## Diagnostics
+
+`PollResult` is the structured diagnostic boundary. It preserves raw battery
+values, charge-state uncertainty, typed error kinds, and readable devices in the
+same result. JSON output uses this type directly.
+
+Repeated errors are throttled in logs. A later successful poll records recovery.
+
+## Forecast
+
+Forecasting is private application state. It consumes successful, timestamped
+readings only. It resets after charging, large gaps, or implausible upward
+changes. The tray receives only a formatted estimate, not forecast internals.

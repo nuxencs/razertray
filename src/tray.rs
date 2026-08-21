@@ -1,143 +1,215 @@
 use crate::APP_ID;
+use crate::application::{AppCore, AppEvent, Command, PollId, TrayIconState, TrayView};
 use crate::autostart;
-use crate::config::{self, AppConfig, PidCache};
+use crate::config::{self, AlertScope, AppConfig, PidCache, ViewMode};
+use crate::error_tracker::{ErrorNotice, ErrorTracker};
 use crate::hid::client;
 use crate::icon;
-use crate::model::{BatteryState, PollResult};
-use crate::notify::Notifier;
+use crate::model::{PollError, PollErrorKind, PollOutcome};
+use crate::notify::{self, Notifier};
 use anyhow::{Context, Result};
 use hidapi::HidApi;
+use std::collections::BTreeSet;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+const EMPTY_RETRY_START_SECS: u64 = 2;
+const THRESHOLD_OPTIONS: &[u8] = &[10, 15, 20, 25];
+const INTERVAL_OPTIONS: &[(u64, &str)] = &[
+    (30, "30 seconds"),
+    (60, "1 minute"),
+    (120, "2 minutes"),
+    (300, "5 minutes"),
+];
+
 #[derive(Debug, Clone)]
 enum UserEvent {
     Menu(String),
-    Poll(PollResult),
+    PollStarted(PollId),
+    PollFinished(PollId, PollOutcome),
 }
 
 enum WorkerCommand {
     Refresh,
+    SetInterval(u64),
     Exit,
 }
 
 struct MenuHandles {
     root: Menu,
     status_item: MenuItem,
-    select_submenu: Submenu,
+    device_submenu: Submenu,
     refresh_item: MenuItem,
     view_mode_item: CheckMenuItem,
+    alert_scope_item: CheckMenuItem,
+    threshold_items: Vec<(u8, CheckMenuItem)>,
+    interval_items: Vec<(u64, CheckMenuItem)>,
     autostart_item: CheckMenuItem,
-    exit_item: MenuItem,
     device_items: Vec<CheckMenuItem>,
 }
 
 impl MenuHandles {
-    fn build(initial_autostart: bool, initial_text_mode: bool) -> Result<Self> {
+    fn build(config: &AppConfig, autostart_enabled: Option<bool>) -> Result<Self> {
         let root = Menu::new();
+        let status_item = MenuItem::new("Checking for Razer devices...", false, None);
+        let device_submenu = Submenu::new("Displayed device", true);
+        device_submenu.append(&MenuItem::new("Checking...", false, None))?;
+        let refresh_item = MenuItem::with_id("refresh", "Refreshing...", false, None);
 
-        let status_item = MenuItem::new("No supported Razer devices", false, None);
-        let select_submenu = Submenu::new("Select Device", true);
-        let refresh_item = MenuItem::with_id("refresh", "Refresh now", true, None);
+        let preferences = Submenu::new("Preferences", true);
         let view_mode_item = CheckMenuItem::with_id(
             "viewmode",
             "Show percentage as text",
             true,
-            initial_text_mode,
+            config.view_mode == ViewMode::Text,
             None,
         );
-        let autostart_item =
-            CheckMenuItem::with_id("autostart", "Start at login", true, initial_autostart, None);
-        let exit_item = MenuItem::with_id("exit", "Exit", true, None);
-        let separator = PredefinedMenuItem::separator();
+        let alert_scope_item = CheckMenuItem::with_id(
+            "alertscope",
+            "Alert for all devices",
+            true,
+            config.alert_scope == AlertScope::All,
+            None,
+        );
+        let threshold_submenu = Submenu::new("Low-battery alert", true);
+        let mut threshold_items = Vec::new();
+        for threshold in THRESHOLD_OPTIONS {
+            let item = CheckMenuItem::with_id(
+                format!("threshold:{threshold}"),
+                format!("{threshold}%"),
+                true,
+                config.low_battery_threshold == *threshold,
+                None,
+            );
+            threshold_submenu.append(&item)?;
+            threshold_items.push((*threshold, item));
+        }
 
+        let interval_submenu = Submenu::new("Check interval", true);
+        let mut interval_items = Vec::new();
+        for (seconds, label) in INTERVAL_OPTIONS {
+            let item = CheckMenuItem::with_id(
+                format!("interval:{seconds}"),
+                *label,
+                true,
+                config.poll_interval_seconds == *seconds,
+                None,
+            );
+            interval_submenu.append(&item)?;
+            interval_items.push((*seconds, item));
+        }
+
+        let autostart_item = CheckMenuItem::with_id(
+            "autostart",
+            if autostart_enabled.is_some() {
+                "Start at login"
+            } else {
+                "Start at login (status unavailable)"
+            },
+            autostart_enabled.is_some(),
+            autostart_enabled.unwrap_or(false),
+            None,
+        );
+        preferences.append_items(&[
+            &view_mode_item,
+            &alert_scope_item,
+            &threshold_submenu,
+            &interval_submenu,
+            &autostart_item,
+        ])?;
+
+        let open_folder_item = MenuItem::with_id("open-folder", "Open app folder", true, None);
+        let exit_item = MenuItem::with_id("exit", "Exit razertray", true, None);
+        let separator_one = PredefinedMenuItem::separator();
+        let separator_two = PredefinedMenuItem::separator();
         root.append_items(&[
             &status_item,
-            &select_submenu,
+            &device_submenu,
             &refresh_item,
-            &view_mode_item,
-            &autostart_item,
-            &separator,
+            &separator_one,
+            &preferences,
+            &open_folder_item,
+            &separator_two,
             &exit_item,
         ])?;
 
         Ok(Self {
             root,
             status_item,
-            select_submenu,
+            device_submenu,
             refresh_item,
             view_mode_item,
+            alert_scope_item,
+            threshold_items,
+            interval_items,
             autostart_item,
-            exit_item,
             device_items: Vec::new(),
         })
     }
 
-    fn rebuild_device_menu(
-        &mut self,
-        devices: &[BatteryState],
-        selected_device_id: &str,
-    ) -> Result<()> {
-        for item in self.select_submenu.items() {
-            remove_item(&self.select_submenu, &item)?;
+    fn apply_view(&mut self, view: &TrayView) -> Result<()> {
+        self.status_item.set_text(&view.status_text);
+        self.refresh_item.set_enabled(view.refresh_enabled);
+        self.refresh_item.set_text(if view.refresh_enabled {
+            "Refresh now"
+        } else {
+            "Refreshing..."
+        });
+        self.view_mode_item
+            .set_checked(view.config.view_mode == ViewMode::Text);
+        self.alert_scope_item
+            .set_checked(view.config.alert_scope == AlertScope::All);
+        for (threshold, item) in &self.threshold_items {
+            item.set_checked(*threshold == view.config.low_battery_threshold);
+        }
+        for (seconds, item) in &self.interval_items {
+            item.set_checked(*seconds == view.config.poll_interval_seconds);
+        }
+
+        for item in self.device_submenu.items() {
+            remove_item(&self.device_submenu, &item)?;
         }
         self.device_items.clear();
-
-        if devices.is_empty() {
-            let empty = MenuItem::new("No devices", false, None);
-            self.select_submenu.append(&empty)?;
-            return Ok(());
+        if view.devices.is_empty() {
+            let label = if view.refresh_enabled {
+                "No devices available"
+            } else {
+                "Checking..."
+            };
+            self.device_submenu
+                .append(&MenuItem::new(label, false, None))?;
+        } else {
+            for device in &view.devices {
+                let item = CheckMenuItem::with_id(
+                    format!("device:{}", device.id),
+                    &device.label,
+                    device.available,
+                    device.displayed,
+                    None,
+                );
+                self.device_submenu.append(&item)?;
+                self.device_items.push(item);
+            }
         }
-
-        for device in devices {
-            let checked = device.device_key == selected_device_id;
-            let label = format!(
-                "{} ({:04X}) - {}%{}",
-                device.display_name,
-                device.pid,
-                device.battery_percent,
-                if device.is_charging { " charging" } else { "" }
-            );
-
-            let menu_id = format!("device:{}", device.device_key);
-            let item = CheckMenuItem::with_id(menu_id, label, true, checked, None);
-            self.select_submenu.append(&item)?;
-            self.device_items.push(item);
-        }
-
         Ok(())
-    }
-
-    fn set_selected(&self, selected_device_id: &str) {
-        for item in &self.device_items {
-            let is_selected = item.id().0.strip_prefix("device:") == Some(selected_device_id);
-            item.set_checked(is_selected);
-        }
-    }
-
-    fn touch_ids(&self) {
-        // Keep explicit reads so clippy/rustc treat these handles as used.
-        // We retain them to keep the corresponding menu items alive.
-        let _ = self.refresh_item.id();
-        let _ = self.exit_item.id();
     }
 }
 
-pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
+pub fn run_tray_app(config: AppConfig, startup_warning: Option<String>) -> Result<()> {
     let exe_path = std::env::current_exe().context("failed resolving executable path")?;
-    if let Err(err) = autostart::set_enabled(&exe_path, cfg.autostart) {
-        tracing::warn!("failed to apply autostart setting: {err}");
-    }
-
-    let autostart_enabled = autostart::is_enabled().unwrap_or(cfg.autostart);
-
+    let autostart_enabled = match autostart::is_enabled(&exe_path) {
+        Ok(enabled) => Some(enabled),
+        Err(err) => {
+            tracing::warn!("failed reading autostart state: {err}");
+            None
+        }
+    };
     let cache = config::load_or_create_pid_cache().unwrap_or_else(|_| PidCache::default());
-
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
@@ -149,151 +221,225 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     }));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
+    spawn_poll_worker(proxy, cmd_rx, cache, config.poll_interval_seconds);
 
-    spawn_poll_worker(
-        proxy.clone(),
-        cmd_rx,
-        cache.clone(),
-        cfg.poll_interval_seconds.max(5),
-    );
-
-    let mut text_mode = cfg.text_mode();
-    let mut menu = MenuHandles::build(autostart_enabled, text_mode)?;
-    menu.touch_ids();
-
+    let now = Instant::now();
+    let (mut core, _initial_poll, initial_update) = AppCore::new(config, now);
+    let mut menu = MenuHandles::build(core.config(), autostart_enabled)?;
     let initial_icon = icon::neutral_icon()?;
     let mut tray_icon = build_tray_icon(&menu.root, initial_icon)?;
+    apply_projection(&mut menu, &mut tray_icon, &initial_update.view)?;
+    let mut notifier = Notifier::new(
+        core.config().low_battery_threshold,
+        core.config().low_battery_cooldown_minutes,
+    );
+    let mut error_tracker = ErrorTracker::default();
 
-    let mut notifier = Notifier::new(cfg.low_battery_threshold, cfg.low_battery_cooldown_minutes);
-    let mut devices: Vec<BatteryState> = Vec::new();
-    let mut selected_device_id = cfg.selected_device_id.clone();
+    if let Some(warning) = startup_warning {
+        tracing::warn!("configuration recovery: {warning}");
+        let _ = notify::show_error("Configuration was reset", &warning);
+    }
 
-    // Tolerate brief gaps: keep showing the last reading for up to this many
-    // consecutive empty polls before clearing the tray to "no device".
-    let mut missed_polls: u32 = 0;
-    const MAX_MISSED_POLLS: u32 = 3;
+    if !core.config().welcome_shown {
+        if let Err(err) = notify::show_welcome() {
+            tracing::warn!("failed showing welcome notification: {err}");
+        }
+        let update = core.handle(AppEvent::MarkWelcomeShown, Instant::now());
+        if let Some(rollback) = execute_commands(&update.commands, &mut notifier, &cmd_tx) {
+            core.handle(AppEvent::RestoreConfig(rollback), Instant::now());
+        }
+    }
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
+        let Event::UserEvent(user_event) = event else {
+            return;
+        };
 
-        if let Event::UserEvent(user_event) = event {
-            match user_event {
-                UserEvent::Menu(menu_id) => {
-                    if menu_id == "refresh" {
-                        let _ = cmd_tx.send(WorkerCommand::Refresh);
-                    } else if menu_id == "exit" {
-                        let _ = cmd_tx.send(WorkerCommand::Exit);
-                        *control_flow = ControlFlow::Exit;
-                    } else if menu_id == "autostart" {
-                        // muda already toggled the checkbox before firing this
-                        // event (see its `menu_selected`), so `is_checked()`
-                        // holds the post-click state. Re-setting it here would
-                        // toggle a second time and make the click a no-op.
-                        let enabled = menu.autostart_item.is_checked();
-
-                        if let Err(err) = autostart::set_enabled(&exe_path, enabled) {
-                            tracing::warn!("failed to set autostart: {err}");
-                        }
-
-                        cfg.autostart = enabled;
-                        if let Err(err) = config::save_config(&cfg) {
-                            tracing::warn!("failed saving config: {err}");
-                        }
-                    } else if menu_id == "viewmode" {
-                        // muda already toggled the check mark before firing this
-                        // event, so is_checked() holds the post-click state.
-                        text_mode = menu.view_mode_item.is_checked();
-                        cfg.view_mode = if text_mode { "text" } else { "icon" }.to_string();
-
-                        if let Err(err) = config::save_config(&cfg) {
-                            tracing::warn!("failed saving config: {err}");
-                        }
-
-                        if let Err(err) = refresh_tray_visuals(
-                            &mut tray_icon,
-                            &devices,
-                            &selected_device_id,
-                            &menu.status_item,
-                            text_mode,
-                        ) {
-                            tracing::warn!("failed updating tray visuals: {err}");
-                        }
-                    } else if let Some(device_id) = menu_id.strip_prefix("device:") {
-                        selected_device_id = device_id.to_string();
-                        cfg.selected_device_id = selected_device_id.clone();
-                        menu.set_selected(&selected_device_id);
-
-                        if let Err(err) = config::save_config(&cfg) {
-                            tracing::warn!("failed saving config: {err}");
-                        }
-
-                        if let Err(err) = refresh_tray_visuals(
-                            &mut tray_icon,
-                            &devices,
-                            &selected_device_id,
-                            &menu.status_item,
-                            text_mode,
-                        ) {
-                            tracing::warn!("failed updating tray visuals: {err}");
-                        }
-                    }
+        let update = match user_event {
+            UserEvent::PollStarted(id) => core.handle(AppEvent::PollStarted(id), Instant::now()),
+            UserEvent::PollFinished(id, result) => {
+                let (poll_errors, successful_ids, poll_completed) = match &result {
+                    Ok(poll_result) => (
+                        poll_result.errors.clone(),
+                        poll_result
+                            .devices
+                            .iter()
+                            .map(|device| device.device_key.clone())
+                            .collect::<BTreeSet<_>>(),
+                        true,
+                    ),
+                    Err(error) => (vec![error.clone()], BTreeSet::new(), false),
+                };
+                for notice in error_tracker.observe(
+                    &poll_errors,
+                    &successful_ids,
+                    poll_completed,
+                    Instant::now(),
+                ) {
+                    log_error_notice(notice);
                 }
-                UserEvent::Poll(mut poll_result) => {
-                    poll_result.sort_devices();
-                    let PollResult {
-                        devices: new_devices,
-                        errors,
-                    } = poll_result;
-
-                    if !errors.is_empty() {
-                        for err in errors {
-                            tracing::warn!("poll error: {err}");
-                        }
+                core.handle(AppEvent::PollFinished(id, result), Instant::now())
+            }
+            UserEvent::Menu(menu_id) => {
+                if menu_id == "refresh" {
+                    let _ = cmd_tx.send(WorkerCommand::Refresh);
+                    return;
+                }
+                if menu_id == "exit" {
+                    let _ = cmd_tx.send(WorkerCommand::Exit);
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                }
+                if menu_id == "open-folder" {
+                    if let Err(err) = open_app_folder() {
+                        tracing::warn!("failed opening app folder: {err}");
+                        let _ = notify::show_error(
+                            "Could not open the app folder",
+                            "Open %APPDATA%\\razertray in File Explorer.",
+                        );
                     }
-
-                    // Keep the last known reading through brief gaps: a poll that
-                    // comes back empty while we still have devices is treated as a
-                    // transient miss until it persists for MAX_MISSED_POLLS cycles.
-                    if new_devices.is_empty() && !devices.is_empty() {
-                        missed_polls += 1;
-                        if missed_polls < MAX_MISSED_POLLS {
-                            tracing::debug!(
-                                "transient empty poll ({missed_polls}/{MAX_MISSED_POLLS}); keeping last reading"
+                    return;
+                }
+                if menu_id == "autostart" {
+                    let requested = menu.autostart_item.is_checked();
+                    match autostart::set_enabled(&exe_path, requested) {
+                        Ok(()) => return,
+                        Err(err) => {
+                            menu.autostart_item.set_checked(!requested);
+                            tracing::warn!("failed setting autostart: {err}");
+                            let _ = notify::show_error(
+                                "Start at login was not changed",
+                                "Try again, or check Windows startup-app permissions.",
                             );
                             return;
                         }
                     }
-                    missed_polls = 0;
-                    devices = new_devices;
-
-                    if ensure_selected_device(&mut selected_device_id, &devices) {
-                        cfg.selected_device_id = selected_device_id.clone();
-                        if let Err(err) = config::save_config(&cfg) {
-                            tracing::warn!("failed saving config: {err}");
-                        }
-                    }
-
-                    if let Err(err) = menu.rebuild_device_menu(&devices, &selected_device_id) {
-                        tracing::warn!("failed rebuilding menu: {err}");
-                    }
-
-                    if let Err(err) = refresh_tray_visuals(
-                        &mut tray_icon,
-                        &devices,
-                        &selected_device_id,
-                        &menu.status_item,
-                        text_mode,
-                    ) {
-                        tracing::warn!("failed refreshing visuals: {err}");
-                    }
-
-                    for device in &devices {
-                        notifier.maybe_notify_low_battery(device);
-                    }
+                } else if menu_id == "viewmode" {
+                    let mode = if menu.view_mode_item.is_checked() {
+                        ViewMode::Text
+                    } else {
+                        ViewMode::Icon
+                    };
+                    core.handle(AppEvent::SetViewMode(mode), Instant::now())
+                } else if menu_id == "alertscope" {
+                    let scope = if menu.alert_scope_item.is_checked() {
+                        AlertScope::All
+                    } else {
+                        AlertScope::Selected
+                    };
+                    core.handle(AppEvent::SetAlertScope(scope), Instant::now())
+                } else if let Some(raw) = menu_id.strip_prefix("threshold:") {
+                    let Ok(threshold) = raw.parse::<u8>() else {
+                        return;
+                    };
+                    core.handle(AppEvent::SetLowBatteryThreshold(threshold), Instant::now())
+                } else if let Some(raw) = menu_id.strip_prefix("interval:") {
+                    let Ok(seconds) = raw.parse::<u64>() else {
+                        return;
+                    };
+                    core.handle(AppEvent::SetPollInterval(seconds), Instant::now())
+                } else if let Some(device_id) = menu_id.strip_prefix("device:") {
+                    core.handle(
+                        AppEvent::SelectDevice(device_id.to_string()),
+                        Instant::now(),
+                    )
+                } else {
+                    return;
                 }
             }
+        };
+
+        let update =
+            if let Some(rollback) = execute_commands(&update.commands, &mut notifier, &cmd_tx) {
+                core.handle(AppEvent::RestoreConfig(rollback), Instant::now())
+            } else {
+                update
+            };
+        notifier.set_policy(
+            update.view.config.low_battery_threshold,
+            update.view.config.low_battery_cooldown_minutes,
+        );
+        if let Err(err) = apply_projection(&mut menu, &mut tray_icon, &update.view) {
+            tracing::warn!("failed applying tray view: {err}");
         }
     });
+}
+
+fn execute_commands(
+    commands: &[Command],
+    notifier: &mut Notifier,
+    worker: &mpsc::Sender<WorkerCommand>,
+) -> Option<AppConfig> {
+    for command in commands {
+        match command {
+            Command::SaveConfig { config, rollback } => {
+                if let Err(err) = config::save_config(config) {
+                    tracing::warn!("failed saving config: {err}");
+                    let _ = notify::show_error(
+                        "Settings were not saved",
+                        "Check access to the razertray app folder, then try again.",
+                    );
+                    return Some(rollback.clone());
+                }
+            }
+            Command::NotifyCandidate { reading, estimate } => {
+                notifier.maybe_notify_low_battery(reading, *estimate);
+            }
+            Command::ApplyPollInterval(seconds) => {
+                let _ = worker.send(WorkerCommand::SetInterval(*seconds));
+            }
+        }
+    }
+    None
+}
+
+fn log_error_notice(notice: ErrorNotice) {
+    match notice {
+        ErrorNotice::Started(error) => tracing::warn!(
+            device = %error.display_name,
+            kind = ?error.kind,
+            "poll error: {}",
+            error.message
+        ),
+        ErrorNotice::Repeated { error, suppressed } => tracing::warn!(
+            device = %error.display_name,
+            kind = ?error.kind,
+            suppressed,
+            "poll error continues: {}",
+            error.message
+        ),
+        ErrorNotice::Recovered { display_name, kind } => tracing::info!(
+            device = %display_name,
+            kind = ?kind,
+            "device polling recovered"
+        ),
+    }
+}
+
+fn apply_projection(
+    menu: &mut MenuHandles,
+    tray_icon: &mut TrayIcon,
+    view: &TrayView,
+) -> Result<()> {
+    menu.apply_view(view)?;
+    let next_icon = match view.icon {
+        TrayIconState::Unknown => icon::neutral_icon()?,
+        TrayIconState::Battery {
+            percent,
+            charge_state,
+        } => {
+            let charging = charge_state.is_charging();
+            if view.config.text_mode() {
+                icon::text_icon(percent, charging)?
+            } else {
+                icon::battery_icon(percent, charging)?
+            }
+        }
+    };
+    tray_icon.set_icon(Some(next_icon))?;
+    tray_icon.set_tooltip(Some(&view.tooltip))?;
+    Ok(())
 }
 
 fn build_tray_icon(menu: &Menu, icon: Icon) -> Result<TrayIcon> {
@@ -305,126 +451,123 @@ fn build_tray_icon(menu: &Menu, icon: Icon) -> Result<TrayIcon> {
         .context("failed creating tray icon")
 }
 
-fn refresh_tray_visuals(
-    tray_icon: &mut TrayIcon,
-    devices: &[BatteryState],
-    selected_device_id: &str,
-    status_item: &MenuItem,
-    text_mode: bool,
-) -> Result<()> {
-    let selected = devices.iter().find(|d| d.device_key == selected_device_id);
-
-    if let Some(device) = selected {
-        let icon = if text_mode {
-            icon::text_icon(device.battery_percent, device.is_charging)?
-        } else {
-            icon::battery_icon(device.battery_percent, device.is_charging)?
-        };
-        tray_icon.set_icon(Some(icon))?;
-
-        let tooltip = format!(
-            "{}: {}%{}",
-            device.display_name,
-            device.battery_percent,
-            if device.is_charging {
-                " (charging)"
-            } else {
-                ""
-            }
-        );
-        tray_icon.set_tooltip(Some(tooltip.clone()))?;
-        status_item.set_text(&tooltip);
-    } else {
-        tray_icon.set_icon(Some(icon::neutral_icon()?))?;
-        tray_icon.set_tooltip(Some("No supported Razer devices"))?;
-        status_item.set_text("No supported Razer devices");
-    }
-
-    Ok(())
-}
-
-fn ensure_selected_device(selected_device_id: &mut String, devices: &[BatteryState]) -> bool {
-    if devices.is_empty() {
-        if !selected_device_id.is_empty() {
-            selected_device_id.clear();
-            return true;
-        }
-        return false;
-    }
-
-    if devices.iter().any(|d| d.device_key == *selected_device_id) {
-        return false;
-    }
-
-    *selected_device_id = devices[0].device_key.clone();
-    true
-}
-
-const EMPTY_RETRY_START_SECS: u64 = 2;
-
 fn spawn_poll_worker(
     proxy: EventLoopProxy<UserEvent>,
     cmd_rx: mpsc::Receiver<WorkerCommand>,
     mut cache: PidCache,
-    poll_interval_seconds: u64,
+    initial_interval: u64,
 ) {
     thread::spawn(move || {
-        // When a poll finds no device we retry quickly, doubling the delay each
-        // time (2s, 4s, 8s, …) up to the normal interval, so a sleeping or
-        // not-yet-ready device is picked up fast without hammering the USB bus
-        // forever when nothing is connected.
+        let mut poll_interval = initial_interval.clamp(5, 3_600);
         let mut empty_backoff = EMPTY_RETRY_START_SECS;
-
-        // Create the HidApi handle once and reuse it across polls;
-        // `refresh_devices` picks up newly attached/removed devices without a
-        // full re-enumeration. The handle is recreated lazily if init ever fails.
+        let mut next_wait = poll_interval;
         let mut api: Option<HidApi> = None;
+        let mut api_init_error: Option<PollError> = None;
+        let mut cache_dirty = false;
+        let mut poll_number = 0_u64;
+        let mut poll_now = true;
 
         loop {
-            if api.is_none() {
-                match HidApi::new() {
-                    Ok(a) => api = Some(a),
-                    Err(err) => tracing::warn!("failed initializing hidapi: {err}"),
+            if poll_now {
+                poll_number = poll_number.saturating_add(1);
+                let poll_id = PollId::new(poll_number);
+                let _ = proxy.send_event(UserEvent::PollStarted(poll_id));
+                if api.is_none() {
+                    match HidApi::new() {
+                        Ok(handle) => {
+                            api = Some(handle);
+                            api_init_error = None;
+                        }
+                        Err(err) => {
+                            let error =
+                                subsystem_error(format!("failed initializing HID access: {err}"));
+                            tracing::warn!("{}", error.message);
+                            api_init_error = Some(error);
+                        }
+                    }
                 }
+
+                let outcome = match api.as_mut() {
+                    Some(handle) => match handle.refresh_devices() {
+                        Ok(()) => {
+                            let batch = client::poll_devices(handle, &mut cache);
+                            cache_dirty |= batch.cache_changed;
+                            if cache_dirty {
+                                match config::save_pid_cache(&cache) {
+                                    Ok(()) => cache_dirty = false,
+                                    Err(err) => {
+                                        tracing::warn!("failed saving PID cache: {err}");
+                                    }
+                                }
+                            }
+                            Ok(batch.result)
+                        }
+                        Err(err) => Err(subsystem_error(format!(
+                            "could not refresh HID devices: {err}"
+                        ))),
+                    },
+                    None => Err(api_init_error.clone().unwrap_or_else(|| {
+                        subsystem_error("HID access is unavailable".to_string())
+                    })),
+                };
+                let found = outcome
+                    .as_ref()
+                    .is_ok_and(|result| !result.devices.is_empty());
+                let _ = proxy.send_event(UserEvent::PollFinished(poll_id, outcome));
+                if found {
+                    empty_backoff = EMPTY_RETRY_START_SECS;
+                    next_wait = poll_interval;
+                } else {
+                    next_wait = empty_backoff.min(poll_interval);
+                    empty_backoff = (empty_backoff * 2).min(poll_interval);
+                }
+                poll_now = false;
             }
 
-            let poll_result = match api.as_mut() {
-                Some(a) => {
-                    let _ = a.refresh_devices();
-                    client::poll_devices(a, &mut cache)
+            match cmd_rx.recv_timeout(Duration::from_secs(next_wait)) {
+                Ok(WorkerCommand::Refresh) => poll_now = true,
+                Ok(WorkerCommand::SetInterval(seconds)) => {
+                    poll_interval = seconds.clamp(5, 3_600);
+                    next_wait = next_wait.min(poll_interval);
                 }
-                None => PollResult {
-                    devices: Vec::new(),
-                    errors: vec!["hidapi unavailable".to_string()],
-                },
-            };
-
-            if let Err(err) = config::save_pid_cache(&cache) {
-                tracing::warn!("failed saving pid cache: {err}");
-            }
-
-            let found = !poll_result.devices.is_empty();
-            let _ = proxy.send_event(UserEvent::Poll(poll_result));
-
-            // Sleep the full interval once we have a device; otherwise back off
-            // quickly so the next attempt is soon after a device appears.
-            let wait = if found {
-                empty_backoff = EMPTY_RETRY_START_SECS;
-                poll_interval_seconds
-            } else {
-                let w = empty_backoff.min(poll_interval_seconds);
-                empty_backoff = (empty_backoff * 2).min(poll_interval_seconds);
-                w
-            };
-
-            match cmd_rx.recv_timeout(Duration::from_secs(wait)) {
-                Ok(WorkerCommand::Refresh) => continue,
                 Ok(WorkerCommand::Exit) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => poll_now = true,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
     });
+}
+
+fn subsystem_error(message: String) -> PollError {
+    let normalized = message.to_ascii_lowercase();
+    let kind = if normalized.contains("access")
+        && (normalized.contains("denied") || normalized.contains("permission"))
+    {
+        PollErrorKind::AccessDenied
+    } else {
+        PollErrorKind::Unknown
+    };
+    PollError {
+        device_key: String::new(),
+        display_name: "HID subsystem".to_string(),
+        pid: 0,
+        kind,
+        message,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_app_folder() -> Result<()> {
+    std::process::Command::new("explorer.exe")
+        .arg(config::app_data_dir())
+        .spawn()
+        .context("failed starting File Explorer")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_app_folder() -> Result<()> {
+    anyhow::bail!("opening the app folder is only supported on Windows")
 }
 
 fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Result<()> {
@@ -440,26 +583,15 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_selected_device;
-    use crate::model::BatteryState;
-
-    fn mk_state(id: &str) -> BatteryState {
-        BatteryState {
-            device_key: id.to_string(),
-            display_name: "X".to_string(),
-            pid: 0x0001,
-            battery_percent: 50,
-            is_charging: false,
-            supports_charging_status: true,
-        }
-    }
+    use super::subsystem_error;
+    use crate::model::PollErrorKind;
 
     #[test]
-    fn selected_device_falls_back_to_first() {
-        let devices = vec![mk_state("a"), mk_state("b")];
-        let mut selected = "missing".to_string();
-        let changed = ensure_selected_device(&mut selected, &devices);
-        assert!(changed);
-        assert_eq!(selected, "a");
+    fn subsystem_access_failure_keeps_actionable_kind() {
+        let denied = subsystem_error("HID access denied by Windows".to_string());
+        let unknown = subsystem_error("HID refresh failed".to_string());
+
+        assert_eq!(denied.kind, PollErrorKind::AccessDenied);
+        assert_eq!(unknown.kind, PollErrorKind::Unknown);
     }
 }
