@@ -226,8 +226,9 @@ pub fn run_tray_app(config: AppConfig, startup_recovery: Option<ConfigRecovery>)
     };
     let config::PidCacheLoad {
         cache,
-        diagnostic: cache_diagnostic,
+        state: cache_state,
     } = config::load_pid_cache_for_polling();
+    let cache_diagnostic = cache_state.into_diagnostic();
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 

@@ -1,6 +1,6 @@
 use hidapi::HidApi;
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 
 pub const RAZER_VID: u16 = 0x1532;
 
@@ -16,7 +16,14 @@ pub struct DiscoveredDevice {
     pub key: String,
     pub pid: u16,
     pub product_name: String,
+    pub interface_grouping: InterfaceGrouping,
     pub candidates: Vec<InterfaceCandidate>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterfaceGrouping {
+    VerifiedDevice,
+    AmbiguousSerialless,
 }
 
 pub fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
@@ -61,7 +68,7 @@ fn add_interface(
     product_name: String,
     candidate: InterfaceCandidate,
 ) {
-    let key = device_key(pid, serial_number, candidate.path.as_c_str());
+    let (key, interface_grouping) = device_identity(pid, serial_number);
     match devices.entry(key.clone()) {
         std::collections::btree_map::Entry::Occupied(mut entry) => {
             entry.get_mut().candidates.push(candidate);
@@ -71,6 +78,7 @@ fn add_interface(
                 key,
                 pid,
                 product_name,
+                interface_grouping,
                 candidates: vec![candidate],
             });
         }
@@ -88,17 +96,14 @@ fn non_empty_text(value: Option<&str>) -> Option<String> {
     })
 }
 
-fn device_key(pid: u16, serial_number: Option<&str>, path: &CStr) -> String {
+fn device_identity(pid: u16, serial_number: Option<&str>) -> (String, InterfaceGrouping) {
     if let Some(serial) = non_empty_text(serial_number) {
-        format!("{pid:04X}:{serial}")
+        (
+            format!("{pid:04X}:{serial}"),
+            InterfaceGrouping::VerifiedDevice,
+        )
     } else {
-        let mut key = format!("{pid:04X}:path:");
-        const HEX: &[u8; 16] = b"0123456789ABCDEF";
-        for byte in path.to_bytes() {
-            key.push(char::from(HEX[usize::from(byte >> 4)]));
-            key.push(char::from(HEX[usize::from(byte & 0x0F)]));
-        }
-        key
+        (format!("{pid:04X}"), InterfaceGrouping::AmbiguousSerialless)
     }
 }
 
@@ -114,7 +119,10 @@ fn candidate_score(interface_number: i32, usage_page: u16, usage: u16) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{InterfaceCandidate, add_interface, candidate_score, device_key, non_empty_text};
+    use super::{
+        InterfaceCandidate, InterfaceGrouping, add_interface, candidate_score, device_identity,
+        non_empty_text,
+    };
     use std::collections::BTreeMap;
     use std::ffi::CString;
 
@@ -134,21 +142,14 @@ mod tests {
 
     #[test]
     fn device_key_uses_serial_when_available() {
-        let first = CString::new("physical-a-interface-0").expect("path");
-        let second = CString::new("physical-a-interface-1").expect("path");
-
         assert_eq!(
-            device_key(0x00BF, Some("ABC123"), first.as_c_str()),
-            "00BF:ABC123"
-        );
-        assert_eq!(
-            device_key(0x00BF, Some("ABC123"), second.as_c_str()),
-            "00BF:ABC123"
+            device_identity(0x00BF, Some("ABC123")),
+            ("00BF:ABC123".to_string(), InterfaceGrouping::VerifiedDevice)
         );
     }
 
     #[test]
-    fn review_round_20_serialless_paths_are_not_grouped_as_one_device() {
+    fn review_round_21_serialless_interfaces_form_one_ambiguous_group() {
         let mut devices = BTreeMap::new();
         add_interface(
             &mut devices,
@@ -165,8 +166,14 @@ mod tests {
             candidate("physical-b-interface-0", 0),
         );
 
-        assert_eq!(devices.len(), 2);
-        assert!(devices.values().all(|device| device.candidates.len() == 1));
+        assert_eq!(devices.len(), 1);
+        let device = devices.values().next().expect("device group");
+        assert_eq!(device.key, "00BF");
+        assert_eq!(
+            device.interface_grouping,
+            InterfaceGrouping::AmbiguousSerialless
+        );
+        assert_eq!(device.candidates.len(), 2);
     }
 
     #[test]
@@ -188,7 +195,9 @@ mod tests {
         );
 
         assert_eq!(devices.len(), 1);
-        assert_eq!(devices.values().next().expect("device").candidates.len(), 2);
+        let device = devices.values().next().expect("device");
+        assert_eq!(device.interface_grouping, InterfaceGrouping::VerifiedDevice);
+        assert_eq!(device.candidates.len(), 2);
     }
 
     #[test]

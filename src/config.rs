@@ -89,7 +89,22 @@ pub struct PidCache {
 #[derive(Clone, Debug)]
 pub struct PidCacheLoad {
     pub cache: PidCache,
-    pub diagnostic: Option<PollError>,
+    pub state: PidCacheLoadState,
+}
+
+#[derive(Clone, Debug)]
+pub enum PidCacheLoadState {
+    Available,
+    Unavailable(PollError),
+}
+
+impl PidCacheLoadState {
+    pub fn into_diagnostic(self) -> Option<PollError> {
+        match self {
+            Self::Available => None,
+            Self::Unavailable(diagnostic) => Some(diagnostic),
+        }
+    }
 }
 
 impl PidCache {
@@ -358,13 +373,13 @@ fn load_pid_cache_for_polling_at(path: &Path) -> PidCacheLoad {
     match load_or_create_pid_cache_at(path) {
         Ok(cache) => PidCacheLoad {
             cache,
-            diagnostic: None,
+            state: PidCacheLoadState::Available,
         },
         Err(error) => {
             let message = format!("PID cache unavailable: {error:#}");
             PidCacheLoad {
                 cache: PidCache::default(),
-                diagnostic: Some(PollError::pid_cache(message)),
+                state: PidCacheLoadState::Unavailable(PollError::pid_cache(message)),
             }
         }
     }
@@ -646,7 +661,7 @@ welcome_shown = true
         let loaded = load_pid_cache_for_polling_at(&path);
 
         assert!(loaded.cache.transaction_ids.is_empty());
-        let diagnostic = loaded.diagnostic.expect("cache diagnostic");
+        let diagnostic = loaded.state.into_diagnostic().expect("cache diagnostic");
         assert_eq!(diagnostic.display_name, "PID cache");
         assert_eq!(diagnostic.scope, PollErrorScope::Subsystem);
         assert_eq!(diagnostic.kind, PollErrorKind::DeviceUnavailable);

@@ -1,4 +1,4 @@
-use crate::config::{self, AppConfig};
+use crate::config::{self, AppConfig, PidCacheLoadState};
 use crate::hid::client;
 use crate::model::{PollError, PollResult};
 use anyhow::{Context, Result};
@@ -34,20 +34,19 @@ pub fn run_once(output: OnceOutput) -> Result<OnceStatus> {
         eprintln!("Warning: {}", recovery.message());
     }
 
-    let cache_load = config::load_pid_cache_for_polling();
-    let mut cache = cache_load.cache;
+    let config::PidCacheLoad {
+        mut cache,
+        state: cache_state,
+    } = config::load_pid_cache_for_polling();
     let batch = poll_batch_or_diagnostic(
         HidApi::new()
             .context("failed to initialize hidapi")
             .map(|api| client::poll_devices(&api, &mut cache)),
     );
     let mut result = batch.result;
-    if let Some(diagnostic) = cache_load.diagnostic {
-        result.errors.push(diagnostic);
-    }
-    if batch.cache_changed {
-        record_cache_save_result(&mut result, config::save_pid_cache(&cache));
-    }
+    finish_cache_poll(&mut result, batch.cache_changed, cache_state, || {
+        config::save_pid_cache(&cache)
+    });
 
     if output == OnceOutput::Json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -98,6 +97,19 @@ fn record_cache_save_result(result: &mut PollResult, save_result: Result<()>) {
     };
     let message = format!("failed saving PID cache: {error:#}");
     result.errors.push(PollError::pid_cache(message));
+}
+
+fn finish_cache_poll(
+    result: &mut PollResult,
+    cache_changed: bool,
+    load_state: PidCacheLoadState,
+    save: impl FnOnce() -> Result<()>,
+) {
+    match load_state {
+        PidCacheLoadState::Available if cache_changed => record_cache_save_result(result, save()),
+        PidCacheLoadState::Available => {}
+        PidCacheLoadState::Unavailable(diagnostic) => result.errors.push(diagnostic),
+    }
 }
 
 fn write_poll_errors(
@@ -294,12 +306,14 @@ fn rotated_log_path(base_path: &Path, index: usize) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OnceOutput, OnceStatus, once_status, poll_batch_or_diagnostic, record_cache_save_result,
-        write_poll_errors,
+        OnceOutput, OnceStatus, finish_cache_poll, once_status, poll_batch_or_diagnostic,
+        record_cache_save_result, write_poll_errors,
     };
+    use crate::config::PidCacheLoadState;
     use crate::model::{
         BatteryState, ChargeState, PollError, PollErrorKind, PollErrorScope, PollResult,
     };
+    use std::cell::Cell;
 
     #[test]
     fn unsupported_device_is_a_failure_not_no_device() {
@@ -363,6 +377,29 @@ mod tests {
         assert_eq!(json["errors"][0]["component"], "pid-cache");
         assert_eq!(json["errors"][0]["kind"], "access-denied");
         assert_eq!(json["errors"][0]["display_name"], "PID cache");
+    }
+
+    #[test]
+    fn review_round_21_failed_cache_load_blocks_persistence() {
+        let mut result = PollResult::default();
+        let save_attempted = Cell::new(false);
+
+        finish_cache_poll(
+            &mut result,
+            true,
+            PidCacheLoadState::Unavailable(PollError::pid_cache(
+                "PID cache unavailable: permission denied",
+            )),
+            || {
+                save_attempted.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(!save_attempted.get());
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].display_name, "PID cache");
+        assert_eq!(result.errors[0].kind, PollErrorKind::AccessDenied);
     }
 
     #[test]

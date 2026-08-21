@@ -5,7 +5,7 @@ use crate::hid::protocol::{
     STATUS_NOT_SUPPORTED, STATUS_SUCCESSFUL, build_battery_request, build_charging_request,
     expected_response_matches, feature_report_payload,
 };
-use crate::hid::scanner::{DiscoveredDevice, scan_devices};
+use crate::hid::scanner::{DiscoveredDevice, InterfaceGrouping, scan_devices};
 use crate::model::{
     BatteryState, ChargeState, PollError, PollErrorKind, PollErrorScope, PollResult,
 };
@@ -186,8 +186,9 @@ fn query_device(
         (ChargeState::Unsupported, Vec::new())
     } else {
         prioritize_probe_candidate(&mut transports, candidate_index);
+        let charge_candidates = charge_probe_candidates(&transports, device.interface_grouping);
         let charge_probe = probe_request_with(
-            &transports,
+            charge_candidates,
             &[transaction_id],
             build_charging_request,
             response_wait(device.pid),
@@ -302,6 +303,13 @@ fn candidate_probe_plan<T>(candidates: &[T]) -> (&[T], Option<String>) {
 fn prioritize_probe_candidate<T>(candidates: &mut [T], candidate_index: usize) {
     if candidate_index < candidates.len() {
         candidates[..=candidate_index].rotate_right(1);
+    }
+}
+
+fn charge_probe_candidates<T>(candidates: &[T], interface_grouping: InterfaceGrouping) -> &[T] {
+    match interface_grouping {
+        InterfaceGrouping::VerifiedDevice => candidates,
+        InterfaceGrouping::AmbiguousSerialless => &candidates[..candidates.len().min(1)],
     }
 }
 
@@ -541,10 +549,14 @@ fn response_wait(pid: u16) -> Duration {
 }
 
 fn display_name(device: &DiscoveredDevice) -> String {
-    device_map::known_device_support(device.pid).map_or_else(
+    let name = device_map::known_device_support(device.pid).map_or_else(
         || device.product_name.clone(),
         |support| support.name.to_string(),
-    )
+    );
+    match device.interface_grouping {
+        InterfaceGrouping::VerifiedDevice => name,
+        InterfaceGrouping::AmbiguousSerialless => format!("{name} (serial unavailable)"),
+    }
 }
 
 fn poll_error(device: &DiscoveredDevice, err: anyhow::Error) -> PollError {
@@ -601,16 +613,16 @@ fn scale_percent(raw: u8) -> u8 {
 mod tests {
     use super::{
         FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence, candidate_probe_plan,
-        charge_query_result, format_error_chain, merge_query_failure, no_open_transport_failure,
-        prioritize_probe_candidate, probe_request_with, record_query_result, scale_percent,
-        update_cache_after_success,
+        charge_probe_candidates, charge_query_result, display_name, format_error_chain,
+        merge_query_failure, no_open_transport_failure, prioritize_probe_candidate,
+        probe_request_with, record_query_result, scale_percent, update_cache_after_success,
     };
     use crate::config::PidCache;
     use crate::hid::protocol::{
         FEATURE_REPORT_LENGTH, STATUS_BUSY, STATUS_NO_RESPONSE, STATUS_NOT_SUPPORTED,
         STATUS_SUCCESSFUL, build_battery_request, build_charging_request,
     };
-    use crate::hid::scanner::DiscoveredDevice;
+    use crate::hid::scanner::{DiscoveredDevice, InterfaceGrouping};
     use crate::model::{PollErrorKind, PollErrorScope, PollResult};
     use anyhow::{Result, bail};
     use std::cell::{Cell, RefCell};
@@ -857,6 +869,7 @@ mod tests {
             key: "mouse".to_string(),
             pid: 0xFFFF,
             product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::VerifiedDevice,
             candidates: Vec::new(),
         };
         let mut result = PollResult::default();
@@ -878,6 +891,7 @@ mod tests {
             key: "mouse".to_string(),
             pid: 0xFFFF,
             product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::VerifiedDevice,
             candidates: Vec::new(),
         };
         let mut result = PollResult::default();
@@ -945,6 +959,7 @@ mod tests {
             key: "mouse".to_string(),
             pid: 0xFFFF,
             product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::VerifiedDevice,
             candidates: Vec::new(),
         };
         let mut result = PollResult::default();
@@ -1011,6 +1026,7 @@ mod tests {
             key: "mouse".to_string(),
             pid: 0xFFFF,
             product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::VerifiedDevice,
             candidates: Vec::new(),
         };
         let failure = merge_query_failure(
@@ -1144,6 +1160,7 @@ mod tests {
             key: "mouse".to_string(),
             pid: 0xFFFF,
             product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::VerifiedDevice,
             candidates: Vec::new(),
         };
         let mut result = PollResult::default();
@@ -1178,6 +1195,7 @@ mod tests {
             key: "mouse".to_string(),
             pid: 0xFFFF,
             product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::VerifiedDevice,
             candidates: Vec::new(),
         };
 
@@ -1235,6 +1253,29 @@ mod tests {
     }
 
     #[test]
+    fn review_round_21_ambiguous_charge_stays_on_battery_interface() {
+        let candidates = [0, 1, 2];
+
+        assert_eq!(
+            charge_probe_candidates(&candidates, InterfaceGrouping::AmbiguousSerialless),
+            &[0]
+        );
+        assert_eq!(
+            charge_probe_candidates(&candidates, InterfaceGrouping::VerifiedDevice),
+            &[0, 1, 2]
+        );
+
+        let device = DiscoveredDevice {
+            key: "00BF".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::AmbiguousSerialless,
+            candidates: Vec::new(),
+        };
+        assert_eq!(display_name(&device), "Razer Mouse (serial unavailable)");
+    }
+
+    #[test]
     fn review_charge_probe_preserves_partial_unsupported_evidence() {
         let candidates = [
             (
@@ -1258,6 +1299,7 @@ mod tests {
             key: "mouse".to_string(),
             pid: 0xFFFF,
             product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::VerifiedDevice,
             candidates: Vec::new(),
         };
 
@@ -1284,6 +1326,7 @@ mod tests {
             key: "mouse".to_string(),
             pid: 0xFFFF,
             product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::VerifiedDevice,
             candidates: Vec::new(),
         };
         let query = Err(QueryFailure::Failed {
@@ -1306,6 +1349,7 @@ mod tests {
             key: "mouse".to_string(),
             pid: 0xFFFF,
             product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::VerifiedDevice,
             candidates: Vec::new(),
         };
         let candidates = [0, 1, 2, 3, 4];
@@ -1356,6 +1400,7 @@ mod tests {
             key: "mouse".to_string(),
             pid: 0xFFFF,
             product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::VerifiedDevice,
             candidates: Vec::new(),
         };
 

@@ -28,17 +28,17 @@ This split keeps the core testable without a Windows tray or physical hardware.
 
 ## HID boundary
 
-The scanner groups candidate HID interfaces only when a serial number provides
-a physical-device identity. Serialless interfaces remain separate, ambiguous
-devices so probes cannot combine evidence from identical hardware. The client
-tries grouped candidates in a deterministic order. It tries a cached
-transaction ID, known device metadata, and bounded protocol fallbacks. Failed
-cached IDs are removed. Battery and charging queries aggregate relevant
-candidate results before declaring a state unsupported. Transport and protocol
-failures can retry within a per-device time budget. If the bounded candidate
-set is truncated, unsupported evidence remains partial. The interface that
-supplied the battery reading is tried first for charging status, followed by
-bounded fallbacks.
+The scanner groups serial-numbered HID interfaces by verified device identity.
+It keeps serialless interfaces in one typed ambiguous PID group with the legacy
+PID-only preference key. The client tries grouped candidates in a deterministic
+order. It tries a cached transaction ID, known device metadata, and bounded
+protocol fallbacks. Failed cached IDs are removed. Battery and charging queries
+aggregate relevant candidate results before declaring a state unsupported.
+Transport and protocol failures can retry within a per-device time budget. If
+the bounded candidate set is truncated, unsupported evidence remains partial.
+Verified devices try the battery-winning interface first for charging status,
+then bounded fallbacks. Ambiguous serialless groups use only the battery-winning
+interface for charging status so evidence cannot mix across physical devices.
 
 The private transport seam supports retry tests without exposing HID mechanics
 to the rest of the app.
