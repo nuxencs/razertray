@@ -19,11 +19,13 @@ use std::time::{Duration, Instant};
 const INITIAL_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_REPLY_ALLOWANCE: Duration = Duration::from_secs(1);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_SCAN_WORKERS: usize = 2;
 const MAX_REQUEST_WORKERS: usize = 4;
 const OBSERVATION_TRANSIT_ALLOWANCE_MS: u64 = 10;
 const FRAME_PREFIX: &str = "RAZERTRAY-HID:";
 const PROCESS_TREE_ENV: &str = "RAZERTRAY_HID_PROCESS_TREE";
 
+static ACTIVE_SCAN_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_REQUEST_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static QUARANTINED_REQUESTS: LazyLock<Mutex<BTreeSet<FeatureRequestKey>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
@@ -129,31 +131,56 @@ impl fmt::Display for WorkerTimeout {
 
 impl std::error::Error for WorkerTimeout {}
 
-struct RequestWorkerPermit;
+#[derive(Clone, Copy, Debug)]
+enum WorkerCapacity {
+    Scan,
+    Request,
+}
 
-impl RequestWorkerPermit {
-    fn acquire() -> Result<Self> {
-        ACTIVE_REQUEST_WORKERS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_REQUEST_WORKERS).then_some(active + 1)
-            })
-            .map_err(|_| {
-                anyhow::anyhow!("HID worker capacity is retained by stalled operations")
-            })?;
-        Ok(Self)
+impl WorkerCapacity {
+    fn state(self) -> (&'static AtomicUsize, usize, &'static str) {
+        match self {
+            Self::Scan => (
+                &ACTIVE_SCAN_WORKERS,
+                MAX_SCAN_WORKERS,
+                "HID scan capacity is retained by stalled scans",
+            ),
+            Self::Request => (
+                &ACTIVE_REQUEST_WORKERS,
+                MAX_REQUEST_WORKERS,
+                "HID request capacity is retained by stalled operations",
+            ),
+        }
     }
 }
 
-impl Drop for RequestWorkerPermit {
+#[derive(Debug)]
+struct WorkerPermit {
+    capacity: WorkerCapacity,
+}
+
+impl WorkerPermit {
+    fn acquire(capacity: WorkerCapacity) -> Result<Self> {
+        let (active_workers, maximum_workers, exhausted_message) = capacity.state();
+        active_workers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < maximum_workers).then_some(active + 1)
+            })
+            .map_err(|_| anyhow::anyhow!(exhausted_message))?;
+        Ok(Self { capacity })
+    }
+}
+
+impl Drop for WorkerPermit {
     fn drop(&mut self) {
-        ACTIVE_REQUEST_WORKERS.fetch_sub(1, Ordering::AcqRel);
+        self.capacity.state().0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 struct RetiredWorker {
     child: Child,
     reader: Option<thread::JoinHandle<()>>,
-    permit: Option<RequestWorkerPermit>,
+    permit: Option<WorkerPermit>,
     process_tree: Option<process_tree::Owned>,
 }
 
@@ -181,13 +208,13 @@ struct OutputReader {
 struct SupervisedChild {
     child: Option<Child>,
     reader: Option<thread::JoinHandle<()>>,
-    permit: Option<RequestWorkerPermit>,
+    permit: Option<WorkerPermit>,
     tree: Option<process_tree::Owned>,
     retain_locally: bool,
 }
 
 impl SupervisedChild {
-    fn new(child: Child, permit: Option<RequestWorkerPermit>, retain_locally: bool) -> Self {
+    fn new(child: Child, permit: Option<WorkerPermit>, retain_locally: bool) -> Self {
         Self {
             child: Some(child),
             reader: None,
@@ -416,17 +443,13 @@ fn run_process(request: &WorkerRequest, timeout: Duration) -> Result<WorkerReply
     supervise_child(worker, &input, timeout)
 }
 
-fn worker_permit(
-    request: &WorkerRequest,
-    inherited_tree: bool,
-) -> Result<Option<RequestWorkerPermit>> {
-    Ok(
-        if matches!(request, WorkerRequest::Feature { .. }) && !inherited_tree {
-            Some(RequestWorkerPermit::acquire()?)
-        } else {
-            None
-        },
-    )
+fn worker_permit(request: &WorkerRequest, inherited_tree: bool) -> Result<Option<WorkerPermit>> {
+    let capacity = match request {
+        WorkerRequest::Poll { .. } => Some(WorkerCapacity::Scan),
+        WorkerRequest::Feature { .. } if !inherited_tree => Some(WorkerCapacity::Request),
+        WorkerRequest::Feature { .. } => None,
+    };
+    capacity.map(WorkerPermit::acquire).transpose()
 }
 
 fn supervise_child(
@@ -550,7 +573,7 @@ fn read_output_frames(
 fn retire_worker(
     child: Child,
     reader: Option<thread::JoinHandle<()>>,
-    permit: Option<RequestWorkerPermit>,
+    permit: Option<WorkerPermit>,
     tree: Option<process_tree::Owned>,
 ) {
     retain_worker(child, reader, permit, tree, true);
@@ -559,7 +582,7 @@ fn retire_worker(
 fn retain_worker(
     mut child: Child,
     reader: Option<thread::JoinHandle<()>>,
-    permit: Option<RequestWorkerPermit>,
+    permit: Option<WorkerPermit>,
     tree: Option<process_tree::Owned>,
     terminate: bool,
 ) {
@@ -852,8 +875,8 @@ mod tests {
     #[cfg(windows)]
     use super::RetiredWorker;
     use super::{
-        FeatureRequestKey, INITIAL_POLL_TIMEOUT, RequestWorkerPermit, STATUS_POLL_INTERVAL,
-        WorkerFrame, WorkerReply, WorkerRequest, WorkerTimeout, ensure_feature_request_available,
+        FeatureRequestKey, INITIAL_POLL_TIMEOUT, STATUS_POLL_INTERVAL, WorkerCapacity, WorkerFrame,
+        WorkerPermit, WorkerReply, WorkerRequest, WorkerTimeout, ensure_feature_request_available,
         record_stalled_request_from_error, supervise_child, worker_permit, write_frame,
     };
     #[cfg(windows)]
@@ -880,7 +903,7 @@ mod tests {
         let error = supervise_child(
             super::SupervisedChild::new(
                 child,
-                Some(RequestWorkerPermit::acquire().expect("worker capacity")),
+                Some(WorkerPermit::acquire(WorkerCapacity::Request).expect("worker capacity")),
                 true,
             ),
             &[],
@@ -905,7 +928,7 @@ mod tests {
         let reply = supervise_child(
             super::SupervisedChild::new(
                 child,
-                Some(RequestWorkerPermit::acquire().expect("worker capacity")),
+                Some(WorkerPermit::acquire(WorkerCapacity::Request).expect("worker capacity")),
                 true,
             ),
             &[],
@@ -937,7 +960,7 @@ mod tests {
         let reply = supervise_child(
             super::SupervisedChild::new(
                 child,
-                Some(RequestWorkerPermit::acquire().expect("worker capacity")),
+                Some(WorkerPermit::acquire(WorkerCapacity::Request).expect("worker capacity")),
                 true,
             ),
             &[],
@@ -974,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn review_round_32_poll_scan_does_not_consume_request_capacity() {
+    fn review_round_33_scan_capacity_is_bounded_with_recovery_reserved() {
         let poll = WorkerRequest::Poll {
             cache: crate::config::PidCache::default(),
             quarantined_requests: Vec::new(),
@@ -987,16 +1010,27 @@ mod tests {
             operation_timeout_ms: 0,
         };
 
-        assert!(
-            worker_permit(&poll, false)
-                .expect("poll admission")
-                .is_none()
-        );
+        let primary_scan = worker_permit(&poll, false)
+            .expect("primary scan admission")
+            .expect("primary scan permit");
+        let recovery_scan = worker_permit(&poll, false)
+            .expect("recovery scan admission")
+            .expect("recovery scan permit");
+        let error = worker_permit(&poll, false).expect_err("scan capacity must remain bounded");
+
+        assert!(format!("{error:#}").contains("scan capacity"));
         assert!(
             worker_permit(&feature, false)
                 .expect("request admission")
                 .is_some()
         );
+        drop(recovery_scan);
+        assert!(
+            worker_permit(&poll, false)
+                .expect("replacement recovery scan admission")
+                .is_some()
+        );
+        drop(primary_scan);
     }
 
     #[cfg(windows)]
@@ -1053,7 +1087,7 @@ mod tests {
         let mut retired = RetiredWorker {
             child,
             reader: None,
-            permit: Some(RequestWorkerPermit::acquire().expect("worker capacity")),
+            permit: Some(WorkerPermit::acquire(WorkerCapacity::Request).expect("worker capacity")),
             process_tree: Some(tree),
         };
 
