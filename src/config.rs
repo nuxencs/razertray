@@ -1,17 +1,33 @@
 use crate::APP_ID;
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ViewMode {
     #[default]
     Icon,
     Text,
+}
+
+impl<'de> Deserialize<'de> for ViewMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value.eq_ignore_ascii_case("icon") {
+            Ok(Self::Icon)
+        } else if value.eq_ignore_ascii_case("text") {
+            Ok(Self::Text)
+        } else {
+            Err(serde::de::Error::unknown_variant(&value, &["icon", "text"]))
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -384,6 +400,40 @@ log_level = "info"
         assert_eq!(parsed.view_mode, super::ViewMode::Icon);
         assert_eq!(parsed.alert_scope, super::AlertScope::Selected);
         assert!(!parsed.welcome_shown);
+    }
+
+    #[test]
+    fn legacy_view_mode_case_preserves_other_configuration() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+poll_interval_seconds = 300
+low_battery_threshold = 25
+low_battery_cooldown_minutes = 240
+selected_device_id = "preferred-mouse"
+log_level = "debug"
+view_mode = "TeXt"
+alert_scope = "all"
+welcome_shown = true
+"#,
+        )
+        .expect("write legacy config");
+
+        let loaded = load_or_create_config_at(&path).expect("load legacy config");
+
+        assert_eq!(loaded.config.view_mode, super::ViewMode::Text);
+        assert_eq!(loaded.config.poll_interval_seconds, 300);
+        assert_eq!(loaded.config.low_battery_threshold, 25);
+        assert_eq!(loaded.config.low_battery_cooldown_minutes, 240);
+        assert_eq!(loaded.config.selected_device_id, "preferred-mouse");
+        assert_eq!(loaded.config.log_level, "debug");
+        assert_eq!(loaded.config.alert_scope, super::AlertScope::All);
+        assert!(loaded.config.welcome_shown);
+        assert!(loaded.warning.is_none());
+        let serialized = toml::Value::try_from(&loaded.config).expect("serialize loaded config");
+        assert_eq!(serialized["view_mode"].as_str(), Some("text"));
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub struct BatteryState {
 pub enum PollErrorKind {
     AccessDenied,
     DeviceUnavailable,
+    Unsupported,
     Protocol,
     Unknown,
 }

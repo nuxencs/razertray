@@ -45,22 +45,37 @@ pub fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollBatch {
     let mut cache_changed = false;
 
     for device in discovered {
-        match query_device(api, &device, pid_cache, &mut cache_changed) {
-            Ok((state, warning)) => {
-                result.devices.push(state);
-                if let Some(warning) = warning {
-                    result.errors.push(warning);
-                }
-            }
-            Err(QueryFailure::Unsupported) => {}
-            Err(QueryFailure::Failed(err)) => result.errors.push(poll_error(&device, err)),
-        }
+        let query = query_device(api, &device, pid_cache, &mut cache_changed);
+        record_query_result(&mut result, &device, query);
     }
 
     result.sort_devices();
     PollBatch {
         result,
         cache_changed,
+    }
+}
+
+fn record_query_result(
+    result: &mut PollResult,
+    device: &DiscoveredDevice,
+    query: std::result::Result<(BatteryState, Option<PollError>), QueryFailure>,
+) {
+    match query {
+        Ok((state, warning)) => {
+            result.devices.push(state);
+            if let Some(warning) = warning {
+                result.errors.push(warning);
+            }
+        }
+        Err(QueryFailure::Unsupported) => result.errors.push(PollError {
+            device_key: device.key.clone(),
+            display_name: display_name(device),
+            pid: device.pid,
+            kind: PollErrorKind::Unsupported,
+            message: "battery status is not supported by this device".to_string(),
+        }),
+        Err(QueryFailure::Failed(err)) => result.errors.push(poll_error(&device, err)),
     }
 }
 
@@ -71,10 +86,7 @@ fn query_device(
     cache_changed: &mut bool,
 ) -> std::result::Result<(BatteryState, Option<PollError>), QueryFailure> {
     let known = device_map::known_device_support(device.pid);
-    let display_name = known.map_or_else(
-        || device.product_name.clone(),
-        |support| support.name.to_string(),
-    );
+    let display_name = display_name(device);
     let mut failures = Vec::new();
     let mut unsupported_interfaces = 0_usize;
     let mut opened_interfaces = 0_usize;
@@ -349,10 +361,17 @@ fn response_wait(pid: u16) -> Duration {
     }
 }
 
+fn display_name(device: &DiscoveredDevice) -> String {
+    device_map::known_device_support(device.pid).map_or_else(
+        || device.product_name.clone(),
+        |support| support.name.to_string(),
+    )
+}
+
 fn poll_error(device: &DiscoveredDevice, err: anyhow::Error) -> PollError {
     PollError {
         device_key: device.key.clone(),
-        display_name: device.product_name.clone(),
+        display_name: display_name(device),
         pid: device.pid,
         kind: classify_error(&err),
         message: err.to_string(),
@@ -389,12 +408,17 @@ fn scale_percent(raw: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{FeatureTransport, scale_percent, send_request_with, update_cache_after_success};
+    use super::{
+        FeatureTransport, QueryFailure, record_query_result, scale_percent, send_request_with,
+        update_cache_after_success,
+    };
     use crate::config::PidCache;
     use crate::hid::protocol::{
         FEATURE_REPORT_LENGTH, STATUS_BUSY, STATUS_NOT_SUPPORTED, STATUS_SUCCESSFUL,
         build_battery_request,
     };
+    use crate::hid::scanner::DiscoveredDevice;
+    use crate::model::{PollErrorKind, PollResult};
     use anyhow::{Result, bail};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -554,5 +578,25 @@ mod tests {
         .expect_err("unsupported command should remain typed");
 
         assert!(error.downcast_ref::<super::UnsupportedCommand>().is_some());
+    }
+
+    #[test]
+    fn unsupported_query_is_preserved_in_poll_result() {
+        let device = DiscoveredDevice {
+            key: "mouse".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            candidates: Vec::new(),
+        };
+        let mut result = PollResult::default();
+
+        record_query_result(&mut result, &device, Err(QueryFailure::Unsupported));
+
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].kind, PollErrorKind::Unsupported);
+        assert_eq!(result.errors[0].device_key, "mouse");
+        assert_eq!(result.errors[0].pid, 0xFFFF);
+        let json = serde_json::to_value(result).expect("serialize poll result");
+        assert_eq!(json["errors"][0]["kind"], "unsupported");
     }
 }

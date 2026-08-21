@@ -246,15 +246,15 @@ mod tests {
     use crate::model::{PollError, PollErrorKind, PollResult};
 
     #[test]
-    fn unreadable_device_is_a_failure_not_no_device() {
+    fn unsupported_device_is_a_failure_not_no_device() {
         let result = PollResult {
             devices: Vec::new(),
             errors: vec![PollError {
                 device_key: "mouse".to_string(),
                 display_name: "Mouse".to_string(),
                 pid: 1,
-                kind: PollErrorKind::DeviceUnavailable,
-                message: "asleep".to_string(),
+                kind: PollErrorKind::Unsupported,
+                message: "battery status is not supported".to_string(),
             }],
         };
 

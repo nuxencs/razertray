@@ -464,6 +464,9 @@ fn presentation(
                 crate::model::PollErrorKind::DeviceUnavailable => {
                     "Device unavailable - wake or reconnect it"
                 }
+                crate::model::PollErrorKind::Unsupported => {
+                    "Battery reporting is unsupported by this device"
+                }
                 crate::model::PollErrorKind::Protocol => {
                     "Battery response invalid - refresh to retry"
                 }
@@ -500,7 +503,7 @@ fn format_age(age: Duration) -> String {
 mod tests {
     use super::{AppCore, AppEvent, Command, ObservationView, PollActivity};
     use crate::config::AppConfig;
-    use crate::model::{BatteryState, ChargeState, PollResult};
+    use crate::model::{BatteryState, ChargeState, PollError, PollErrorKind, PollResult};
     use std::time::{Duration, Instant};
 
     fn reading(id: &str, percent: u8) -> BatteryState {
@@ -707,5 +710,40 @@ mod tests {
             matches!(stale.view.observation, ObservationView::Stale { reading, .. } if reading.device_key == "fallback")
         );
         assert_eq!(core.config().selected_device_id, "preferred");
+    }
+
+    #[test]
+    fn unsupported_battery_query_has_explicit_tray_status() {
+        let now = Instant::now();
+        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+
+        let update = core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: Vec::new(),
+                    errors: vec![PollError {
+                        device_key: "mouse".to_string(),
+                        display_name: "Razer Mouse".to_string(),
+                        pid: 1,
+                        kind: PollErrorKind::Unsupported,
+                        message: "battery status is not supported by this device".to_string(),
+                    }],
+                }),
+            ),
+            now,
+        );
+
+        assert!(matches!(
+            update.view.observation,
+            ObservationView::Failed {
+                kind: PollErrorKind::Unsupported,
+                ..
+            }
+        ));
+        assert_eq!(
+            update.view.status_text,
+            "Battery reporting is unsupported by this device"
+        );
     }
 }

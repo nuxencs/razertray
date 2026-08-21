@@ -69,17 +69,21 @@ impl Forecaster {
 }
 
 pub fn format_estimate(estimate: Estimate) -> String {
-    let hours = estimate.remaining.as_secs().div_ceil(3_600);
-    if hours >= 48 {
-        format!("~{} days left", hours.div_ceil(24))
+    let seconds = estimate.remaining.as_secs();
+    if seconds < 60 {
+        "~<1 min left".to_string()
+    } else if seconds < 3_600 {
+        format!("~{} min left", seconds / 60)
+    } else if seconds < 48 * 3_600 {
+        format!("~{} h left", seconds / 3_600)
     } else {
-        format!("~{hours} h left")
+        format!("~{} days left", seconds / (24 * 3_600))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Forecaster;
+    use super::{Estimate, Forecaster, format_estimate};
     use crate::model::{BatteryState, ChargeState};
     use std::time::{Duration, Instant};
 
@@ -164,6 +168,34 @@ mod tests {
                 now + Duration::from_secs(80 * 60),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn estimate_format_uses_conservative_whole_units() {
+        assert_eq!(
+            format_estimate(Estimate {
+                remaining: Duration::from_secs(30),
+            }),
+            "~<1 min left"
+        );
+        assert_eq!(
+            format_estimate(Estimate {
+                remaining: Duration::from_secs(6 * 60 + 59),
+            }),
+            "~6 min left"
+        );
+        assert_eq!(
+            format_estimate(Estimate {
+                remaining: Duration::from_secs(47 * 3_600 + 59 * 60),
+            }),
+            "~47 h left"
+        );
+        assert_eq!(
+            format_estimate(Estimate {
+                remaining: Duration::from_secs(48 * 3_600 + 59 * 60),
+            }),
+            "~2 days left"
         );
     }
 }
