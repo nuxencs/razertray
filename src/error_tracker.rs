@@ -10,6 +10,7 @@ struct ErrorKey {
     pid: u16,
     scope: PollErrorScope,
     kind: PollErrorKind,
+    message: String,
 }
 
 impl From<&PollError> for ErrorKey {
@@ -19,6 +20,7 @@ impl From<&PollError> for ErrorKey {
             pid: error.pid,
             scope: error.scope,
             kind: error.kind,
+            message: error.message.clone(),
         }
     }
 }
@@ -221,5 +223,35 @@ mod tests {
                 }
             ]
         ));
+    }
+
+    #[test]
+    fn review_distinct_same_kind_evidence_is_logged_and_throttled_independently() {
+        let now = Instant::now();
+        let mut tracker = ErrorTracker::default();
+        let mut first = error();
+        first.message = "interface 0 returned no response".to_string();
+        let mut second = error();
+        second.message = "interface 1 returned no response".to_string();
+
+        let notices = tracker.observe(&[first.clone(), second.clone()], &successful(), true, now);
+
+        assert_eq!(
+            notices,
+            vec![
+                ErrorNotice::Started(first.clone()),
+                ErrorNotice::Started(second.clone())
+            ]
+        );
+        assert!(
+            tracker
+                .observe(
+                    &[first, second],
+                    &successful(),
+                    true,
+                    now + Duration::from_secs(60)
+                )
+                .is_empty()
+        );
     }
 }

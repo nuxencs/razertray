@@ -117,7 +117,8 @@ pub fn build_request(
 }
 
 pub fn expected_response_matches(request: &RazerReport, response: &RazerReport) -> bool {
-    response.remaining_packets == request.remaining_packets
+    response.transaction_id == request.transaction_id
+        && response.remaining_packets == request.remaining_packets
         && response.command_class == request.command_class
         && response.command_id == request.command_id
 }

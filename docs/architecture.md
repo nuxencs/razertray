@@ -50,7 +50,8 @@ diagnostics. JSON output uses this type directly.
 The tray shows a bounded diagnostic summary. Logs and CLI or JSON output retain
 the complete typed details.
 
-Repeated errors are throttled in logs. A later successful poll records recovery.
+Exact repeated errors are throttled in logs without collapsing distinct probe
+details. A later successful poll records recovery.
 
 ## Forecast
 

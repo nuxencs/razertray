@@ -82,13 +82,34 @@ pub fn run_once(output: OnceOutput) -> Result<OnceStatus> {
     }
 
     if output != OnceOutput::Json && !result.errors.is_empty() {
-        eprintln!("Errors:");
-        for err in &result.errors {
-            eprintln!("- {} ({:04X}): {}", err.display_name, err.pid, err.message);
-        }
+        write_poll_errors(io::stderr().lock(), &result.errors, output)?;
     }
 
     Ok(once_status(&result))
+}
+
+fn write_poll_errors(
+    mut writer: impl Write,
+    errors: &[PollError],
+    output: OnceOutput,
+) -> io::Result<()> {
+    writeln!(writer, "Errors:")?;
+    for error in errors {
+        if output == OnceOutput::Diagnose {
+            writeln!(
+                writer,
+                "- {} ({:04X}) scope={} kind={}: {}",
+                error.display_name, error.pid, error.scope, error.kind, error.message
+            )?;
+        } else {
+            writeln!(
+                writer,
+                "- {} ({:04X}): {}",
+                error.display_name, error.pid, error.message
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn once_status(result: &crate::model::PollResult) -> OnceStatus {
@@ -255,7 +276,7 @@ fn rotated_log_path(base_path: &Path, index: usize) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OnceStatus, once_status, poll_batch_or_diagnostic};
+    use super::{OnceOutput, OnceStatus, once_status, poll_batch_or_diagnostic, write_poll_errors};
     use crate::model::{PollError, PollErrorKind, PollErrorScope, PollResult};
 
     #[test]
@@ -288,5 +309,36 @@ mod tests {
         assert_eq!(json["devices"], serde_json::json!([]));
         assert_eq!(json["errors"][0]["scope"], "subsystem");
         assert_eq!(json["errors"][0]["kind"], "access-denied");
+    }
+
+    #[test]
+    fn review_diagnose_error_output_includes_typed_fields_only_in_diagnostic_mode() {
+        let error = PollError {
+            device_key: "mouse".to_string(),
+            display_name: "Mouse".to_string(),
+            pid: 1,
+            scope: PollErrorScope::Device,
+            kind: PollErrorKind::AccessDenied,
+            message: "interface access denied".to_string(),
+        };
+        let mut diagnostic = Vec::new();
+        let mut human = Vec::new();
+
+        write_poll_errors(
+            &mut diagnostic,
+            std::slice::from_ref(&error),
+            OnceOutput::Diagnose,
+        )
+        .expect("write diagnostic output");
+        write_poll_errors(&mut human, &[error], OnceOutput::Human).expect("write human output");
+
+        assert_eq!(
+            String::from_utf8(diagnostic).expect("diagnostic output is UTF-8"),
+            "Errors:\n- Mouse (0001) scope=device kind=access-denied: interface access denied\n"
+        );
+        assert_eq!(
+            String::from_utf8(human).expect("human output is UTF-8"),
+            "Errors:\n- Mouse (0001): interface access denied\n"
+        );
     }
 }

@@ -721,6 +721,31 @@ mod tests {
     }
 
     #[test]
+    fn review_transport_rejects_response_from_different_transaction() {
+        let candidates = [(
+            0,
+            FakeTransport::new(vec![
+                Ok(feature_response(0x1F, 200)),
+                Ok(feature_response(0x3F, 120)),
+            ]),
+        )];
+
+        let success = probe_request_with(
+            &candidates,
+            &[0x3F],
+            build_battery_request,
+            Duration::ZERO,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("matching response should succeed after delayed response is rejected");
+
+        assert_eq!(success.transaction_id, 0x3F);
+        assert_eq!(success.report.transaction_id, 0x3F);
+        assert_eq!(success.report.arguments[1], 120);
+        assert_eq!(candidates[0].1.attempts.get(), 2);
+    }
+
+    #[test]
     fn review_transport_retries_busy_then_uses_completed_response() {
         let candidates = [(
             0,

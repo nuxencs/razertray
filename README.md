@@ -101,8 +101,8 @@ razertray.exe --diagnose
 
 - `--once` prints one readable snapshot.
 - `--json` prints the complete structured poll result.
-- `--diagnose` also prints the device key, raw battery value, and cached
-  transaction ID.
+- `--diagnose` also prints the device key, raw battery value, cached transaction
+  ID, and typed error scope and kind.
 
 Exit codes:
 

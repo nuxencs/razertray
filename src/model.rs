@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -48,6 +49,9 @@ impl PollErrorKind {
             || normalized.contains("unavailable")
             || normalized.contains("no response")
             || normalized.contains("time budget")
+            || normalized.contains("not connected")
+            || normalized.contains("disconnected")
+            || normalized.contains("device_not_connected")
         {
             Self::DeviceUnavailable
         } else if normalized.contains("busy")
@@ -62,12 +66,35 @@ impl PollErrorKind {
     }
 }
 
+impl fmt::Display for PollErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::AccessDenied => "access-denied",
+            Self::DeviceUnavailable => "device-unavailable",
+            Self::Unsupported => "unsupported",
+            Self::PartialUnsupported => "partial-unsupported",
+            Self::Protocol => "protocol",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PollErrorScope {
     Device,
     ChargeState,
     Subsystem,
+}
+
+impl fmt::Display for PollErrorScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Device => "device",
+            Self::ChargeState => "charge-state",
+            Self::Subsystem => "subsystem",
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -111,6 +138,14 @@ mod tests {
         );
         assert_eq!(
             PollError::subsystem("HID access is unavailable").kind,
+            PollErrorKind::DeviceUnavailable
+        );
+        assert_eq!(
+            PollErrorKind::classify_message("The device is not connected"),
+            PollErrorKind::DeviceUnavailable
+        );
+        assert_eq!(
+            PollErrorKind::classify_message("ERROR_DEVICE_NOT_CONNECTED"),
             PollErrorKind::DeviceUnavailable
         );
     }
