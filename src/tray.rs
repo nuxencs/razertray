@@ -42,6 +42,19 @@ enum WorkerCommand {
     Exit,
 }
 
+enum PidCacheIssue {
+    Load(PollError),
+    Save(PollError),
+}
+
+impl PidCacheIssue {
+    fn diagnostic(&self) -> &PollError {
+        match self {
+            Self::Load(error) | Self::Save(error) => error,
+        }
+    }
+}
+
 struct MenuHandles {
     root: Menu,
     status_item: MenuItem,
@@ -508,12 +521,15 @@ fn spawn_poll_worker(
         let mut api: Option<HidApi> = None;
         let mut api_init_error: Option<PollError> = None;
         let mut cache_dirty = false;
+        let mut cache_issue = cache_diagnostic.take().map(PidCacheIssue::Load);
         let mut poll_number = 0_u64;
         let mut poll_now = true;
 
         loop {
             if poll_now {
-                let mut cache_recovered = false;
+                revalidate_pid_cache_load(&mut cache, &mut cache_issue, || {
+                    config::load_or_create_pid_cache()
+                });
                 poll_number = poll_number.saturating_add(1);
                 let poll_id = PollId::new(poll_number);
                 let _ = proxy.send_event(UserEvent::PollStarted(poll_id));
@@ -538,17 +554,6 @@ fn spawn_poll_worker(
                         Ok(()) => {
                             let batch = client::poll_devices(handle, &mut cache);
                             cache_dirty |= batch.cache_changed;
-                            if cache_dirty {
-                                match config::save_pid_cache(&cache) {
-                                    Ok(()) => {
-                                        cache_dirty = false;
-                                        cache_recovered = true;
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!("failed saving PID cache: {err}");
-                                    }
-                                }
-                            }
                             Ok(batch.result)
                         }
                         Err(err) => Err(PollError::subsystem(format!(
@@ -559,11 +564,13 @@ fn spawn_poll_worker(
                         .clone()
                         .unwrap_or_else(|| PollError::subsystem("HID access is unavailable"))),
                 };
-                let outcome =
-                    attach_cache_diagnostic(outcome, cache_diagnostic.as_ref(), cache_recovered);
-                if cache_recovered {
-                    cache_diagnostic = None;
-                }
+                persist_pid_cache(&mut cache_dirty, &mut cache_issue, || {
+                    config::save_pid_cache(&cache)
+                });
+                let outcome = attach_cache_diagnostic(
+                    outcome,
+                    cache_issue.as_ref().map(PidCacheIssue::diagnostic),
+                );
                 let found = outcome
                     .as_ref()
                     .is_ok_and(|result| !result.devices.is_empty());
@@ -592,14 +599,7 @@ fn spawn_poll_worker(
     });
 }
 
-fn attach_cache_diagnostic(
-    outcome: PollOutcome,
-    diagnostic: Option<&PollError>,
-    recovered: bool,
-) -> PollOutcome {
-    if recovered {
-        return outcome;
-    }
+fn attach_cache_diagnostic(outcome: PollOutcome, diagnostic: Option<&PollError>) -> PollOutcome {
     let Some(diagnostic) = diagnostic else {
         return outcome;
     };
@@ -612,6 +612,47 @@ fn attach_cache_diagnostic(
             devices: Vec::new(),
             errors: vec![error, diagnostic.clone()],
         }),
+    }
+}
+
+fn revalidate_pid_cache_load<F>(cache: &mut PidCache, issue: &mut Option<PidCacheIssue>, load: F)
+where
+    F: FnOnce() -> Result<PidCache>,
+{
+    if !matches!(issue, Some(PidCacheIssue::Load(_))) {
+        return;
+    }
+    match load() {
+        Ok(loaded) => {
+            *cache = loaded;
+            *issue = None;
+        }
+        Err(error) => {
+            let diagnostic = PollError::pid_cache(format!("PID cache unavailable: {error:#}"));
+            *issue = Some(PidCacheIssue::Load(diagnostic));
+        }
+    }
+}
+
+fn persist_pid_cache<F>(dirty: &mut bool, issue: &mut Option<PidCacheIssue>, save: F)
+where
+    F: FnOnce() -> Result<()>,
+{
+    if matches!(issue, Some(PidCacheIssue::Load(_)))
+        || (!*dirty && !matches!(issue, Some(PidCacheIssue::Save(_))))
+    {
+        return;
+    }
+    match save() {
+        Ok(()) => {
+            *dirty = false;
+            *issue = None;
+        }
+        Err(error) => {
+            tracing::warn!("failed saving PID cache: {error}");
+            let diagnostic = PollError::pid_cache(format!("failed saving PID cache: {error:#}"));
+            *issue = Some(PidCacheIssue::Save(diagnostic));
+        }
     }
 }
 
@@ -642,10 +683,16 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_cache_diagnostic, welcome_update};
+    use super::{
+        PidCacheIssue, attach_cache_diagnostic, persist_pid_cache, revalidate_pid_cache_load,
+        welcome_update,
+    };
     use crate::application::AppCore;
-    use crate::config::AppConfig;
-    use crate::model::{PollError, PollErrorKind, PollErrorScope};
+    use crate::config::{AppConfig, PidCache};
+    use crate::model::{
+        BatteryState, ChargeState, PollError, PollErrorKind, PollErrorScope, PollResult,
+        SubsystemComponent,
+    };
     use std::time::Instant;
 
     #[test]
@@ -680,10 +727,9 @@ mod tests {
     #[test]
     fn review_round_17_cache_diagnostic_preserves_hid_failure() {
         let hid_error = PollError::subsystem("HID access denied");
-        let cache_error =
-            PollError::subsystem_component("PID cache", "PID cache unavailable: permission denied");
+        let cache_error = PollError::pid_cache("PID cache unavailable: permission denied");
 
-        let result = attach_cache_diagnostic(Err(hid_error.clone()), Some(&cache_error), false)
+        let result = attach_cache_diagnostic(Err(hid_error.clone()), Some(&cache_error))
             .expect("typed poll result");
 
         assert!(result.devices.is_empty());
@@ -698,16 +744,60 @@ mod tests {
 
     #[test]
     fn review_round_18_repaired_cache_diagnostic_is_not_projected() {
-        let cache_error =
-            PollError::subsystem_component("PID cache", "PID cache unavailable: access denied");
+        let result = attach_cache_diagnostic(Ok(PollResult::default()), None).expect("poll result");
 
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn review_round_19_cache_load_issue_is_revalidated_without_cache_changes() {
+        let mut cache = PidCache::default();
+        let mut issue = Some(PidCacheIssue::Load(PollError::pid_cache(
+            "PID cache unavailable: access denied",
+        )));
+        let mut recovered = PidCache::default();
+        recovered.set(0x1234, 0x3f);
+
+        revalidate_pid_cache_load(&mut cache, &mut issue, || Ok(recovered));
+
+        assert_eq!(cache.get(0x1234), Some(0x3f));
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn review_round_19_cache_save_failure_keeps_reading_and_typed_diagnostic() {
+        let mut dirty = true;
+        let mut issue = None;
+
+        persist_pid_cache(&mut dirty, &mut issue, || {
+            anyhow::bail!("permission denied")
+        });
+
+        let reading = BatteryState {
+            device_key: "mouse".to_string(),
+            display_name: "Mouse".to_string(),
+            pid: 0x1234,
+            battery_raw: 128,
+            battery_percent: 50,
+            charge_state: ChargeState::NotCharging,
+            observed_at: None,
+        };
         let result = attach_cache_diagnostic(
-            Ok(crate::model::PollResult::default()),
-            Some(&cache_error),
-            true,
+            Ok(PollResult {
+                devices: vec![reading.clone()],
+                errors: Vec::new(),
+            }),
+            issue.as_ref().map(PidCacheIssue::diagnostic),
         )
         .expect("poll result");
 
-        assert!(result.errors.is_empty());
+        assert_eq!(result.devices, vec![reading]);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(
+            result.errors[0].component,
+            Some(SubsystemComponent::PidCache)
+        );
+        assert_eq!(result.errors[0].kind, PollErrorKind::AccessDenied);
+        assert!(dirty);
     }
 }

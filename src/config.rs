@@ -364,7 +364,7 @@ fn load_pid_cache_for_polling_at(path: &Path) -> PidCacheLoad {
             let message = format!("PID cache unavailable: {error:#}");
             PidCacheLoad {
                 cache: PidCache::default(),
-                diagnostic: Some(PollError::subsystem_component("PID cache", message)),
+                diagnostic: Some(PollError::pid_cache(message)),
             }
         }
     }

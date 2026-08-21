@@ -85,6 +85,7 @@ fn record_query_result(
                 display_name: display_name(device),
                 pid: device.pid,
                 scope: PollErrorScope::Device,
+                component: None,
                 kind: match evidence {
                     UnsupportedEvidence::Conclusive => PollErrorKind::Unsupported,
                     UnsupportedEvidence::Partial => PollErrorKind::PartialUnsupported,
@@ -236,6 +237,7 @@ fn charge_query_result(
                 display_name: display_name(device),
                 pid: device.pid,
                 scope: PollErrorScope::ChargeState,
+                component: None,
                 kind: PollErrorKind::PartialUnsupported,
                 message: "one or more charging-status probes reported unsupported status"
                     .to_string(),
@@ -559,6 +561,7 @@ fn scoped_poll_error(
         display_name: display_name(device),
         pid: device.pid,
         scope,
+        component: None,
         kind: PollErrorKind::classify_message(&format_error_chain(&err)),
         message: format_error_chain(&err),
     }
@@ -577,6 +580,7 @@ fn contextual_poll_error(
         display_name: display_name(device),
         pid: device.pid,
         scope,
+        component: None,
         kind,
         message: format_error_chain(&err),
     }

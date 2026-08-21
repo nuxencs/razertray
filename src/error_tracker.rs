@@ -1,4 +1,4 @@
-use crate::model::{PollError, PollErrorKind, PollErrorScope};
+use crate::model::{PollError, PollErrorKind, PollErrorScope, SubsystemComponent};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -9,6 +9,7 @@ struct IncidentKey {
     device_key: String,
     pid: u16,
     scope: PollErrorScope,
+    component: Option<SubsystemComponent>,
 }
 
 impl From<&PollError> for IncidentKey {
@@ -17,6 +18,7 @@ impl From<&PollError> for IncidentKey {
             device_key: error.device_key.clone(),
             pid: error.pid,
             scope: error.scope,
+            component: error.component,
         }
     }
 }
@@ -149,6 +151,7 @@ mod tests {
             display_name: "Mouse".to_string(),
             pid: 1,
             scope: PollErrorScope::Device,
+            component: None,
             kind: PollErrorKind::DeviceUnavailable,
             message: "receiver asleep".to_string(),
         }
@@ -343,6 +346,26 @@ mod tests {
                 now + Duration::from_secs(60)
             ),
             vec![ErrorNotice::Started(protocol)]
+        );
+    }
+
+    #[test]
+    fn review_round_19_subsystem_components_recover_independently() {
+        let now = Instant::now();
+        let mut tracker = ErrorTracker::default();
+        let hid = PollError::subsystem("HID access denied");
+        let cache = PollError::pid_cache("PID cache unavailable: permission denied");
+        let no_devices = std::collections::BTreeSet::new();
+
+        tracker.observe(&[hid.clone(), cache], &no_devices, true, now);
+        let notices = tracker.observe(&[hid], &no_devices, true, now + Duration::from_secs(60));
+
+        assert_eq!(
+            notices,
+            vec![ErrorNotice::Recovered {
+                display_name: "PID cache".to_string(),
+                scope: PollErrorScope::Subsystem,
+            }]
         );
     }
 }

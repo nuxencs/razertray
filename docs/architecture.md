@@ -45,7 +45,8 @@ to the rest of the app.
 `PollResult` is the structured diagnostic boundary. It preserves raw battery
 values, charge-state uncertainty, typed error scopes and kinds, and readable
 devices in the same result. Independent transport failures remain separate
-diagnostics. JSON output uses this type directly.
+diagnostics. Subsystem diagnostics also carry a typed HID or PID-cache
+component identity. JSON output uses this type directly.
 
 The tray shows a bounded diagnostic summary. Logs and CLI or JSON output retain
 the complete typed details.
@@ -58,7 +59,8 @@ details. A later successful poll records recovery.
 Forecasting is private application state. It consumes successful, timestamped
 readings only. It resets after charging, unavailable polls, large gaps, or
 implausible upward changes. An expired estimate restarts calibration instead
-of remaining at zero.
+of remaining at zero. Before initial calibration, a flat reading advances the
+baseline so idle time cannot inflate the first discharge estimate.
 Each projected estimate carries its timestamp. The tray refreshes at the next
 forecast or stale-age display boundary and removes an expired estimate between
 hardware polls.

@@ -91,6 +91,22 @@ pub enum PollErrorScope {
     Subsystem,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubsystemComponent {
+    Hid,
+    PidCache,
+}
+
+impl SubsystemComponent {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Hid => "HID subsystem",
+            Self::PidCache => "PID cache",
+        }
+    }
+}
+
 impl fmt::Display for PollErrorScope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -107,29 +123,36 @@ pub struct PollError {
     pub display_name: String,
     pub pid: u16,
     pub scope: PollErrorScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component: Option<SubsystemComponent>,
     pub kind: PollErrorKind,
     pub message: String,
 }
 
 impl PollError {
     pub(crate) fn subsystem(message: impl Into<String>) -> Self {
-        Self::subsystem_component("HID subsystem", message)
+        Self::subsystem_component(SubsystemComponent::Hid, message)
     }
 
     pub(crate) fn subsystem_component(
-        display_name: impl Into<String>,
+        component: SubsystemComponent,
         message: impl Into<String>,
     ) -> Self {
         let message = message.into();
         let kind = PollErrorKind::classify_message(&message);
         Self {
             device_key: String::new(),
-            display_name: display_name.into(),
+            display_name: component.display_name().to_string(),
             pid: 0,
             scope: PollErrorScope::Subsystem,
+            component: Some(component),
             kind,
             message,
         }
+    }
+
+    pub(crate) fn pid_cache(message: impl Into<String>) -> Self {
+        Self::subsystem_component(SubsystemComponent::PidCache, message)
     }
 }
 

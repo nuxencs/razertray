@@ -788,6 +788,7 @@ mod tests {
             display_name: format!("Mouse {id}"),
             pid: 1,
             scope: PollErrorScope::Device,
+            component: None,
             kind: PollErrorKind::Unsupported,
             message: "battery status is not supported by this device".to_string(),
         }
@@ -1138,8 +1139,7 @@ mod tests {
                 first,
                 Ok(PollResult {
                     devices: Vec::new(),
-                    errors: vec![PollError::subsystem_component(
-                        "PID cache",
+                    errors: vec![PollError::pid_cache(
                         "PID cache unavailable: permission denied",
                     )],
                 }),
@@ -1376,6 +1376,7 @@ mod tests {
                             display_name: "Mouse other".to_string(),
                             pid: 3,
                             scope: PollErrorScope::Device,
+                            component: None,
                             kind: PollErrorKind::Protocol,
                             message: "invalid response".to_string(),
                         },
@@ -1384,6 +1385,7 @@ mod tests {
                             display_name: "Mouse fallback".to_string(),
                             pid: 2,
                             scope: PollErrorScope::ChargeState,
+                            component: None,
                             kind: PollErrorKind::AccessDenied,
                             message: "charging status access denied".to_string(),
                         },
@@ -1504,6 +1506,7 @@ mod tests {
                             display_name: "Mouse mouse".to_string(),
                             pid: 1,
                             scope: PollErrorScope::Device,
+                            component: None,
                             kind: PollErrorKind::AccessDenied,
                             message: "interface access denied".to_string(),
                         },
@@ -1561,6 +1564,7 @@ mod tests {
                         display_name: "Mouse mouse".to_string(),
                         pid: 1,
                         scope: PollErrorScope::ChargeState,
+                        component: None,
                         kind: PollErrorKind::DeviceUnavailable,
                         message: "charging status unavailable".to_string(),
                     }],

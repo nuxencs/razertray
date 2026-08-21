@@ -97,9 +97,7 @@ fn record_cache_save_result(result: &mut PollResult, save_result: Result<()>) {
         return;
     };
     let message = format!("failed saving PID cache: {error:#}");
-    result
-        .errors
-        .push(PollError::subsystem_component("PID cache", message));
+    result.errors.push(PollError::pid_cache(message));
 }
 
 fn write_poll_errors(
@@ -312,6 +310,7 @@ mod tests {
                 display_name: "Mouse".to_string(),
                 pid: 1,
                 scope: PollErrorScope::Device,
+                component: None,
                 kind: PollErrorKind::Unsupported,
                 message: "battery status is not supported".to_string(),
             }],
@@ -332,6 +331,7 @@ mod tests {
         let json = serde_json::to_value(batch.result).expect("serialize poll result");
         assert_eq!(json["devices"], serde_json::json!([]));
         assert_eq!(json["errors"][0]["scope"], "subsystem");
+        assert_eq!(json["errors"][0]["component"], "hid");
         assert_eq!(json["errors"][0]["kind"], "access-denied");
     }
 
@@ -360,6 +360,7 @@ mod tests {
         assert_eq!(json["devices"][0]["device_key"], "mouse");
         assert_eq!(json["devices"][0]["battery_percent"], 50);
         assert_eq!(json["errors"][0]["scope"], "subsystem");
+        assert_eq!(json["errors"][0]["component"], "pid-cache");
         assert_eq!(json["errors"][0]["kind"], "access-denied");
         assert_eq!(json["errors"][0]["display_name"], "PID cache");
     }
@@ -371,6 +372,7 @@ mod tests {
             display_name: "Mouse".to_string(),
             pid: 1,
             scope: PollErrorScope::Device,
+            component: None,
             kind: PollErrorKind::AccessDenied,
             message: "interface access denied".to_string(),
         };

@@ -102,6 +102,10 @@ impl Forecaster {
             return None;
         }
 
+        if segment.last_estimate.is_none() && reading.battery_raw == segment.lowest_raw {
+            segment.started_at = now;
+            segment.started_raw = reading.battery_raw;
+        }
         segment.last_at = now;
         segment.lowest_raw = segment.lowest_raw.min(reading.battery_raw);
         let span = now.saturating_duration_since(segment.started_at);
@@ -188,6 +192,32 @@ mod tests {
                     now + Duration::from_secs(2 * 60 * 60),
                 )
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn review_round_19_precalibration_plateau_uses_latest_baseline() {
+        let now = Instant::now();
+        let mut forecaster = Forecaster::default();
+        forecaster.observe(&reading(200, ChargeState::NotCharging), now);
+        assert_eq!(
+            forecaster.observe(
+                &reading(200, ChargeState::NotCharging),
+                now + Duration::from_secs(5 * 60 * 60),
+            ),
+            None
+        );
+
+        let estimate = forecaster
+            .observe(
+                &reading(190, ChargeState::NotCharging),
+                now + Duration::from_secs(5 * 60 * 60 + 30 * 60),
+            )
+            .expect("first estimate");
+
+        assert_eq!(
+            estimate.remaining,
+            Duration::from_secs(9 * 60 * 60 + 30 * 60)
         );
     }
 
