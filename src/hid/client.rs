@@ -26,17 +26,6 @@ pub struct PollBatch {
 }
 
 #[derive(Debug)]
-struct UnsupportedCommand;
-
-impl std::fmt::Display for UnsupportedCommand {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("device returned STATUS_NOT_SUPPORTED")
-    }
-}
-
-impl std::error::Error for UnsupportedCommand {}
-
-#[derive(Debug)]
 enum QueryFailure {
     Unsupported {
         evidence: UnsupportedEvidence,
@@ -71,14 +60,12 @@ pub fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollBatch {
 fn record_query_result(
     result: &mut PollResult,
     device: &DiscoveredDevice,
-    query: std::result::Result<(BatteryState, Option<PollError>), QueryFailure>,
+    query: std::result::Result<(BatteryState, Vec<PollError>), QueryFailure>,
 ) {
     match query {
-        Ok((state, warning)) => {
+        Ok((state, warnings)) => {
             result.devices.push(state);
-            if let Some(warning) = warning {
-                result.errors.push(warning);
-            }
+            result.errors.extend(warnings);
         }
         Err(QueryFailure::Unsupported {
             evidence,
@@ -112,7 +99,7 @@ fn query_device(
     device: &DiscoveredDevice,
     pid_cache: &mut PidCache,
     cache_changed: &mut bool,
-) -> std::result::Result<(BatteryState, Option<PollError>), QueryFailure> {
+) -> std::result::Result<(BatteryState, Vec<PollError>), QueryFailure> {
     let known = device_map::known_device_support(device.pid);
     let display_name = display_name(device);
     let mut failures = Vec::new();
@@ -138,14 +125,15 @@ fn query_device(
         .iter()
         .map(|(interface_number, handle)| (*interface_number, HidTransport(handle)))
         .collect();
-    let battery_probe = probe_battery_with(
+    let battery_probe = probe_request_with(
         &transports,
         &transaction_ids,
+        build_battery_request,
         response_wait(device.pid),
         overall_deadline,
     );
 
-    let (candidate_index, transaction_id, battery_report) = match battery_probe {
+    let (_, transaction_id, battery_report) = match battery_probe {
         Ok(found) => found,
         Err(failure) => {
             if cached.is_some() {
@@ -158,36 +146,21 @@ fn query_device(
     let generated = known.map(|support| support.transaction_id);
     *cache_changed |=
         update_cache_after_success(pid_cache, device.pid, cached, generated, transaction_id);
-    let handle = &opened[candidate_index].1;
     let battery_raw = battery_report.arguments[1];
     let battery_percent = scale_percent(battery_raw);
-    let (charge_state, warning) = if known.is_some_and(|support| !support.supports_charging_status)
+    let (charge_state, warnings) = if known.is_some_and(|support| !support.supports_charging_status)
     {
-        (ChargeState::Unsupported, None)
+        (ChargeState::Unsupported, Vec::new())
     } else {
-        match send_request(
-            handle,
-            build_charging_request(transaction_id),
-            device.pid,
+        let charge_probe = probe_request_with(
+            &transports,
+            &[transaction_id],
+            build_charging_request,
+            response_wait(device.pid),
             overall_deadline,
-        ) {
-            Ok(report) if report.arguments[1] > 0 => (ChargeState::Charging, None),
-            Ok(_) => (ChargeState::NotCharging, None),
-            Err(err) if err.downcast_ref::<UnsupportedCommand>().is_some() => {
-                (ChargeState::Unsupported, None)
-            }
-            Err(err) => (
-                ChargeState::Unavailable,
-                Some(PollError {
-                    device_key: device.key.clone(),
-                    display_name: display_name.clone(),
-                    pid: device.pid,
-                    scope: PollErrorScope::ChargeState,
-                    kind: classify_error(&err),
-                    message: format!("charging status unavailable: {}", format_error_chain(&err)),
-                }),
-            ),
-        }
+        )
+        .map_err(|failure| merge_query_failure(failure, failures));
+        charge_query_result(device, charge_probe)
     };
 
     Ok((
@@ -199,8 +172,49 @@ fn query_device(
             battery_percent,
             charge_state,
         },
-        warning,
+        warnings,
     ))
+}
+
+fn charge_query_result(
+    device: &DiscoveredDevice,
+    query: std::result::Result<(usize, u8, RazerReport), QueryFailure>,
+) -> (ChargeState, Vec<PollError>) {
+    match query {
+        Ok((_, _, report)) if report.arguments[1] > 0 => (ChargeState::Charging, Vec::new()),
+        Ok(_) => (ChargeState::NotCharging, Vec::new()),
+        Err(QueryFailure::Unsupported {
+            evidence: UnsupportedEvidence::Conclusive,
+            auxiliary,
+        }) if auxiliary.is_empty() => (ChargeState::Unsupported, Vec::new()),
+        Err(QueryFailure::Unsupported { auxiliary, .. }) => {
+            let mut warnings = vec![PollError {
+                device_key: device.key.clone(),
+                display_name: display_name(device),
+                pid: device.pid,
+                scope: PollErrorScope::ChargeState,
+                kind: PollErrorKind::Unsupported,
+                message: "one or more charging-status probes reported unsupported status"
+                    .to_string(),
+            }];
+            warnings.extend(auxiliary.into_iter().map(|error| {
+                scoped_poll_error(
+                    device,
+                    PollErrorScope::ChargeState,
+                    error.context("charging status probe incomplete"),
+                )
+            }));
+            (ChargeState::Unavailable, warnings)
+        }
+        Err(QueryFailure::Failed(error)) => (
+            ChargeState::Unavailable,
+            vec![scoped_poll_error(
+                device,
+                PollErrorScope::ChargeState,
+                error.context("charging status unavailable"),
+            )],
+        ),
+    }
 }
 
 fn merge_query_failure(failure: QueryFailure, mut auxiliary: Vec<String>) -> QueryFailure {
@@ -259,9 +273,10 @@ impl ProbeState {
     }
 }
 
-fn probe_battery_with<T: FeatureTransport>(
+fn probe_request_with<T: FeatureTransport, F: Fn(u8) -> RazerReport>(
     candidates: &[(i32, T)],
     transaction_ids: &[u8],
+    build_request: F,
     response_wait: Duration,
     deadline: Instant,
 ) -> std::result::Result<(usize, u8, RazerReport), QueryFailure> {
@@ -283,7 +298,7 @@ fn probe_battery_with<T: FeatureTransport>(
                     break 'rounds;
                 }
 
-                let request = build_battery_request(transaction_id);
+                let request = build_request(transaction_id);
                 states[target_index] =
                     match attempt_request_with(transport, &request, response_wait) {
                         RequestAttempt::Success(report) => {
@@ -343,7 +358,7 @@ fn probe_battery_with<T: FeatureTransport>(
         });
     }
     if failures.is_empty() {
-        failures.push("no candidate interface produced a battery reading".to_string());
+        failures.push("no candidate interface produced a completed response".to_string());
     }
     Err(QueryFailure::Failed(anyhow::anyhow!(failures.join(", "))))
 }
@@ -405,45 +420,6 @@ enum RequestAttempt {
     Unsupported,
 }
 
-fn send_request(
-    handle: &HidDevice,
-    request: RazerReport,
-    pid: u16,
-    deadline: Instant,
-) -> Result<RazerReport> {
-    send_request_with(&HidTransport(handle), request, response_wait(pid), deadline)
-}
-
-fn send_request_with<T: FeatureTransport>(
-    transport: &T,
-    request: RazerReport,
-    response_wait: Duration,
-    deadline: Instant,
-) -> Result<RazerReport> {
-    let mut last_error = None;
-
-    for attempt in 0..MAX_RETRIES {
-        let now = Instant::now();
-        if now >= deadline || deadline.saturating_duration_since(now) < response_wait {
-            last_error = Some(anyhow::anyhow!("poll time budget exhausted"));
-            break;
-        }
-
-        match attempt_request_with(transport, &request, response_wait) {
-            RequestAttempt::Success(response) => return Ok(response),
-            RequestAttempt::Retry(err) => last_error = Some(err),
-            RequestAttempt::Failed(err) => return Err(err),
-            RequestAttempt::Unsupported => return Err(UnsupportedCommand.into()),
-        }
-
-        if attempt + 1 < MAX_RETRIES && Instant::now() < deadline {
-            transport.pause(RETRY_DELAY.min(deadline.saturating_duration_since(Instant::now())));
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("request exhausted retries")))
-}
-
 fn attempt_request_with<T: FeatureTransport>(
     transport: &T,
     request: &RazerReport,
@@ -475,7 +451,8 @@ fn attempt_request_with<T: FeatureTransport>(
     }
 
     match response.status {
-        STATUS_SUCCESSFUL | STATUS_BUSY => RequestAttempt::Success(response),
+        STATUS_SUCCESSFUL => RequestAttempt::Success(response),
+        STATUS_BUSY => RequestAttempt::Retry(anyhow::anyhow!("device returned STATUS_BUSY")),
         STATUS_NO_RESPONSE => RequestAttempt::Retry(anyhow::anyhow!("device returned no response")),
         STATUS_FAILURE => RequestAttempt::Failed(anyhow::anyhow!("device returned STATUS_FAILURE")),
         STATUS_NOT_SUPPORTED => RequestAttempt::Unsupported,
@@ -499,11 +476,19 @@ fn display_name(device: &DiscoveredDevice) -> String {
 }
 
 fn poll_error(device: &DiscoveredDevice, err: anyhow::Error) -> PollError {
+    scoped_poll_error(device, PollErrorScope::Device, err)
+}
+
+fn scoped_poll_error(
+    device: &DiscoveredDevice,
+    scope: PollErrorScope,
+    err: anyhow::Error,
+) -> PollError {
     PollError {
         device_key: device.key.clone(),
         display_name: display_name(device),
         pid: device.pid,
-        scope: PollErrorScope::Device,
+        scope,
         kind: classify_error(&err),
         message: format_error_chain(&err),
     }
@@ -544,14 +529,14 @@ fn scale_percent(raw: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence, classify_error,
-        format_error_chain, merge_query_failure, probe_battery_with, record_query_result,
-        scale_percent, send_request_with, update_cache_after_success,
+        FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence, charge_query_result,
+        classify_error, format_error_chain, merge_query_failure, probe_request_with,
+        record_query_result, scale_percent, update_cache_after_success,
     };
     use crate::config::PidCache;
     use crate::hid::protocol::{
         FEATURE_REPORT_LENGTH, STATUS_BUSY, STATUS_NO_RESPONSE, STATUS_NOT_SUPPORTED,
-        STATUS_SUCCESSFUL, build_battery_request,
+        STATUS_SUCCESSFUL, build_battery_request, build_charging_request,
     };
     use crate::hid::scanner::DiscoveredDevice;
     use crate::model::{PollErrorKind, PollErrorScope, PollResult};
@@ -638,6 +623,16 @@ mod tests {
         feature_response_with_status(transaction_id, battery_raw, STATUS_SUCCESSFUL)
     }
 
+    fn charging_response_with_status(transaction_id: u8, charging: u8, status: u8) -> Vec<u8> {
+        let mut report = build_charging_request(transaction_id);
+        report.status = status;
+        report.arguments[1] = charging;
+        report.crc = report.calculate_crc();
+        let mut bytes = vec![0; FEATURE_REPORT_LENGTH];
+        bytes[1..].copy_from_slice(&report.to_bytes());
+        bytes
+    }
+
     #[test]
     fn scaling_truncates_like_reference() {
         // OpenRazer floors the percentage (int((raw / 255) * 100)); these
@@ -653,62 +648,94 @@ mod tests {
 
     #[test]
     fn transport_retries_invalid_crc_then_uses_valid_response() {
-        let request = build_battery_request(0x1F);
         let mut invalid = feature_response(0x1F, 127);
         invalid[89] ^= 0x01;
-        let transport = FakeTransport::new(vec![Ok(invalid), Ok(feature_response(0x1F, 128))]);
+        let candidates = [(
+            0,
+            FakeTransport::new(vec![Ok(invalid), Ok(feature_response(0x1F, 128))]),
+        )];
 
-        let response = send_request_with(
-            &transport,
-            request,
+        let (_, _, response) = probe_request_with(
+            &candidates,
+            &[0x1F],
+            build_battery_request,
             Duration::ZERO,
             Instant::now() + Duration::from_secs(1),
         )
         .expect("second response should succeed");
 
         assert_eq!(response.arguments[1], 128);
-        assert_eq!(transport.attempts.get(), 2);
+        assert_eq!(candidates[0].1.attempts.get(), 2);
     }
 
     #[test]
     fn transport_retries_read_failure() {
-        let request = build_battery_request(0x3F);
-        let transport = FakeTransport::new(vec![
-            Err(anyhow::anyhow!("receiver asleep")),
-            Ok(feature_response(0x3F, 200)),
-        ]);
+        let candidates = [(
+            0,
+            FakeTransport::new(vec![
+                Err(anyhow::anyhow!("receiver asleep")),
+                Ok(feature_response(0x3F, 200)),
+            ]),
+        )];
 
-        let response = send_request_with(
-            &transport,
-            request,
+        let (_, _, response) = probe_request_with(
+            &candidates,
+            &[0x3F],
+            build_battery_request,
             Duration::ZERO,
             Instant::now() + Duration::from_secs(1),
         )
         .expect("retry should recover");
 
         assert_eq!(response.arguments[1], 200);
-        assert_eq!(transport.attempts.get(), 2);
+        assert_eq!(candidates[0].1.attempts.get(), 2);
     }
 
     #[test]
-    fn transport_accepts_busy_response_with_usable_data() {
-        let request = build_battery_request(0x1F);
-        let transport = FakeTransport::new(vec![Ok(feature_response_with_status(
-            0x1F,
-            180,
-            STATUS_BUSY,
-        ))]);
+    fn review_transport_retries_busy_then_uses_completed_response() {
+        let candidates = [(
+            0,
+            FakeTransport::new(vec![
+                Ok(feature_response_with_status(0x1F, 180, STATUS_BUSY)),
+                Ok(feature_response(0x1F, 120)),
+            ]),
+        )];
 
-        let response = send_request_with(
-            &transport,
-            request,
+        let (_, _, response) = probe_request_with(
+            &candidates,
+            &[0x1F],
+            build_battery_request,
             Duration::ZERO,
             Instant::now() + Duration::from_secs(1),
         )
-        .expect("busy response can contain usable data");
+        .expect("completed response should succeed after busy status");
 
-        assert_eq!(response.arguments[1], 180);
-        assert_eq!(transport.attempts.get(), 1);
+        assert_eq!(response.arguments[1], 120);
+        assert_eq!(candidates[0].1.attempts.get(), 2);
+    }
+
+    #[test]
+    fn review_transport_rejects_busy_payload_after_retry_budget() {
+        let candidates = [(
+            0,
+            FakeTransport::new(
+                (0..MAX_RETRIES)
+                    .map(|_| Ok(feature_response_with_status(0x1F, 180, STATUS_BUSY)))
+                    .collect(),
+            ),
+        )];
+
+        let failure = probe_request_with(
+            &candidates,
+            &[0x1F],
+            build_battery_request,
+            Duration::ZERO,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect_err("busy payload must not become a reading");
+
+        assert!(matches!(failure, QueryFailure::Failed(_)));
+        assert_eq!(candidates[0].1.attempts.get(), MAX_RETRIES);
     }
 
     #[test]
@@ -728,22 +755,31 @@ mod tests {
 
     #[test]
     fn transport_preserves_explicit_not_supported_result() {
-        let request = build_battery_request(0x1F);
-        let transport = FakeTransport::new(vec![Ok(feature_response_with_status(
-            0x1F,
+        let candidates = [(
             0,
-            STATUS_NOT_SUPPORTED,
-        ))]);
+            FakeTransport::new(vec![Ok(feature_response_with_status(
+                0x1F,
+                0,
+                STATUS_NOT_SUPPORTED,
+            ))]),
+        )];
 
-        let error = send_request_with(
-            &transport,
-            request,
+        let failure = probe_request_with(
+            &candidates,
+            &[0x1F],
+            build_battery_request,
             Duration::ZERO,
             Instant::now() + Duration::from_secs(1),
         )
         .expect_err("unsupported command should remain typed");
 
-        assert!(error.downcast_ref::<super::UnsupportedCommand>().is_some());
+        assert!(matches!(
+            failure,
+            QueryFailure::Unsupported {
+                evidence: UnsupportedEvidence::Conclusive,
+                auxiliary,
+            } if auxiliary.is_empty()
+        ));
     }
 
     #[test]
@@ -784,26 +820,25 @@ mod tests {
 
     #[test]
     fn diagnostic_classification_preserves_transport_source() {
-        let request = build_battery_request(0x1F);
         let replies = (0..MAX_RETRIES)
             .map(|_| {
                 Err(anyhow::anyhow!("access denied by operating system")
                     .context("send_feature_report failed"))
             })
             .collect();
-        let transport = FakeTransport::new(replies);
+        let candidates = [(0, FakeTransport::new(replies))];
 
-        let transport_error = send_request_with(
-            &transport,
-            request,
+        let failure = probe_request_with(
+            &candidates,
+            &[0x1F],
+            build_battery_request,
             Duration::ZERO,
             Instant::now() + Duration::from_secs(1),
         )
         .expect_err("transport retries should fail");
-        let aggregate = anyhow::anyhow!(
-            "unable to read battery (tx 0x1F: {})",
-            format_error_chain(&transport_error)
-        );
+        let QueryFailure::Failed(aggregate) = failure else {
+            panic!("transport error should remain a failed query")
+        };
 
         assert_eq!(classify_error(&aggregate), PollErrorKind::AccessDenied);
         assert!(format_error_chain(&aggregate).contains("access denied by operating system"));
@@ -824,9 +859,10 @@ mod tests {
             })
             .collect();
 
-        let (candidate_index, transaction_id, response) = probe_battery_with(
+        let (candidate_index, transaction_id, response) = probe_request_with(
             &candidates,
             &[0x1F, 0x3F, 0xFF],
+            build_battery_request,
             Duration::ZERO,
             Instant::now() + Duration::from_secs(1),
         )
@@ -870,9 +906,10 @@ mod tests {
             (1, FakeTransport::new(unsupported_replies())),
         ];
 
-        let result = probe_battery_with(
+        let result = probe_request_with(
             &candidates,
             &[0x1F, 0x3F, 0xFF],
+            build_battery_request,
             Duration::ZERO,
             Instant::now() + Duration::from_secs(1),
         );
@@ -898,9 +935,10 @@ mod tests {
         );
         let candidates = [(0, FakeTransport::new(replies))];
 
-        let failure = probe_battery_with(
+        let failure = probe_request_with(
             &candidates,
             &[0x1F, 0x3F],
+            build_battery_request,
             Duration::ZERO,
             Instant::now() + Duration::from_secs(1),
         )
@@ -925,5 +963,131 @@ mod tests {
         assert_eq!(result.errors.len(), 2);
         assert_eq!(result.errors[0].kind, PollErrorKind::Unsupported);
         assert_eq!(result.errors[1].kind, PollErrorKind::DeviceUnavailable);
+    }
+
+    #[test]
+    fn review_charge_probe_uses_a_supported_fallback_candidate() {
+        let candidates = [
+            (
+                0,
+                FakeTransport::new(vec![Ok(charging_response_with_status(
+                    0x1F,
+                    0,
+                    STATUS_NOT_SUPPORTED,
+                ))]),
+            ),
+            (
+                1,
+                FakeTransport::new(vec![Ok(charging_response_with_status(
+                    0x1F,
+                    1,
+                    STATUS_SUCCESSFUL,
+                ))]),
+            ),
+        ];
+        let device = DiscoveredDevice {
+            key: "mouse".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            candidates: Vec::new(),
+        };
+
+        let query = probe_request_with(
+            &candidates,
+            &[0x1F],
+            build_charging_request,
+            Duration::ZERO,
+            Instant::now() + Duration::from_secs(1),
+        );
+        let (state, warnings) = charge_query_result(&device, query);
+
+        assert_eq!(state, crate::model::ChargeState::Charging);
+        assert!(warnings.is_empty());
+        assert_eq!(candidates[0].1.attempts.get(), 1);
+        assert_eq!(candidates[1].1.attempts.get(), 1);
+    }
+
+    #[test]
+    fn review_charge_probe_preserves_partial_unsupported_evidence() {
+        let candidates = [
+            (
+                0,
+                FakeTransport::new(vec![Ok(charging_response_with_status(
+                    0x1F,
+                    0,
+                    STATUS_NOT_SUPPORTED,
+                ))]),
+            ),
+            (
+                1,
+                FakeTransport::new(
+                    (0..MAX_RETRIES)
+                        .map(|_| Ok(charging_response_with_status(0x1F, 0, STATUS_NO_RESPONSE)))
+                        .collect(),
+                ),
+            ),
+        ];
+        let device = DiscoveredDevice {
+            key: "mouse".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            candidates: Vec::new(),
+        };
+
+        let query = probe_request_with(
+            &candidates,
+            &[0x1F],
+            build_charging_request,
+            Duration::ZERO,
+            Instant::now() + Duration::from_secs(1),
+        );
+        let (state, warnings) = charge_query_result(&device, query);
+
+        assert_eq!(state, crate::model::ChargeState::Unavailable);
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].scope, PollErrorScope::ChargeState);
+        assert_eq!(warnings[0].kind, PollErrorKind::Unsupported);
+        assert_eq!(warnings[1].scope, PollErrorScope::ChargeState);
+        assert_eq!(warnings[1].kind, PollErrorKind::DeviceUnavailable);
+    }
+
+    #[test]
+    fn review_charge_probe_requires_conclusive_unsupported_evidence() {
+        let candidates = [
+            (
+                0,
+                FakeTransport::new(vec![Ok(charging_response_with_status(
+                    0x1F,
+                    0,
+                    STATUS_NOT_SUPPORTED,
+                ))]),
+            ),
+            (
+                1,
+                FakeTransport::new(vec![Ok(charging_response_with_status(
+                    0x1F,
+                    0,
+                    STATUS_NOT_SUPPORTED,
+                ))]),
+            ),
+        ];
+        let device = DiscoveredDevice {
+            key: "mouse".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            candidates: Vec::new(),
+        };
+
+        let query = probe_request_with(
+            &candidates,
+            &[0x1F],
+            build_charging_request,
+            Duration::ZERO,
+            Instant::now() + Duration::from_secs(1),
+        );
+        let (state, warnings) = charge_query_result(&device, query);
+
+        assert_eq!(state, crate::model::ChargeState::Unsupported);
+        assert!(warnings.is_empty());
     }
 }

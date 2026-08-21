@@ -31,8 +31,9 @@ This split keeps the core testable without a Windows tray or physical hardware.
 The scanner groups candidate HID interfaces for each logical device. The client
 tries candidates in a deterministic order. It tries a cached transaction ID,
 known device metadata, and bounded protocol fallbacks. Failed cached IDs are
-removed. Transport and protocol failures can retry within a per-device time
-budget.
+removed. Battery and charging queries aggregate relevant candidate results
+before declaring a state unsupported. Transport and protocol failures can retry
+within a per-device time budget.
 
 The private transport seam supports retry tests without exposing HID mechanics
 to the rest of the app.
