@@ -89,6 +89,7 @@ impl fmt::Display for PollErrorKind {
 #[serde(rename_all = "kebab-case")]
 pub enum PollErrorScope {
     Device,
+    Interface,
     ChargeState,
     Subsystem,
 }
@@ -113,6 +114,7 @@ impl fmt::Display for PollErrorScope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Device => "device",
+            Self::Interface => "interface",
             Self::ChargeState => "charge-state",
             Self::Subsystem => "subsystem",
         })

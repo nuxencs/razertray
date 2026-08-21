@@ -38,8 +38,9 @@ unsupported.
 Transport and protocol failures can retry within a per-device time budget. If
 the bounded candidate set is truncated, unsupported evidence remains partial.
 Each blocking feature exchange runs behind a timeout boundary. Timed-out native
-operations are isolated from the polling worker, and a global cap prevents
-stalled driver calls from creating unbounded worker threads.
+operations are isolated from the polling worker. A stable per-interface gate
+prevents later polls from starting more blocked work on the same path without
+denying healthy interfaces.
 Verified devices try the battery-winning interface first for charging status,
 then bounded fallbacks. Ambiguous serialless groups retain probe results only as
 typed diagnostics, never as a definitive device reading. Excluded charge
@@ -53,8 +54,10 @@ to the rest of the app.
 `PollResult` is the structured diagnostic boundary. It preserves raw battery
 values, charge-state uncertainty, typed error scopes and kinds, and readable
 devices in the same result. Independent transport failures remain separate
-diagnostics. Subsystem diagnostics also carry a typed HID or PID-cache
-component identity. JSON output uses this type directly.
+diagnostics. When an interface fallback succeeds, those details retain
+interface scope while the tray shows one concise fallback warning. Subsystem
+diagnostics also carry a typed HID or PID-cache component identity. JSON output
+uses this type directly.
 
 The tray shows a bounded diagnostic summary. Logs and CLI or JSON output retain
 the complete typed details.

@@ -7,7 +7,7 @@ use crate::config::{self, AlertScope, AppConfig, ConfigRecovery, PidCache, ViewM
 use crate::error_tracker::{ErrorNotice, ErrorTracker};
 use crate::hid::client;
 use crate::icon;
-use crate::model::{PollError, PollOutcome, PollResult, SubsystemComponent};
+use crate::model::{PollError, PollErrorScope, PollOutcome, PollResult, SubsystemComponent};
 use crate::notify::{self, Notifier};
 use anyhow::{Context, Result};
 use hidapi::HidApi;
@@ -471,16 +471,17 @@ fn log_error_notice(notice: ErrorNotice) {
             scope = ?scope,
             component = ?component,
             "{}",
-            recovery_message(component)
+            recovery_message(component, scope)
         ),
     }
 }
 
-fn recovery_message(component: Option<SubsystemComponent>) -> &'static str {
-    match component {
-        Some(SubsystemComponent::Hid) => "HID subsystem recovered",
-        Some(SubsystemComponent::PidCache) => "PID cache recovered",
-        None => "device polling recovered",
+fn recovery_message(component: Option<SubsystemComponent>, scope: PollErrorScope) -> &'static str {
+    match (component, scope) {
+        (Some(SubsystemComponent::Hid), _) => "HID subsystem recovered",
+        (Some(SubsystemComponent::PidCache), _) => "PID cache recovered",
+        (None, PollErrorScope::Interface) => "interface fallback recovered",
+        (None, _) => "device polling recovered",
     }
 }
 
@@ -813,10 +814,17 @@ mod tests {
     }
 
     #[test]
-    fn review_round_20_cache_recovery_uses_component_wording() {
+    fn review_round_25_recovery_wording_preserves_incident_scope() {
         assert_eq!(
-            recovery_message(Some(SubsystemComponent::PidCache)),
+            recovery_message(
+                Some(SubsystemComponent::PidCache),
+                PollErrorScope::Subsystem
+            ),
             "PID cache recovered"
+        );
+        assert_eq!(
+            recovery_message(None, PollErrorScope::Interface),
+            "interface fallback recovered"
         );
     }
 }

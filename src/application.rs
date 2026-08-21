@@ -346,7 +346,8 @@ impl AppCore {
         } else if !self.has_polled {
             ObservationView::NeverObserved
         } else if let Some(error) = diagnostics.first() {
-            let (scope, kind) = diagnostic_classification(&diagnostics)
+            let diagnostic_refs = diagnostics.iter().collect::<Vec<_>>();
+            let (scope, kind) = diagnostic_classification(&diagnostic_refs)
                 .unwrap_or((error.scope, crate::model::PollErrorKind::Unknown));
             ObservationView::Failed {
                 scope,
@@ -541,6 +542,8 @@ fn append_diagnostics(text: &mut String, diagnostics: &[PollError]) {
             text.push_str(" - ");
             if error.scope == PollErrorScope::Subsystem {
                 text.push_str(&diagnostic_status(error));
+            } else if error.scope == PollErrorScope::Interface {
+                text.push_str(poll_error_status(error.scope, error.kind));
             } else {
                 text.push_str(&error.display_name);
                 text.push_str(": ");
@@ -557,7 +560,37 @@ fn append_diagnostics(text: &mut String, diagnostics: &[PollError]) {
 }
 
 fn diagnostic_summary(diagnostics: &[PollError]) -> Option<String> {
-    let first = diagnostics.first()?;
+    let interface_diagnostics = diagnostics
+        .iter()
+        .filter(|error| error.scope == PollErrorScope::Interface)
+        .collect::<Vec<_>>();
+    let primary_diagnostics = diagnostics
+        .iter()
+        .filter(|error| error.scope != PollErrorScope::Interface)
+        .collect::<Vec<_>>();
+
+    let mut summary = diagnostic_summary_for(&primary_diagnostics);
+    if !interface_diagnostics.is_empty() {
+        let device_count = interface_diagnostics
+            .iter()
+            .filter(|error| !error.device_key.is_empty())
+            .map(|error| error.device_key.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let fallback = interface_fallback_status(device_count);
+        match &mut summary {
+            Some(summary) => {
+                summary.push_str(" - ");
+                summary.push_str(&fallback);
+            }
+            None => summary = Some(fallback),
+        }
+    }
+    summary
+}
+
+fn diagnostic_summary_for(diagnostics: &[&PollError]) -> Option<String> {
+    let first = *diagnostics.first()?;
     if diagnostics.len() == 1 {
         return Some(diagnostic_status(first));
     }
@@ -610,9 +643,9 @@ fn subsystem_error_status(kind: crate::model::PollErrorKind) -> &'static str {
 }
 
 fn diagnostic_classification(
-    diagnostics: &[PollError],
+    diagnostics: &[&PollError],
 ) -> Option<(PollErrorScope, crate::model::PollErrorKind)> {
-    let first = diagnostics.first()?;
+    let first = *diagnostics.first()?;
     diagnostics
         .iter()
         .all(|error| error.scope == first.scope && error.kind == first.kind)
@@ -642,6 +675,7 @@ fn poll_error_status(scope: PollErrorScope, kind: crate::model::PollErrorKind) -
         (PollErrorScope::Device, crate::model::PollErrorKind::Unknown) => {
             "Battery reading unavailable - refresh to retry"
         }
+        (PollErrorScope::Interface, _) => "Using a fallback interface - run --diagnose for details",
         (PollErrorScope::ChargeState, crate::model::PollErrorKind::AccessDenied) => {
             "Charging status access denied - check permissions and refresh"
         }
@@ -700,6 +734,7 @@ fn multi_device_poll_error_status(
         (PollErrorScope::Device, crate::model::PollErrorKind::Unknown) => {
             format!("Battery readings unavailable for {device_count} devices - refresh to retry")
         }
+        (PollErrorScope::Interface, _) => interface_fallback_status(device_count),
         (PollErrorScope::ChargeState, crate::model::PollErrorKind::AccessDenied) => format!(
             "Charging status access denied for {device_count} devices - check permissions and refresh"
         ),
@@ -716,6 +751,14 @@ fn multi_device_poll_error_status(
             format!("Charging status unavailable for {device_count} devices - refresh to retry")
         }
         (PollErrorScope::Subsystem, _) => poll_error_status(scope, kind).to_string(),
+    }
+}
+
+fn interface_fallback_status(device_count: usize) -> String {
+    if device_count > 1 {
+        format!("Using fallback interfaces for {device_count} devices - run --diagnose for details")
+    } else {
+        "Using a fallback interface - run --diagnose for details".to_string()
     }
 }
 
@@ -1631,5 +1674,56 @@ mod tests {
         );
         assert!(update.view.tooltip.contains("Charging status unavailable"));
         assert!(!update.view.status_text.contains("Device unavailable"));
+    }
+
+    #[test]
+    fn review_round_25_fallback_details_stay_typed_and_tray_status_stays_concise() {
+        let now = Instant::now();
+        let (mut core, first, _) = started_core(AppConfig::default(), now);
+        let errors = vec![
+            PollError {
+                device_key: "mouse".to_string(),
+                display_name: "Mouse mouse".to_string(),
+                pid: 1,
+                scope: PollErrorScope::Interface,
+                component: None,
+                kind: PollErrorKind::AccessDenied,
+                message: "interface 1 could not be opened: access denied".to_string(),
+            },
+            PollError {
+                device_key: "mouse".to_string(),
+                display_name: "Mouse mouse".to_string(),
+                pid: 1,
+                scope: PollErrorScope::Interface,
+                component: None,
+                kind: PollErrorKind::Unknown,
+                message: "one candidate interface was skipped".to_string(),
+            },
+        ];
+
+        let update = core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: vec![reading("mouse", 70)],
+                    errors: errors.clone(),
+                }),
+            ),
+            now,
+        );
+
+        assert!(matches!(
+            update.view.observation,
+            ObservationView::Fresh { reading } if reading.device_key == "mouse"
+        ));
+        assert!(
+            update
+                .view
+                .status_text
+                .contains("Using a fallback interface - run --diagnose for details")
+        );
+        assert!(!update.view.status_text.contains("access denied"));
+        assert!(!update.view.status_text.contains("indeterminate"));
+        assert_eq!(update.view.diagnostics, errors);
     }
 }

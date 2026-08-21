@@ -11,8 +11,9 @@ use crate::model::{
 };
 use anyhow::{Context, Result};
 use hidapi::{HidApi, HidDevice};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,11 +21,11 @@ const MAX_CANDIDATES_PER_DEVICE: usize = 4;
 const MAX_RETRIES: usize = 5;
 const DEVICE_POLL_BUDGET: Duration = Duration::from_secs(8);
 const FEATURE_IO_TIMEOUT: Duration = Duration::from_secs(1);
-const MAX_BLOCKED_FEATURE_OPERATIONS: usize = MAX_CANDIDATES_PER_DEVICE;
 const SEND_DELAY: Duration = Duration::from_millis(60);
 const RETRY_DELAY: Duration = Duration::from_millis(400);
 
-static ACTIVE_FEATURE_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_FEATURE_PATHS: LazyLock<Mutex<HashSet<Vec<u8>>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 pub struct PollBatch {
     pub result: PollResult,
@@ -154,7 +155,7 @@ fn query_device(
             break;
         }
         match api.open_path(candidate.path.as_c_str()) {
-            Ok(handle) => match HidTransport::new(handle) {
+            Ok(handle) => match HidTransport::new(handle, candidate.path.to_bytes().to_vec()) {
                 Ok(transport) => transports.push((candidate.interface_number, transport)),
                 Err(err) => failures.push(anyhow::anyhow!(
                     "interface {} transport unavailable: {err:#}",
@@ -244,7 +245,7 @@ fn device_transport_warnings(
 ) -> Vec<PollError> {
     failures
         .into_iter()
-        .map(|error| poll_error(device, error))
+        .map(|error| scoped_poll_error(device, PollErrorScope::Interface, error))
         .collect()
 }
 
@@ -566,22 +567,30 @@ struct FeatureCommand {
     reply: mpsc::Sender<Result<(usize, Vec<u8>)>>,
 }
 
-struct FeatureOperationPermit;
+struct FeatureOperationPermit {
+    path: Vec<u8>,
+}
 
 impl FeatureOperationPermit {
-    fn acquire() -> Option<Self> {
-        ACTIVE_FEATURE_OPERATIONS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_BLOCKED_FEATURE_OPERATIONS).then_some(active + 1)
-            })
-            .ok()
-            .map(|_| Self)
+    fn acquire(path: &[u8]) -> Option<Self> {
+        let mut active = ACTIVE_FEATURE_PATHS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = path.to_vec();
+        if active.insert(path.clone()) {
+            Some(Self { path })
+        } else {
+            None
+        }
     }
 }
 
 impl Drop for FeatureOperationPermit {
     fn drop(&mut self) {
-        ACTIVE_FEATURE_OPERATIONS.fetch_sub(1, Ordering::AcqRel);
+        ACTIVE_FEATURE_PATHS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.path);
     }
 }
 
@@ -591,13 +600,13 @@ struct HidTransport {
 }
 
 impl HidTransport {
-    fn new<D: BlockingFeatureDevice>(device: D) -> Result<Self> {
+    fn new<D: BlockingFeatureDevice>(device: D, path: Vec<u8>) -> Result<Self> {
         let (commands, receiver) = mpsc::channel::<FeatureCommand>();
         thread::Builder::new()
             .name("razertray-hid-feature".to_string())
             .spawn(move || {
                 while let Ok(command) = receiver.recv() {
-                    let result = match FeatureOperationPermit::acquire() {
+                    let result = match FeatureOperationPermit::acquire(&path) {
                         Some(_permit) => {
                             let mut response = command.response;
                             device
@@ -609,7 +618,7 @@ impl HidTransport {
                                 .map(|count| (count, response))
                         }
                         None => Err(anyhow::anyhow!(
-                            "HID feature operation unavailable because earlier operations remain blocked"
+                            "HID feature operation unavailable because this interface remains blocked"
                         )),
                     };
                     let _ = command.reply.send(result);
@@ -873,7 +882,9 @@ mod tests {
         fn pause(&self, _duration: Duration) {}
     }
 
-    struct SlowFeatureDevice;
+    struct SlowFeatureDevice {
+        started: std::sync::mpsc::Sender<()>,
+    }
 
     impl BlockingFeatureDevice for SlowFeatureDevice {
         fn exchange_blocking(
@@ -882,7 +893,21 @@ mod tests {
             response: &mut [u8],
             _response_wait: Duration,
         ) -> Result<usize> {
+            let _ = self.started.send(());
             std::thread::sleep(Duration::from_millis(500));
+            Ok(response.len())
+        }
+    }
+
+    struct FastFeatureDevice;
+
+    impl BlockingFeatureDevice for FastFeatureDevice {
+        fn exchange_blocking(
+            &self,
+            _request: &[u8],
+            response: &mut [u8],
+            _response_wait: Duration,
+        ) -> Result<usize> {
             Ok(response.len())
         }
     }
@@ -970,8 +995,16 @@ mod tests {
     }
 
     #[test]
-    fn review_round_24_hid_feature_operation_is_time_bounded() {
-        let transport = HidTransport::new(SlowFeatureDevice).expect("start feature worker");
+    fn review_round_25_stalled_interface_does_not_starve_healthy_interfaces() {
+        let stalled_path = b"review-round-25-stalled".to_vec();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let transport = HidTransport::new(
+            SlowFeatureDevice {
+                started: started_tx,
+            },
+            stalled_path.clone(),
+        )
+        .expect("start feature worker");
         let mut response = [0; FEATURE_REPORT_LENGTH];
         let started = Instant::now();
 
@@ -986,10 +1019,40 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_millis(250));
         assert!(format!("{error:#}").contains("timing out"));
+        started_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("native operation started");
+
+        let same_path = HidTransport::new(FastFeatureDevice, stalled_path)
+            .expect("start same-path feature worker");
+        let same_path_error = same_path
+            .exchange(
+                &[0; FEATURE_REPORT_LENGTH],
+                &mut response,
+                Duration::ZERO,
+                Duration::from_millis(100),
+            )
+            .expect_err("same path should remain isolated");
+        assert!(format!("{same_path_error:#}").contains("this interface remains blocked"));
+
+        let healthy_path =
+            HidTransport::new(FastFeatureDevice, b"review-round-25-healthy".to_vec())
+                .expect("start healthy feature worker");
+        assert_eq!(
+            healthy_path
+                .exchange(
+                    &[0; FEATURE_REPORT_LENGTH],
+                    &mut response,
+                    Duration::ZERO,
+                    Duration::from_millis(100),
+                )
+                .expect("healthy path should remain available"),
+            FEATURE_REPORT_LENGTH
+        );
     }
 
     #[test]
-    fn review_round_24_battery_transport_failures_keep_device_scope() {
+    fn review_round_25_successful_fallback_keeps_interface_scope_and_details() {
         let device = DiscoveredDevice {
             key: "mouse".to_string(),
             pid: 0xFFFF,
@@ -1012,9 +1075,21 @@ mod tests {
         warnings.extend(charge_warnings);
 
         assert_eq!(warnings.len(), 2);
-        assert_eq!(warnings[0].scope, PollErrorScope::Device);
+        assert_eq!(warnings[0].scope, PollErrorScope::Interface);
         assert_eq!(warnings[0].kind, PollErrorKind::AccessDenied);
+        assert_eq!(
+            warnings[0].message,
+            "interface 1 could not be opened: access denied"
+        );
         assert_eq!(warnings[1].scope, PollErrorScope::ChargeState);
+
+        let encoded = serde_json::to_value(&warnings).expect("serialize typed diagnostics");
+        assert_eq!(encoded[0]["scope"], "interface");
+        assert_eq!(encoded[0]["kind"], "access-denied");
+        assert_eq!(
+            encoded[0]["message"],
+            "interface 1 could not be opened: access denied"
+        );
     }
 
     #[test]
