@@ -19,15 +19,15 @@ use std::time::{Duration, Instant};
 const INITIAL_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_REPLY_ALLOWANCE: Duration = Duration::from_secs(1);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(5);
-const MAX_SUPERVISED_WORKERS: usize = 4;
+const MAX_REQUEST_WORKERS: usize = 4;
 const OBSERVATION_TRANSIT_ALLOWANCE_MS: u64 = 10;
 const FRAME_PREFIX: &str = "RAZERTRAY-HID:";
 const PROCESS_TREE_ENV: &str = "RAZERTRAY_HID_PROCESS_TREE";
 
-static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
-static QUARANTINED_PATHS: LazyLock<Mutex<BTreeSet<Vec<u8>>>> =
+static ACTIVE_REQUEST_WORKERS: AtomicUsize = AtomicUsize::new(0);
+static QUARANTINED_REQUESTS: LazyLock<Mutex<BTreeSet<FeatureRequestKey>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
-static NEW_STALLED_PATHS: LazyLock<Mutex<BTreeSet<Vec<u8>>>> =
+static NEW_STALLED_REQUESTS: LazyLock<Mutex<BTreeSet<FeatureRequestKey>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
 static RETIRED_WORKERS: LazyLock<Mutex<Vec<RetiredWorker>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
@@ -62,7 +62,7 @@ static REAPER: LazyLock<()> = LazyLock::new(|| {
 enum WorkerRequest {
     Poll {
         cache: PidCache,
-        quarantined_paths: Vec<Vec<u8>>,
+        quarantined_requests: Vec<FeatureRequestKey>,
     },
     Feature {
         path: Vec<u8>,
@@ -80,7 +80,7 @@ enum WorkerReply {
         cache: PidCache,
         cache_changed: bool,
         observation_ages_ms: Vec<Option<u64>>,
-        stalled_paths: Vec<Vec<u8>>,
+        stalled_requests: Vec<FeatureRequestKey>,
     },
     Feature {
         count: usize,
@@ -95,6 +95,21 @@ enum WorkerReply {
 enum WorkerFrame {
     PollPlan { timeout_ms: u64 },
     Reply(WorkerReply),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct FeatureRequestKey {
+    path: Vec<u8>,
+    request: Vec<u8>,
+}
+
+impl FeatureRequestKey {
+    fn new(path: &[u8], request: &[u8]) -> Self {
+        Self {
+            path: path.to_vec(),
+            request: request.to_vec(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -114,13 +129,13 @@ impl fmt::Display for WorkerTimeout {
 
 impl std::error::Error for WorkerTimeout {}
 
-struct WorkerPermit;
+struct RequestWorkerPermit;
 
-impl WorkerPermit {
+impl RequestWorkerPermit {
     fn acquire() -> Result<Self> {
-        ACTIVE_WORKERS
+        ACTIVE_REQUEST_WORKERS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_SUPERVISED_WORKERS).then_some(active + 1)
+                (active < MAX_REQUEST_WORKERS).then_some(active + 1)
             })
             .map_err(|_| {
                 anyhow::anyhow!("HID worker capacity is retained by stalled operations")
@@ -129,22 +144,21 @@ impl WorkerPermit {
     }
 }
 
-impl Drop for WorkerPermit {
+impl Drop for RequestWorkerPermit {
     fn drop(&mut self) {
-        ACTIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
+        ACTIVE_REQUEST_WORKERS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 struct RetiredWorker {
     child: Child,
     reader: Option<thread::JoinHandle<()>>,
-    permit: Option<WorkerPermit>,
+    permit: Option<RequestWorkerPermit>,
     process_tree: Option<process_tree::Owned>,
 }
 
 impl RetiredWorker {
     fn is_complete(&mut self) -> bool {
-        debug_assert!(self.process_tree.is_none() || self.permit.is_some());
         let child_exited = matches!(self.child.try_wait(), Ok(Some(_)));
         let Some(tree) = &self.process_tree else {
             return child_exited;
@@ -167,13 +181,13 @@ struct OutputReader {
 struct SupervisedChild {
     child: Option<Child>,
     reader: Option<thread::JoinHandle<()>>,
-    permit: Option<WorkerPermit>,
+    permit: Option<RequestWorkerPermit>,
     tree: Option<process_tree::Owned>,
     retain_locally: bool,
 }
 
 impl SupervisedChild {
-    fn new(child: Child, permit: Option<WorkerPermit>, retain_locally: bool) -> Self {
+    fn new(child: Child, permit: Option<RequestWorkerPermit>, retain_locally: bool) -> Self {
         Self {
             child: Some(child),
             reader: None,
@@ -222,29 +236,29 @@ pub(crate) fn poll(cache: &mut PidCache) -> Result<PollBatch> {
     let reply = run_process(
         &WorkerRequest::Poll {
             cache: cache.clone(),
-            quarantined_paths: quarantined_paths(),
+            quarantined_requests: quarantined_requests(),
         },
         INITIAL_POLL_TIMEOUT,
     )
     .context("bounded HID scan failed")?;
-    let (mut result, returned_cache, cache_changed, observation_ages_ms, stalled_paths) =
+    let (mut result, returned_cache, cache_changed, observation_ages_ms, stalled_requests) =
         match reply {
             WorkerReply::Poll {
                 result,
                 cache,
                 cache_changed,
                 observation_ages_ms,
-                stalled_paths,
+                stalled_requests,
             } => (
                 result,
                 cache,
                 cache_changed,
                 observation_ages_ms,
-                stalled_paths,
+                stalled_requests,
             ),
             reply => return worker_failure(reply, "poll"),
         };
-    remember_stalled_paths(stalled_paths);
+    remember_stalled_requests(stalled_requests);
     if observation_ages_ms.len() != result.devices.len() {
         anyhow::bail!(
             "HID worker returned {} observation ages for {} devices",
@@ -276,9 +290,8 @@ pub(crate) fn exchange_feature(
     response_wait: Duration,
     timeout: Duration,
 ) -> Result<usize> {
-    if path_is_quarantined(path) {
-        anyhow::bail!("HID interface unavailable after a stalled operation; path quarantined");
-    }
+    let request_key = FeatureRequestKey::new(path, request);
+    ensure_feature_request_available(&request_key)?;
     let reply = run_process(
         &WorkerRequest::Feature {
             path: path.to_vec(),
@@ -290,7 +303,7 @@ pub(crate) fn exchange_feature(
         timeout,
     )
     .map_err(|error| {
-        record_stalled_path_from_error(path, &error);
+        record_stalled_request_from_error(&request_key, &error);
         error
     })
     .context("HID feature operation unavailable")?;
@@ -316,8 +329,8 @@ fn worker_failure<T>(reply: WorkerReply, expected: &str) -> Result<T> {
     }
 }
 
-fn quarantined_paths() -> Vec<Vec<u8>> {
-    QUARANTINED_PATHS
+fn quarantined_requests() -> Vec<FeatureRequestKey> {
+    QUARANTINED_REQUESTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
@@ -325,48 +338,53 @@ fn quarantined_paths() -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn replace_quarantined_paths(paths: Vec<Vec<u8>>) {
-    *QUARANTINED_PATHS
+fn replace_quarantined_requests(requests: Vec<FeatureRequestKey>) {
+    *QUARANTINED_REQUESTS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = paths.into_iter().collect();
-    NEW_STALLED_PATHS
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = requests.into_iter().collect();
+    NEW_STALLED_REQUESTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
 }
 
-fn remember_stalled_paths(paths: impl IntoIterator<Item = Vec<u8>>) {
-    QUARANTINED_PATHS
+fn remember_stalled_requests(requests: impl IntoIterator<Item = FeatureRequestKey>) {
+    QUARANTINED_REQUESTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .extend(paths);
+        .extend(requests);
 }
 
-fn record_stalled_path(path: &[u8]) {
-    let path = path.to_vec();
-    remember_stalled_paths([path.clone()]);
-    NEW_STALLED_PATHS
+fn record_stalled_request(request: FeatureRequestKey) {
+    remember_stalled_requests([request.clone()]);
+    NEW_STALLED_REQUESTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(path);
+        .insert(request);
 }
 
-fn record_stalled_path_from_error(path: &[u8], error: &anyhow::Error) {
+fn record_stalled_request_from_error(request: &FeatureRequestKey, error: &anyhow::Error) {
     if error.is::<WorkerTimeout>() {
-        record_stalled_path(path);
+        record_stalled_request(request.clone());
     }
 }
 
-fn path_is_quarantined(path: &[u8]) -> bool {
-    QUARANTINED_PATHS
+fn ensure_feature_request_available(request: &FeatureRequestKey) -> Result<()> {
+    if QUARANTINED_REQUESTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(path)
+        .contains(request)
+    {
+        anyhow::bail!(
+            "HID feature request unavailable after a stalled operation; request quarantined"
+        );
+    }
+    Ok(())
 }
 
-fn take_new_stalled_paths() -> Vec<Vec<u8>> {
+fn take_new_stalled_requests() -> Vec<FeatureRequestKey> {
     std::mem::take(
-        &mut *NEW_STALLED_PATHS
+        &mut *NEW_STALLED_REQUESTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     )
@@ -376,11 +394,7 @@ fn take_new_stalled_paths() -> Vec<Vec<u8>> {
 
 fn run_process(request: &WorkerRequest, timeout: Duration) -> Result<WorkerReply> {
     let inherited_tree = uses_inherited_process_tree(request);
-    let permit = if inherited_tree {
-        None
-    } else {
-        Some(WorkerPermit::acquire()?)
-    };
+    let permit = worker_permit(request, inherited_tree)?;
     let input = serde_json::to_vec(request).context("failed encoding HID worker request")?;
     let executable = std::env::current_exe().context("failed resolving HID worker executable")?;
     let mut command = Command::new(executable);
@@ -400,6 +414,19 @@ fn run_process(request: &WorkerRequest, timeout: Duration) -> Result<WorkerReply
         worker.tree = process_tree::assign(worker.child_mut())?;
     }
     supervise_child(worker, &input, timeout)
+}
+
+fn worker_permit(
+    request: &WorkerRequest,
+    inherited_tree: bool,
+) -> Result<Option<RequestWorkerPermit>> {
+    Ok(
+        if matches!(request, WorkerRequest::Feature { .. }) && !inherited_tree {
+            Some(RequestWorkerPermit::acquire()?)
+        } else {
+            None
+        },
+    )
 }
 
 fn supervise_child(
@@ -523,7 +550,7 @@ fn read_output_frames(
 fn retire_worker(
     child: Child,
     reader: Option<thread::JoinHandle<()>>,
-    permit: Option<WorkerPermit>,
+    permit: Option<RequestWorkerPermit>,
     tree: Option<process_tree::Owned>,
 ) {
     retain_worker(child, reader, permit, tree, true);
@@ -532,7 +559,7 @@ fn retire_worker(
 fn retain_worker(
     mut child: Child,
     reader: Option<thread::JoinHandle<()>>,
-    permit: Option<WorkerPermit>,
+    permit: Option<RequestWorkerPermit>,
     tree: Option<process_tree::Owned>,
     terminate: bool,
 ) {
@@ -578,9 +605,9 @@ fn execute<W: Write>(request: WorkerRequest, output: &mut W) -> Result<WorkerRep
     match request {
         WorkerRequest::Poll {
             mut cache,
-            quarantined_paths,
+            quarantined_requests,
         } => {
-            replace_quarantined_paths(quarantined_paths);
+            replace_quarantined_requests(quarantined_requests);
             let api = HidApi::new().context("failed initializing HID access")?;
             let discovered = scan_devices(&api);
             let timeout = client::maximum_poll_duration(discovered.len())
@@ -612,7 +639,7 @@ fn execute<W: Write>(request: WorkerRequest, output: &mut W) -> Result<WorkerRep
                 cache,
                 cache_changed: batch.cache_changed,
                 observation_ages_ms,
-                stalled_paths: take_new_stalled_paths(),
+                stalled_requests: take_new_stalled_requests(),
             })
         }
         WorkerRequest::Feature {
@@ -825,14 +852,13 @@ mod tests {
     #[cfg(windows)]
     use super::RetiredWorker;
     use super::{
-        ACTIVE_WORKERS, INITIAL_POLL_TIMEOUT, STATUS_POLL_INTERVAL, WorkerFrame, WorkerPermit,
-        WorkerReply, WorkerTimeout, exchange_feature, record_stalled_path_from_error,
-        supervise_child, write_frame,
+        FeatureRequestKey, INITIAL_POLL_TIMEOUT, RequestWorkerPermit, STATUS_POLL_INTERVAL,
+        WorkerFrame, WorkerReply, WorkerRequest, WorkerTimeout, ensure_feature_request_available,
+        record_stalled_request_from_error, supervise_child, worker_permit, write_frame,
     };
     #[cfg(windows)]
     use std::io::{Read, Write};
     use std::process::{Child, Command, Stdio};
-    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -854,7 +880,7 @@ mod tests {
         let error = supervise_child(
             super::SupervisedChild::new(
                 child,
-                Some(WorkerPermit::acquire().expect("worker capacity")),
+                Some(RequestWorkerPermit::acquire().expect("worker capacity")),
                 true,
             ),
             &[],
@@ -879,7 +905,7 @@ mod tests {
         let reply = supervise_child(
             super::SupervisedChild::new(
                 child,
-                Some(WorkerPermit::acquire().expect("worker capacity")),
+                Some(RequestWorkerPermit::acquire().expect("worker capacity")),
                 true,
             ),
             &[],
@@ -911,7 +937,7 @@ mod tests {
         let reply = supervise_child(
             super::SupervisedChild::new(
                 child,
-                Some(WorkerPermit::acquire().expect("worker capacity")),
+                Some(RequestWorkerPermit::acquire().expect("worker capacity")),
                 true,
             ),
             &[],
@@ -924,29 +950,53 @@ mod tests {
     }
 
     #[test]
-    fn review_round_31_stalled_path_is_quarantined_without_new_workers() {
-        let path = b"review-round-31-stalled-path";
-        record_stalled_path_from_error(
-            path,
+    fn review_round_32_stalled_request_preserves_transaction_fallbacks() {
+        let path = b"review-round-32-stalled-path";
+        let mut first_request = [0; 91];
+        first_request[2] = 0x1F;
+        let first_request = FeatureRequestKey::new(path, &first_request);
+        record_stalled_request_from_error(
+            &first_request,
             &anyhow::Error::new(WorkerTimeout {
                 timeout: Duration::from_millis(20),
             }),
         );
-        let active_before = ACTIVE_WORKERS.load(Ordering::Acquire);
 
-        for _ in 0..5 {
-            let error = exchange_feature(
-                path,
-                &[0; 91],
-                &mut [0; 91],
-                Duration::ZERO,
-                Duration::from_millis(20),
-            )
-            .expect_err("quarantined path must not start another worker");
-            assert!(format!("{error:#}").contains("quarantined"));
+        let error = ensure_feature_request_available(&first_request)
+            .expect_err("stalled request must remain quarantined");
+        assert!(format!("{error:#}").contains("quarantined"));
+        for transaction_id in [0x3F, 0xFF] {
+            let mut fallback_request = [0; 91];
+            fallback_request[2] = transaction_id;
+            ensure_feature_request_available(&FeatureRequestKey::new(path, &fallback_request))
+                .expect("later transaction must retain an isolated attempt");
         }
+    }
 
-        assert_eq!(ACTIVE_WORKERS.load(Ordering::Acquire), active_before);
+    #[test]
+    fn review_round_32_poll_scan_does_not_consume_request_capacity() {
+        let poll = WorkerRequest::Poll {
+            cache: crate::config::PidCache::default(),
+            quarantined_requests: Vec::new(),
+        };
+        let feature = WorkerRequest::Feature {
+            path: Vec::new(),
+            request: Vec::new(),
+            response: Vec::new(),
+            response_wait_ms: 0,
+            operation_timeout_ms: 0,
+        };
+
+        assert!(
+            worker_permit(&poll, false)
+                .expect("poll admission")
+                .is_none()
+        );
+        assert!(
+            worker_permit(&feature, false)
+                .expect("request admission")
+                .is_some()
+        );
     }
 
     #[cfg(windows)]
@@ -1003,7 +1053,7 @@ mod tests {
         let mut retired = RetiredWorker {
             child,
             reader: None,
-            permit: Some(WorkerPermit::acquire().expect("worker capacity")),
+            permit: Some(RequestWorkerPermit::acquire().expect("worker capacity")),
             process_tree: Some(tree),
         };
 

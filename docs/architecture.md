@@ -50,12 +50,12 @@ termination and returns without waiting for process cleanup. A bounded
 background supervisor retains every non-exited poll process until it is reaped.
 On Windows, each poll and its feature-operation descendants belong to a
 kill-on-close process tree owned by the long-lived app process. Feature stalls
-cannot consume capacity reserved for later devices. A path that leaves a
-feature worker stalled is quarantined for the rest of the app session, so later
-polls continue to check healthy paths without retaining another worker for the
-same fault. Tray shutdown terminates active process trees within a bounded
-wait. The next candidate or transaction ID runs in fresh isolation while
-supervised capacity remains.
+cannot consume capacity reserved for later devices, and retained scan trees do
+not consume request-worker capacity or block a recovery scan. A feature request
+that leaves a worker stalled is quarantined for the rest of the app session, so
+later polls do not retain another worker for the same request. Tray shutdown
+terminates active process trees within a bounded wait. The next candidate or
+transaction ID runs in fresh isolation.
 Verified devices try the battery-winning interface first for charging status,
 then bounded fallbacks. Ambiguous serialless groups retain probe results only as
 typed diagnostics, never as a definitive device reading. Excluded charge
