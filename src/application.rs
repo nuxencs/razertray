@@ -313,7 +313,7 @@ impl AppCore {
     fn project(&self, now: Instant) -> TrayView {
         let displayed = self.displayed_reading();
         let diagnostics: Vec<_> = self
-            .projected_diagnostics(displayed)
+            .ordered_diagnostics(displayed)
             .into_iter()
             .cloned()
             .collect();
@@ -331,13 +331,11 @@ impl AppCore {
         } else if !self.has_polled {
             ObservationView::NeverObserved
         } else if let Some(error) = diagnostics.first() {
+            let (scope, kind) = diagnostic_classification(&diagnostics)
+                .unwrap_or((error.scope, crate::model::PollErrorKind::Unknown));
             ObservationView::Failed {
-                scope: error.scope,
-                kind: if diagnostics.len() == 1 {
-                    error.kind
-                } else {
-                    crate::model::PollErrorKind::Unknown
-                },
+                scope,
+                kind,
                 message: diagnostic_summary(&diagnostics).unwrap_or_else(|| error.message.clone()),
             }
         } else {
@@ -380,30 +378,22 @@ impl AppCore {
             })
     }
 
-    fn projected_diagnostics(&self, displayed: Option<&TrackedReading>) -> Vec<&PollError> {
-        if !self.config.selected_device_id.is_empty() {
-            let errors: Vec<_> = self
-                .last_errors
-                .iter()
-                .filter(|error| error.device_key == self.config.selected_device_id)
-                .collect();
-            if !errors.is_empty() {
-                return errors;
-            }
-        }
-
-        if let Some(displayed) = displayed {
-            let errors: Vec<_> = self
-                .last_errors
-                .iter()
-                .filter(|error| error.device_key == displayed.reading.device_key)
-                .collect();
-            if !errors.is_empty() {
-                return errors;
-            }
-        }
-
-        self.last_errors.iter().collect()
+    fn ordered_diagnostics(&self, displayed: Option<&TrackedReading>) -> Vec<&PollError> {
+        let preferred = (!self.config.selected_device_id.is_empty())
+            .then_some(self.config.selected_device_id.as_str());
+        let displayed = displayed.map(|tracked| tracked.reading.device_key.as_str());
+        let mut diagnostics: Vec<_> = self.last_errors.iter().enumerate().collect();
+        diagnostics.sort_by_key(|(index, error)| {
+            let priority = if preferred == Some(error.device_key.as_str()) {
+                0
+            } else if displayed == Some(error.device_key.as_str()) {
+                1
+            } else {
+                2
+            };
+            (priority, *index)
+        });
+        diagnostics.into_iter().map(|(_, error)| error).collect()
     }
 
     fn available_display_id(&self) -> Option<&str> {
@@ -540,15 +530,30 @@ fn diagnostic_summary(diagnostics: &[PollError]) -> Option<String> {
     match diagnostics {
         [] => None,
         [error] => Some(poll_error_status(error.scope, error.kind).to_string()),
+        errors if diagnostic_classification(errors).is_some() => Some(diagnostic_details(errors)),
         errors => Some(format!(
             "Hardware state indeterminate - {}",
-            errors
-                .iter()
-                .map(|error| format!("{}: {}", error.display_name, error.message))
-                .collect::<Vec<_>>()
-                .join("; ")
+            diagnostic_details(errors)
         )),
     }
+}
+
+fn diagnostic_classification(
+    diagnostics: &[PollError],
+) -> Option<(PollErrorScope, crate::model::PollErrorKind)> {
+    let first = diagnostics.first()?;
+    diagnostics
+        .iter()
+        .all(|error| error.scope == first.scope && error.kind == first.kind)
+        .then_some((first.scope, first.kind))
+}
+
+fn diagnostic_details(diagnostics: &[PollError]) -> String {
+    diagnostics
+        .iter()
+        .map(|error| format!("{}: {}", error.display_name, error.message))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn poll_error_status(scope: PollErrorScope, kind: crate::model::PollErrorKind) -> &'static str {
@@ -995,6 +1000,84 @@ mod tests {
                 .tooltip
                 .contains("Battery reporting is unsupported by this device")
         );
+    }
+
+    #[test]
+    fn review_preferred_diagnostic_orders_without_hiding_other_errors() {
+        let now = Instant::now();
+        let cfg = AppConfig {
+            selected_device_id: "preferred".to_string(),
+            ..AppConfig::default()
+        };
+        let (mut core, first, _) = AppCore::new(cfg, now);
+        let update = core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: vec![reading("fallback", 60)],
+                    errors: vec![
+                        PollError {
+                            device_key: "other".to_string(),
+                            display_name: "Mouse other".to_string(),
+                            pid: 3,
+                            scope: PollErrorScope::Device,
+                            kind: PollErrorKind::Protocol,
+                            message: "invalid response".to_string(),
+                        },
+                        PollError {
+                            device_key: "fallback".to_string(),
+                            display_name: "Mouse fallback".to_string(),
+                            pid: 2,
+                            scope: PollErrorScope::ChargeState,
+                            kind: PollErrorKind::AccessDenied,
+                            message: "charging status access denied".to_string(),
+                        },
+                        unsupported_error("preferred"),
+                    ],
+                }),
+            ),
+            now,
+        );
+
+        assert_eq!(
+            update
+                .view
+                .diagnostics
+                .iter()
+                .map(|error| error.device_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["preferred", "fallback", "other"]
+        );
+        assert!(update.view.status_text.contains("Mouse preferred"));
+        assert!(update.view.status_text.contains("Mouse fallback"));
+        assert!(update.view.status_text.contains("Mouse other"));
+    }
+
+    #[test]
+    fn review_homogeneous_diagnostics_keep_their_conclusive_kind() {
+        let now = Instant::now();
+        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let update = core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: Vec::new(),
+                    errors: vec![unsupported_error("a"), unsupported_error("b")],
+                }),
+            ),
+            now,
+        );
+
+        assert!(matches!(
+            update.view.observation,
+            ObservationView::Failed {
+                kind: PollErrorKind::Unsupported,
+                ..
+            }
+        ));
+        assert!(!update.view.status_text.contains("indeterminate"));
+        assert!(update.view.status_text.contains("Mouse a"));
+        assert!(update.view.status_text.contains("Mouse b"));
     }
 
     #[test]

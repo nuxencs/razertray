@@ -49,5 +49,6 @@ Repeated errors are throttled in logs. A later successful poll records recovery.
 
 Forecasting is private application state. It consumes successful, timestamped
 readings only. It resets after charging, large gaps, or implausible upward
-changes. The tray and notification commands receive the current estimate.
-Forecast samples and discharge-rate state remain private to `AppCore`.
+changes. An expired estimate restarts calibration instead of remaining at zero.
+The tray and notification commands receive the current estimate. Forecast
+samples and discharge-rate state remain private to `AppCore`.

@@ -73,13 +73,16 @@ impl Forecaster {
         let seconds_per_raw = span.as_secs_f64() / f64::from(drop);
         let remaining_secs = (seconds_per_raw * f64::from(reading.battery_raw)) as u64;
         let calculated = Duration::from_secs(remaining_secs).min(MAX_ESTIMATE);
-        let remaining = segment.last_estimate.map_or(calculated, |previous| {
-            calculated.min(
-                previous
-                    .remaining
-                    .saturating_sub(now.saturating_duration_since(previous.observed_at)),
-            )
-        });
+        let remaining = if let Some(previous) = segment.last_estimate {
+            let elapsed = now.saturating_duration_since(previous.observed_at);
+            if elapsed >= previous.remaining {
+                *segment = Segment::new(now, reading.battery_raw);
+                return None;
+            }
+            calculated.min(previous.remaining - elapsed)
+        } else {
+            calculated
+        };
         segment.last_estimate = Some(TimedEstimate {
             observed_at: now,
             remaining,
@@ -277,5 +280,30 @@ mod tests {
 
         assert_eq!(reset.remaining, Duration::from_secs(9 * 60 * 60));
         assert!(reset.remaining > first.remaining);
+    }
+
+    #[test]
+    fn review_expired_forecast_resets_before_recalibration() {
+        let now = Instant::now();
+        let mut forecaster = Forecaster::default();
+        forecaster.observe(&reading(200, ChargeState::NotCharging), now);
+        let first_at = now + Duration::from_secs(60 * 60);
+        let first = forecaster
+            .observe(&reading(10, ChargeState::NotCharging), first_at)
+            .expect("first estimate");
+        let expired_at = first_at + first.remaining + Duration::from_secs(1);
+
+        assert_eq!(
+            forecaster.observe(&reading(10, ChargeState::NotCharging), expired_at),
+            None
+        );
+        let recalibrated = forecaster
+            .observe(
+                &reading(5, ChargeState::NotCharging),
+                expired_at + Duration::from_secs(30 * 60),
+            )
+            .expect("recalibrated estimate");
+
+        assert!(recalibrated.remaining > Duration::ZERO);
     }
 }
