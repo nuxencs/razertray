@@ -49,12 +49,19 @@ impl Estimate {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct CalibrationSample {
+    observed_at: Instant,
+    raw: u8,
+}
+
+#[derive(Clone, Debug)]
 struct Segment {
     started_at: Instant,
     started_raw: u8,
     last_at: Instant,
     lowest_raw: u8,
     last_estimate: Option<TimedEstimate>,
+    calibration_samples: Vec<CalibrationSample>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -71,8 +78,57 @@ impl Segment {
             last_at: now,
             lowest_raw: raw,
             last_estimate: None,
+            calibration_samples: vec![CalibrationSample {
+                observed_at: now,
+                raw,
+            }],
         }
     }
+
+    fn remember_calibration_sample(&mut self, now: Instant, raw: u8) {
+        if let Some(sample) = self
+            .calibration_samples
+            .iter_mut()
+            .find(|sample| sample.raw == raw)
+        {
+            sample.observed_at = now;
+        } else {
+            self.calibration_samples.push(CalibrationSample {
+                observed_at: now,
+                raw,
+            });
+        }
+    }
+
+    fn conservative_calibration(
+        &self,
+        now: Instant,
+        raw: u8,
+    ) -> Option<(Duration, CalibrationSample)> {
+        self.calibration_samples
+            .iter()
+            .filter_map(|sample| {
+                calculate_remaining(sample.observed_at, sample.raw, now, raw)
+                    .map(|remaining| (remaining, *sample))
+            })
+            .min_by_key(|(remaining, _)| *remaining)
+    }
+}
+
+fn calculate_remaining(
+    started_at: Instant,
+    started_raw: u8,
+    now: Instant,
+    raw: u8,
+) -> Option<Duration> {
+    let span = now.saturating_duration_since(started_at);
+    let drop = started_raw.saturating_sub(raw);
+    if span < MIN_SAMPLE_SPAN || drop < MIN_RAW_DROP || raw == 0 {
+        return None;
+    }
+
+    let remaining_secs = span.as_secs().saturating_mul(u64::from(raw)) / u64::from(drop);
+    Some(Duration::from_secs(remaining_secs).min(MAX_ESTIMATE))
 }
 
 #[derive(Default)]
@@ -102,21 +158,29 @@ impl Forecaster {
             return None;
         }
 
-        if segment.last_estimate.is_none() && reading.battery_raw == segment.lowest_raw {
-            segment.started_at = now;
-            segment.started_raw = reading.battery_raw;
+        let calibration = if segment.last_estimate.is_none() {
+            segment.conservative_calibration(now, reading.battery_raw)
+        } else {
+            None
+        };
+        if segment.last_estimate.is_none() {
+            segment.remember_calibration_sample(now, reading.battery_raw);
         }
         segment.last_at = now;
         segment.lowest_raw = segment.lowest_raw.min(reading.battery_raw);
-        let span = now.saturating_duration_since(segment.started_at);
-        let drop = segment.started_raw.saturating_sub(reading.battery_raw);
-        if span < MIN_SAMPLE_SPAN || drop < MIN_RAW_DROP || reading.battery_raw == 0 {
-            return None;
-        }
-
-        let seconds_per_raw = span.as_secs_f64() / f64::from(drop);
-        let remaining_secs = (seconds_per_raw * f64::from(reading.battery_raw)) as u64;
-        let calculated = Duration::from_secs(remaining_secs).min(MAX_ESTIMATE);
+        let calculated = if let Some((remaining, sample)) = calibration {
+            segment.started_at = sample.observed_at;
+            segment.started_raw = sample.raw;
+            segment.calibration_samples.clear();
+            remaining
+        } else {
+            calculate_remaining(
+                segment.started_at,
+                segment.started_raw,
+                now,
+                reading.battery_raw,
+            )?
+        };
         let remaining = if let Some(previous) = segment.last_estimate {
             let elapsed = now.saturating_duration_since(previous.observed_at);
             if elapsed >= previous.remaining {
@@ -218,6 +282,32 @@ mod tests {
         assert_eq!(
             estimate.remaining,
             Duration::from_secs(9 * 60 * 60 + 30 * 60)
+        );
+    }
+
+    #[test]
+    fn review_round_20_precalibration_uses_shortest_qualified_window() {
+        let now = Instant::now();
+        let mut forecaster = Forecaster::default();
+        forecaster.observe(&reading(200, ChargeState::NotCharging), now);
+        assert_eq!(
+            forecaster.observe(
+                &reading(198, ChargeState::NotCharging),
+                now + Duration::from_secs(5 * 60 * 60),
+            ),
+            None
+        );
+
+        let estimate = forecaster
+            .observe(
+                &reading(190, ChargeState::NotCharging),
+                now + Duration::from_secs(5 * 60 * 60 + 30 * 60),
+            )
+            .expect("first estimate");
+
+        assert_eq!(
+            estimate.remaining,
+            Duration::from_secs(11 * 60 * 60 + 52 * 60 + 30)
         );
     }
 

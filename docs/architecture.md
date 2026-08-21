@@ -28,14 +28,17 @@ This split keeps the core testable without a Windows tray or physical hardware.
 
 ## HID boundary
 
-The scanner groups candidate HID interfaces for each logical device. The client
-tries candidates in a deterministic order. It tries a cached transaction ID,
-known device metadata, and bounded protocol fallbacks. Failed cached IDs are
-removed. Battery and charging queries aggregate relevant candidate results
-before declaring a state unsupported. Transport and protocol failures can retry
-within a per-device time budget. If the bounded candidate set is truncated,
-unsupported evidence remains partial. The interface that supplied the battery
-reading is tried first for charging status, followed by bounded fallbacks.
+The scanner groups candidate HID interfaces only when a serial number provides
+a physical-device identity. Serialless interfaces remain separate, ambiguous
+devices so probes cannot combine evidence from identical hardware. The client
+tries grouped candidates in a deterministic order. It tries a cached
+transaction ID, known device metadata, and bounded protocol fallbacks. Failed
+cached IDs are removed. Battery and charging queries aggregate relevant
+candidate results before declaring a state unsupported. Transport and protocol
+failures can retry within a per-device time budget. If the bounded candidate
+set is truncated, unsupported evidence remains partial. The interface that
+supplied the battery reading is tried first for charging status, followed by
+bounded fallbacks.
 
 The private transport seam supports retry tests without exposing HID mechanics
 to the rest of the app.
@@ -52,7 +55,8 @@ The tray shows a bounded diagnostic summary. Logs and CLI or JSON output retain
 the complete typed details.
 
 Exact repeated errors are throttled in logs without collapsing distinct probe
-details. A later successful poll records recovery.
+details. A later successful poll records recovery with device or subsystem
+component identity.
 
 ## Forecast
 
@@ -60,7 +64,9 @@ Forecasting is private application state. It consumes successful, timestamped
 readings only. It resets after charging, unavailable polls, large gaps, or
 implausible upward changes. An expired estimate restarts calibration instead
 of remaining at zero. Before initial calibration, a flat reading advances the
-baseline so idle time cannot inflate the first discharge estimate.
+baseline so idle time cannot inflate the first discharge estimate. Small
+pre-calibration drops remain as rolling samples, and the shortest qualified
+window supplies the first estimate.
 Each projected estimate carries its timestamp. The tray refreshes at the next
 forecast or stale-age display boundary and removes an expired estimate between
 hardware polls.

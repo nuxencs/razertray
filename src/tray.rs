@@ -7,7 +7,7 @@ use crate::config::{self, AlertScope, AppConfig, ConfigRecovery, PidCache, ViewM
 use crate::error_tracker::{ErrorNotice, ErrorTracker};
 use crate::hid::client;
 use crate::icon;
-use crate::model::{PollError, PollOutcome, PollResult};
+use crate::model::{PollError, PollOutcome, PollResult, SubsystemComponent};
 use crate::notify::{self, Notifier};
 use anyhow::{Context, Result};
 use hidapi::HidApi;
@@ -465,11 +465,22 @@ fn log_error_notice(notice: ErrorNotice) {
         ErrorNotice::Recovered {
             display_name,
             scope,
+            component,
         } => tracing::info!(
             device = %display_name,
             scope = ?scope,
-            "device polling recovered"
+            component = ?component,
+            "{}",
+            recovery_message(component)
         ),
+    }
+}
+
+fn recovery_message(component: Option<SubsystemComponent>) -> &'static str {
+    match component {
+        Some(SubsystemComponent::Hid) => "HID subsystem recovered",
+        Some(SubsystemComponent::PidCache) => "PID cache recovered",
+        None => "device polling recovered",
     }
 }
 
@@ -684,8 +695,8 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        PidCacheIssue, attach_cache_diagnostic, persist_pid_cache, revalidate_pid_cache_load,
-        welcome_update,
+        PidCacheIssue, attach_cache_diagnostic, persist_pid_cache, recovery_message,
+        revalidate_pid_cache_load, welcome_update,
     };
     use crate::application::AppCore;
     use crate::config::{AppConfig, PidCache};
@@ -799,5 +810,13 @@ mod tests {
         );
         assert_eq!(result.errors[0].kind, PollErrorKind::AccessDenied);
         assert!(dirty);
+    }
+
+    #[test]
+    fn review_round_20_cache_recovery_uses_component_wording() {
+        assert_eq!(
+            recovery_message(Some(SubsystemComponent::PidCache)),
+            "PID cache recovered"
+        );
     }
 }

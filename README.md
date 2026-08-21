@@ -135,6 +135,8 @@ and retained as typed diagnostics in JSON, diagnostic output, and tray status.
 - Forecast history is held in memory and restarts with the app.
 - Multiple identical devices without serial numbers can be difficult to
   distinguish because the HID metadata does not always expose a stable identity.
+  They can appear as separate interface entries. These interfaces remain
+  separate so battery and charge evidence cannot mix across physical devices.
 
 ## Development
 

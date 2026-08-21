@@ -56,6 +56,7 @@ pub enum ErrorNotice {
     Recovered {
         display_name: String,
         scope: PollErrorScope,
+        component: Option<SubsystemComponent>,
     },
 }
 
@@ -126,6 +127,7 @@ impl ErrorTracker {
                     notices.push(ErrorNotice::Recovered {
                         display_name: active.error.display_name,
                         scope: active.error.scope,
+                        component: active.error.component,
                     });
                 }
             }
@@ -291,6 +293,7 @@ mod tests {
             vec![ErrorNotice::Recovered {
                 display_name: "Mouse".to_string(),
                 scope: PollErrorScope::Device,
+                component: None,
             }]
         );
     }
@@ -350,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn review_round_19_subsystem_components_recover_independently() {
+    fn review_round_20_subsystem_components_recover_independently() {
         let now = Instant::now();
         let mut tracker = ErrorTracker::default();
         let hid = PollError::subsystem("HID access denied");
@@ -365,6 +368,7 @@ mod tests {
             vec![ErrorNotice::Recovered {
                 display_name: "PID cache".to_string(),
                 scope: PollErrorScope::Subsystem,
+                component: Some(crate::model::SubsystemComponent::PidCache),
             }]
         );
     }

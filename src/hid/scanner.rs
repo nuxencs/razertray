@@ -1,5 +1,6 @@
 use hidapi::HidApi;
-use std::ffi::CString;
+use std::collections::BTreeMap;
+use std::ffi::{CStr, CString};
 
 pub const RAZER_VID: u16 = 0x1532;
 
@@ -19,33 +20,22 @@ pub struct DiscoveredDevice {
 }
 
 pub fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
-    let mut best_by_key: std::collections::BTreeMap<String, DiscoveredDevice> =
-        std::collections::BTreeMap::new();
+    let mut best_by_key = BTreeMap::new();
 
     for dev in api.device_list().filter(|d| d.vendor_id() == RAZER_VID) {
-        let key = dedupe_key(dev.product_id(), dev.serial_number());
         let candidate = InterfaceCandidate {
             path: dev.path().to_owned(),
             interface_number: dev.interface_number(),
             priority_score: candidate_score(dev.interface_number(), dev.usage_page(), dev.usage()),
         };
-
-        let discovered = DiscoveredDevice {
-            key: key.clone(),
-            pid: dev.product_id(),
-            product_name: non_empty_text(dev.product_string())
+        add_interface(
+            &mut best_by_key,
+            dev.product_id(),
+            dev.serial_number(),
+            non_empty_text(dev.product_string())
                 .unwrap_or_else(|| format!("Razer Device {:04X}", dev.product_id())),
-            candidates: vec![candidate],
-        };
-
-        match best_by_key.entry(key) {
-            std::collections::btree_map::Entry::Occupied(mut e) => {
-                e.get_mut().candidates.extend(discovered.candidates);
-            }
-            std::collections::btree_map::Entry::Vacant(e) => {
-                e.insert(discovered);
-            }
-        }
+            candidate,
+        );
     }
 
     let mut out: Vec<DiscoveredDevice> = best_by_key
@@ -64,6 +54,29 @@ pub fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
     out
 }
 
+fn add_interface(
+    devices: &mut BTreeMap<String, DiscoveredDevice>,
+    pid: u16,
+    serial_number: Option<&str>,
+    product_name: String,
+    candidate: InterfaceCandidate,
+) {
+    let key = device_key(pid, serial_number, candidate.path.as_c_str());
+    match devices.entry(key.clone()) {
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            entry.get_mut().candidates.push(candidate);
+        }
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(DiscoveredDevice {
+                key,
+                pid,
+                product_name,
+                candidates: vec![candidate],
+            });
+        }
+    }
+}
+
 fn non_empty_text(value: Option<&str>) -> Option<String> {
     value.and_then(|s| {
         let trimmed = s.trim();
@@ -75,11 +88,17 @@ fn non_empty_text(value: Option<&str>) -> Option<String> {
     })
 }
 
-fn dedupe_key(pid: u16, serial_number: Option<&str>) -> String {
+fn device_key(pid: u16, serial_number: Option<&str>, path: &CStr) -> String {
     if let Some(serial) = non_empty_text(serial_number) {
         format!("{pid:04X}:{serial}")
     } else {
-        format!("{pid:04X}")
+        let mut key = format!("{pid:04X}:path:");
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        for byte in path.to_bytes() {
+            key.push(char::from(HEX[usize::from(byte >> 4)]));
+            key.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+        key
     }
 }
 
@@ -95,7 +114,17 @@ fn candidate_score(interface_number: i32, usage_page: u16, usage: u16) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{candidate_score, dedupe_key, non_empty_text};
+    use super::{InterfaceCandidate, add_interface, candidate_score, device_key, non_empty_text};
+    use std::collections::BTreeMap;
+    use std::ffi::CString;
+
+    fn candidate(path: &str, interface_number: i32) -> InterfaceCandidate {
+        InterfaceCandidate {
+            path: CString::new(path).expect("path"),
+            interface_number,
+            priority_score: 0,
+        }
+    }
 
     #[test]
     fn interface_priority_is_ordered() {
@@ -104,10 +133,62 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_key_uses_serial_when_available() {
-        assert_eq!(dedupe_key(0x00BF, Some("ABC123")), "00BF:ABC123");
-        assert_eq!(dedupe_key(0x00BF, Some("   ")), "00BF");
-        assert_eq!(dedupe_key(0x00BF, None), "00BF");
+    fn device_key_uses_serial_when_available() {
+        let first = CString::new("physical-a-interface-0").expect("path");
+        let second = CString::new("physical-a-interface-1").expect("path");
+
+        assert_eq!(
+            device_key(0x00BF, Some("ABC123"), first.as_c_str()),
+            "00BF:ABC123"
+        );
+        assert_eq!(
+            device_key(0x00BF, Some("ABC123"), second.as_c_str()),
+            "00BF:ABC123"
+        );
+    }
+
+    #[test]
+    fn review_round_20_serialless_paths_are_not_grouped_as_one_device() {
+        let mut devices = BTreeMap::new();
+        add_interface(
+            &mut devices,
+            0x00BF,
+            None,
+            "Mouse".to_string(),
+            candidate("physical-a-interface-0", 0),
+        );
+        add_interface(
+            &mut devices,
+            0x00BF,
+            None,
+            "Mouse".to_string(),
+            candidate("physical-b-interface-0", 0),
+        );
+
+        assert_eq!(devices.len(), 2);
+        assert!(devices.values().all(|device| device.candidates.len() == 1));
+    }
+
+    #[test]
+    fn serialized_interfaces_remain_grouped_for_fallback() {
+        let mut devices = BTreeMap::new();
+        add_interface(
+            &mut devices,
+            0x00BF,
+            Some("ABC123"),
+            "Mouse".to_string(),
+            candidate("physical-a-interface-0", 0),
+        );
+        add_interface(
+            &mut devices,
+            0x00BF,
+            Some("ABC123"),
+            "Mouse".to_string(),
+            candidate("physical-a-interface-1", 1),
+        );
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices.values().next().expect("device").candidates.len(), 2);
     }
 
     #[test]
