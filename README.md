@@ -72,7 +72,9 @@ alert_scope = "selected"        # "selected" or "all"
 welcome_shown = true
 ```
 
-Unsafe numeric values are clamped to supported limits. If the file cannot be
+Unsafe numeric values are clamped to supported limits. The adjusted values stay
+active for the current run if the normalized file cannot be saved, and the
+recovery notification points to `config.toml` for review. If the file cannot be
 parsed, razertray preserves it as `config.invalid.<time>.<pid>.toml` and creates
 a valid default file.
 

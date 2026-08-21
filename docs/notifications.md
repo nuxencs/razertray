@@ -23,7 +23,9 @@ its own cooldown.
 The first run explains how to open the tray menu. A valid configuration with
 unsafe values shows **Configuration was adjusted**. An invalid file that was
 preserved and replaced shows **Configuration was reset**. Settings failures
-show a short action message. Detailed errors remain in the log file.
+show a short action message. Adjustment notifications point to `config.toml`
+because some adjusted values are not available in Preferences. Detailed errors
+remain in the log file.
 
 ## Sender identity
 

@@ -37,6 +37,9 @@ charging queries aggregate relevant candidate results before declaring a state
 unsupported.
 Transport and protocol failures can retry within a per-device time budget. If
 the bounded candidate set is truncated, unsupported evidence remains partial.
+Each blocking feature exchange runs behind a timeout boundary. Timed-out native
+operations are isolated from the polling worker, and a global cap prevents
+stalled driver calls from creating unbounded worker threads.
 Verified devices try the battery-winning interface first for charging status,
 then bounded fallbacks. Ambiguous serialless groups retain probe results only as
 typed diagnostics, never as a definitive device reading. Excluded charge

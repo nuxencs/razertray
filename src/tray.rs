@@ -261,10 +261,7 @@ pub fn run_tray_app(config: AppConfig, startup_recovery: Option<ConfigRecovery>)
     let mut error_tracker = ErrorTracker::default();
 
     if let Some(recovery) = startup_recovery {
-        tracing::warn!(
-            "configuration recovery: {}",
-            recovery.diagnostic_message()
-        );
+        tracing::warn!("configuration recovery: {}", recovery.diagnostic_message());
         let _ = notify::show_error(recovery.title(), recovery.notification_message());
     }
 

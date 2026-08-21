@@ -11,14 +11,20 @@ use crate::model::{
 };
 use anyhow::{Context, Result};
 use hidapi::{HidApi, HidDevice};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_CANDIDATES_PER_DEVICE: usize = 4;
 const MAX_RETRIES: usize = 5;
 const DEVICE_POLL_BUDGET: Duration = Duration::from_secs(8);
+const FEATURE_IO_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_BLOCKED_FEATURE_OPERATIONS: usize = MAX_CANDIDATES_PER_DEVICE;
 const SEND_DELAY: Duration = Duration::from_millis(60);
 const RETRY_DELAY: Duration = Duration::from_millis(400);
+
+static ACTIVE_FEATURE_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
 
 pub struct PollBatch {
     pub result: PollResult,
@@ -139,7 +145,7 @@ fn query_device(
         .map(anyhow::Error::msg)
         .collect();
     let overall_deadline = Instant::now() + DEVICE_POLL_BUDGET;
-    let mut opened = Vec::new();
+    let mut transports = Vec::new();
     for candidate in candidates {
         if Instant::now() >= overall_deadline {
             failures.push(anyhow::anyhow!(
@@ -148,7 +154,13 @@ fn query_device(
             break;
         }
         match api.open_path(candidate.path.as_c_str()) {
-            Ok(handle) => opened.push((candidate.interface_number, handle)),
+            Ok(handle) => match HidTransport::new(handle) {
+                Ok(transport) => transports.push((candidate.interface_number, transport)),
+                Err(err) => failures.push(anyhow::anyhow!(
+                    "interface {} transport unavailable: {err:#}",
+                    candidate.interface_number
+                )),
+            },
             Err(err) => failures.push(anyhow::anyhow!(
                 "interface {} could not be opened: {err}",
                 candidate.interface_number
@@ -156,7 +168,7 @@ fn query_device(
         }
     }
 
-    if opened.is_empty() {
+    if transports.is_empty() {
         if pid_cache.get(device.pid).is_some() {
             *cache_changed |= pid_cache.remove(device.pid);
         }
@@ -165,10 +177,6 @@ fn query_device(
 
     let cached = pid_cache.get(device.pid);
     let transaction_ids = battery_transaction_ids(cached, known);
-    let mut transports: Vec<_> = opened
-        .iter()
-        .map(|(interface_number, handle)| (*interface_number, HidTransport(handle)))
-        .collect();
     let battery_probe = probe_request_with(
         &transports,
         &transaction_ids,
@@ -197,23 +205,24 @@ fn query_device(
         update_cache_after_success(pid_cache, device.pid, cached, generated, transaction_id);
     let battery_raw = battery_report.arguments[1];
     let battery_percent = scale_percent(battery_raw);
-    let (charge_state, warnings) = if known.is_some_and(|support| !support.supports_charging_status)
-    {
-        (ChargeState::Unsupported, Vec::new())
-    } else {
-        prioritize_probe_candidate(&mut transports, candidate_index);
-        let charge_plan = charge_probe_plan(&transports, device.interface_grouping);
-        let charge_probe = probe_request_with(
-            charge_plan.candidates,
-            &[transaction_id],
-            build_charging_request,
-            response_wait(device.pid),
-            overall_deadline,
-        )
-        .map_err(|failure| mark_unsupported_incomplete(failure, charge_plan.omitted))
-        .map_err(|failure| merge_query_failure(failure, failures));
-        charge_query_result(device, charge_probe)
-    };
+    let mut warnings = device_transport_warnings(device, failures);
+    let (charge_state, charge_warnings) =
+        if known.is_some_and(|support| !support.supports_charging_status) {
+            (ChargeState::Unsupported, Vec::new())
+        } else {
+            prioritize_probe_candidate(&mut transports, candidate_index);
+            let charge_plan = charge_probe_plan(&transports, device.interface_grouping);
+            let charge_probe = probe_request_with(
+                charge_plan.candidates,
+                &[transaction_id],
+                build_charging_request,
+                response_wait(device.pid),
+                overall_deadline,
+            )
+            .map_err(|failure| mark_unsupported_incomplete(failure, charge_plan.omitted));
+            charge_query_result(device, charge_probe)
+        };
+    warnings.extend(charge_warnings);
 
     Ok((
         BatteryState {
@@ -227,6 +236,16 @@ fn query_device(
         },
         warnings,
     ))
+}
+
+fn device_transport_warnings(
+    device: &DiscoveredDevice,
+    failures: Vec<anyhow::Error>,
+) -> Vec<PollError> {
+    failures
+        .into_iter()
+        .map(|error| poll_error(device, error))
+        .collect()
 }
 
 fn no_open_transport_failure(mut failures: Vec<anyhow::Error>) -> QueryFailure {
@@ -412,19 +431,25 @@ fn probe_request_with<T: FeatureTransport, F: Fn(u8) -> RazerReport>(
                 }
 
                 let request = build_request(transaction_id);
-                states[target_index] =
-                    match attempt_request_with(transport, &request, response_wait) {
-                        RequestAttempt::Success(report) => {
-                            return Ok(ProbeSuccess {
-                                candidate_index,
-                                transaction_id,
-                                report,
-                            });
-                        }
-                        RequestAttempt::Retry(err) => ProbeState::Retry(err),
-                        RequestAttempt::Failed(err) => ProbeState::Failed(err),
-                        RequestAttempt::Unsupported => ProbeState::Unsupported,
-                    };
+                let operation_timeout =
+                    FEATURE_IO_TIMEOUT.min(deadline.saturating_duration_since(now));
+                states[target_index] = match attempt_request_with(
+                    transport,
+                    &request,
+                    response_wait,
+                    operation_timeout,
+                ) {
+                    RequestAttempt::Success(report) => {
+                        return Ok(ProbeSuccess {
+                            candidate_index,
+                            transaction_id,
+                            report,
+                        });
+                    }
+                    RequestAttempt::Retry(err) => ProbeState::Retry(err),
+                    RequestAttempt::Failed(err) => ProbeState::Failed(err),
+                    RequestAttempt::Unsupported => ProbeState::Unsupported,
+                };
             }
         }
 
@@ -504,27 +529,137 @@ trait FeatureTransport {
         request: &[u8],
         response: &mut [u8],
         response_wait: Duration,
+        operation_timeout: Duration,
     ) -> Result<usize>;
 
     fn pause(&self, duration: Duration);
 }
 
-struct HidTransport<'a>(&'a HidDevice);
+trait BlockingFeatureDevice: Send + 'static {
+    fn exchange_blocking(
+        &self,
+        request: &[u8],
+        response: &mut [u8],
+        response_wait: Duration,
+    ) -> Result<usize>;
+}
 
-impl FeatureTransport for HidTransport<'_> {
-    fn exchange(
+impl BlockingFeatureDevice for HidDevice {
+    fn exchange_blocking(
         &self,
         request: &[u8],
         response: &mut [u8],
         response_wait: Duration,
     ) -> Result<usize> {
-        self.0
-            .send_feature_report(request)
+        self.send_feature_report(request)
             .context("send_feature_report failed")?;
         thread::sleep(response_wait);
-        self.0
-            .get_feature_report(response)
+        self.get_feature_report(response)
             .context("get_feature_report failed")
+    }
+}
+
+struct FeatureCommand {
+    request: Vec<u8>,
+    response: Vec<u8>,
+    response_wait: Duration,
+    reply: mpsc::Sender<Result<(usize, Vec<u8>)>>,
+}
+
+struct FeatureOperationPermit;
+
+impl FeatureOperationPermit {
+    fn acquire() -> Option<Self> {
+        ACTIVE_FEATURE_OPERATIONS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_BLOCKED_FEATURE_OPERATIONS).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for FeatureOperationPermit {
+    fn drop(&mut self) {
+        ACTIVE_FEATURE_OPERATIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct HidTransport {
+    commands: mpsc::Sender<FeatureCommand>,
+    timed_out: AtomicBool,
+}
+
+impl HidTransport {
+    fn new<D: BlockingFeatureDevice>(device: D) -> Result<Self> {
+        let (commands, receiver) = mpsc::channel::<FeatureCommand>();
+        thread::Builder::new()
+            .name("razertray-hid-feature".to_string())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    let result = match FeatureOperationPermit::acquire() {
+                        Some(_permit) => {
+                            let mut response = command.response;
+                            device
+                                .exchange_blocking(
+                                    &command.request,
+                                    &mut response,
+                                    command.response_wait,
+                                )
+                                .map(|count| (count, response))
+                        }
+                        None => Err(anyhow::anyhow!(
+                            "HID feature operation unavailable because earlier operations remain blocked"
+                        )),
+                    };
+                    let _ = command.reply.send(result);
+                }
+            })
+            .context("failed spawning HID feature worker")?;
+        Ok(Self {
+            commands,
+            timed_out: AtomicBool::new(false),
+        })
+    }
+}
+
+impl FeatureTransport for HidTransport {
+    fn exchange(
+        &self,
+        request: &[u8],
+        response: &mut [u8],
+        response_wait: Duration,
+        operation_timeout: Duration,
+    ) -> Result<usize> {
+        if self.timed_out.load(Ordering::Acquire) {
+            anyhow::bail!("HID feature transport unavailable after a timed-out operation");
+        }
+        let (reply, receiver) = mpsc::channel();
+        self.commands
+            .send(FeatureCommand {
+                request: request.to_vec(),
+                response: response.to_vec(),
+                response_wait,
+                reply,
+            })
+            .context("HID feature worker unavailable")?;
+        match receiver.recv_timeout(operation_timeout) {
+            Ok(result) => {
+                let (count, received) = result?;
+                response.copy_from_slice(&received);
+                Ok(count)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.timed_out.store(true, Ordering::Release);
+                anyhow::bail!(
+                    "HID feature operation unavailable after timing out at {} ms",
+                    operation_timeout.as_millis()
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("HID feature worker unavailable")
+            }
+        }
     }
 
     fn pause(&self, duration: Duration) {
@@ -543,11 +678,17 @@ fn attempt_request_with<T: FeatureTransport>(
     transport: &T,
     request: &RazerReport,
     response_wait: Duration,
+    operation_timeout: Duration,
 ) -> RequestAttempt {
     let request_payload = feature_report_payload(request);
     let mut response_buffer = [0u8; FEATURE_REPORT_LENGTH];
     response_buffer[0] = 0x00;
-    let count = match transport.exchange(&request_payload, &mut response_buffer, response_wait) {
+    let count = match transport.exchange(
+        &request_payload,
+        &mut response_buffer,
+        response_wait,
+        operation_timeout,
+    ) {
         Ok(count) => count,
         Err(err) => return RequestAttempt::Retry(err),
     };
@@ -648,11 +789,11 @@ fn scale_percent(raw: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence, candidate_probe_plan,
-        charge_probe_plan, charge_query_result, display_name, format_error_chain,
-        mark_unsupported_incomplete, merge_query_failure, no_open_transport_failure,
-        prioritize_probe_candidate, probe_request_with, record_query_result, scale_percent,
-        update_cache_after_success,
+        BlockingFeatureDevice, FeatureTransport, HidTransport, MAX_RETRIES, QueryFailure,
+        UnsupportedEvidence, candidate_probe_plan, charge_probe_plan, charge_query_result,
+        device_transport_warnings, display_name, format_error_chain, mark_unsupported_incomplete,
+        merge_query_failure, no_open_transport_failure, prioritize_probe_candidate,
+        probe_request_with, record_query_result, scale_percent, update_cache_after_success,
     };
     use crate::config::PidCache;
     use crate::hid::protocol::{
@@ -687,6 +828,7 @@ mod tests {
             _request: &[u8],
             response: &mut [u8],
             _response_wait: Duration,
+            _operation_timeout: Duration,
         ) -> Result<usize> {
             self.attempts.set(self.attempts.get() + 1);
             let Some(reply) = self.replies.borrow_mut().pop_front() else {
@@ -712,6 +854,7 @@ mod tests {
             request: &[u8],
             response: &mut [u8],
             _response_wait: Duration,
+            _operation_timeout: Duration,
         ) -> Result<usize> {
             let transaction_id = request[2];
             self.attempts
@@ -728,6 +871,20 @@ mod tests {
         }
 
         fn pause(&self, _duration: Duration) {}
+    }
+
+    struct SlowFeatureDevice;
+
+    impl BlockingFeatureDevice for SlowFeatureDevice {
+        fn exchange_blocking(
+            &self,
+            _request: &[u8],
+            response: &mut [u8],
+            _response_wait: Duration,
+        ) -> Result<usize> {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(response.len())
+        }
     }
 
     fn feature_response_with_status(transaction_id: u8, battery_raw: u8, status: u8) -> Vec<u8> {
@@ -810,6 +967,54 @@ mod tests {
 
         assert_eq!(success.report.arguments[1], 200);
         assert_eq!(candidates[0].1.attempts.get(), 2);
+    }
+
+    #[test]
+    fn review_round_24_hid_feature_operation_is_time_bounded() {
+        let transport = HidTransport::new(SlowFeatureDevice).expect("start feature worker");
+        let mut response = [0; FEATURE_REPORT_LENGTH];
+        let started = Instant::now();
+
+        let error = transport
+            .exchange(
+                &[0; FEATURE_REPORT_LENGTH],
+                &mut response,
+                Duration::ZERO,
+                Duration::from_millis(20),
+            )
+            .expect_err("slow feature operation should time out");
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(format!("{error:#}").contains("timing out"));
+    }
+
+    #[test]
+    fn review_round_24_battery_transport_failures_keep_device_scope() {
+        let device = DiscoveredDevice {
+            key: "mouse".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::VerifiedDevice,
+            candidates: Vec::new(),
+        };
+        let mut warnings = device_transport_warnings(
+            &device,
+            vec![anyhow::anyhow!(
+                "interface 1 could not be opened: access denied"
+            )],
+        );
+        let (_, charge_warnings) = charge_query_result(
+            &device,
+            Err(QueryFailure::Failed {
+                errors: vec![anyhow::anyhow!("charging response timed out")],
+            }),
+        );
+        warnings.extend(charge_warnings);
+
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].scope, PollErrorScope::Device);
+        assert_eq!(warnings[0].kind, PollErrorKind::AccessDenied);
+        assert_eq!(warnings[1].scope, PollErrorScope::ChargeState);
     }
 
     #[test]

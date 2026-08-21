@@ -164,14 +164,16 @@ pub enum ConfigRecovery {
         backup_path: PathBuf,
         parse_error: String,
     },
-    ValuesAdjusted,
+    ValuesAdjusted {
+        persistence_error: Option<String>,
+    },
 }
 
 impl ConfigRecovery {
     pub fn title(&self) -> &'static str {
         match self {
             Self::InvalidFileReset { .. } => "Configuration was reset",
-            Self::ValuesAdjusted => "Configuration was adjusted",
+            Self::ValuesAdjusted { .. } => "Configuration was adjusted",
         }
     }
 
@@ -184,9 +186,14 @@ impl ConfigRecovery {
                 "The configuration was invalid and was reset. The old file is {}. Parse error: {parse_error}",
                 backup_path.display()
             ),
-            Self::ValuesAdjusted => {
-                "Unsafe configuration values were adjusted to supported limits.".to_string()
-            }
+            Self::ValuesAdjusted {
+                persistence_error: Some(error),
+            } => format!(
+                "Unsafe configuration values were adjusted for this run but could not be saved: {error}"
+            ),
+            Self::ValuesAdjusted {
+                persistence_error: None,
+            } => "Unsafe configuration values were adjusted to supported limits.".to_string(),
         }
     }
 
@@ -195,9 +202,14 @@ impl ConfigRecovery {
             Self::InvalidFileReset { .. } => {
                 "Defaults were restored. Open Preferences to review them."
             }
-            Self::ValuesAdjusted => {
-                "Safe limits were applied. Open Preferences to review them."
+            Self::ValuesAdjusted {
+                persistence_error: Some(_),
+            } => {
+                "Safe limits were applied for this run but could not be saved. Review config.toml."
             }
+            Self::ValuesAdjusted {
+                persistence_error: None,
+            } => "Safe limits were applied. Review config.toml in the app folder.",
         }
     }
 }
@@ -348,8 +360,10 @@ fn load_or_create_config_at(path: &Path) -> Result<ConfigLoad> {
     let before = parsed.clone();
     parsed.validate();
     let recovery = if parsed != before {
-        save_config_at(path, &parsed)?;
-        Some(ConfigRecovery::ValuesAdjusted)
+        let persistence_error = save_config_at(path, &parsed)
+            .err()
+            .map(|error| format!("{error:#}"));
+        Some(ConfigRecovery::ValuesAdjusted { persistence_error })
     } else {
         None
     };
@@ -576,7 +590,7 @@ welcome_shown = true
                     "Defaults were restored. Open Preferences to review them."
                 );
             }
-            ConfigRecovery::ValuesAdjusted => panic!("expected invalid-file reset"),
+            ConfigRecovery::ValuesAdjusted { .. } => panic!("expected invalid-file reset"),
         }
         let parsed: AppConfig =
             toml::from_str(&fs::read_to_string(&path).expect("read replacement config"))
@@ -600,7 +614,7 @@ welcome_shown = true
     }
 
     #[test]
-    fn review_round_23_config_recovery_adjusts_values_without_reset() {
+    fn review_round_24_config_recovery_adjusts_values_without_reset() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let path = temp.path().join("config.toml");
         let config = AppConfig {
@@ -621,7 +635,12 @@ welcome_shown = true
 
         let loaded = load_or_create_config_at(&path).expect("adjust config");
 
-        assert_eq!(loaded.recovery, Some(ConfigRecovery::ValuesAdjusted));
+        assert_eq!(
+            loaded.recovery,
+            Some(ConfigRecovery::ValuesAdjusted {
+                persistence_error: None
+            })
+        );
         assert_eq!(
             loaded.recovery.as_ref().map(ConfigRecovery::title),
             Some("Configuration was adjusted")
@@ -638,7 +657,7 @@ welcome_shown = true
                 .recovery
                 .as_ref()
                 .map(ConfigRecovery::notification_message),
-            Some("Safe limits were applied. Open Preferences to review them.")
+            Some("Safe limits were applied. Review config.toml in the app folder.")
         );
         assert_eq!(loaded.config.poll_interval_seconds, 5);
         assert_eq!(loaded.config.low_battery_threshold, 25);
@@ -652,6 +671,47 @@ welcome_shown = true
             toml::from_str(&fs::read_to_string(&path).expect("read adjusted config"))
                 .expect("parse adjusted config");
         assert_eq!(persisted, loaded.config);
+    }
+
+    #[test]
+    fn review_round_24_config_adjustment_survives_persistence_failure() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("config.toml");
+        let config = AppConfig {
+            poll_interval_seconds: 1,
+            ..AppConfig::default()
+        };
+        fs::write(
+            &path,
+            toml::to_string_pretty(&config).expect("serialize config"),
+        )
+        .expect("write config");
+        fs::create_dir(
+            temp.path()
+                .join(format!(".config.toml.{}.tmp", std::process::id())),
+        )
+        .expect("block atomic replacement");
+
+        let loaded = load_or_create_config_at(&path).expect("return usable adjusted config");
+
+        assert_eq!(loaded.config.poll_interval_seconds, 5);
+        let recovery = loaded.recovery.expect("adjustment recovery");
+        let ConfigRecovery::ValuesAdjusted {
+            persistence_error: Some(error),
+        } = &recovery
+        else {
+            panic!("expected persistence warning")
+        };
+        assert!(error.contains("failed creating"));
+        assert!(recovery.diagnostic_message().contains(error));
+        assert_eq!(
+            recovery.notification_message(),
+            "Safe limits were applied for this run but could not be saved. Review config.toml."
+        );
+        let persisted: AppConfig =
+            toml::from_str(&fs::read_to_string(path).expect("read original config"))
+                .expect("parse original config");
+        assert_eq!(persisted.poll_interval_seconds, 1);
     }
 
     #[test]
