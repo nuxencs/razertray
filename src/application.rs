@@ -50,7 +50,7 @@ pub struct DeviceChoiceView {
 pub struct TrayView {
     pub polling: PollActivity,
     pub observation: ObservationView,
-    pub diagnostic: Option<PollError>,
+    pub diagnostics: Vec<PollError>,
     pub status_text: String,
     pub tooltip: String,
     pub icon: TrayIconState,
@@ -312,7 +312,11 @@ impl AppCore {
 
     fn project(&self, now: Instant) -> TrayView {
         let displayed = self.displayed_reading();
-        let diagnostic = self.projected_diagnostic(displayed).cloned();
+        let diagnostics: Vec<_> = self
+            .projected_diagnostics(displayed)
+            .into_iter()
+            .cloned()
+            .collect();
         let observation = if let Some(tracked) = displayed {
             if self.available.contains(&tracked.reading.device_key) {
                 ObservationView::Fresh {
@@ -326,11 +330,15 @@ impl AppCore {
             }
         } else if !self.has_polled {
             ObservationView::NeverObserved
-        } else if let Some(error) = &diagnostic {
+        } else if let Some(error) = diagnostics.first() {
             ObservationView::Failed {
                 scope: error.scope,
-                kind: error.kind,
-                message: error.message.clone(),
+                kind: if diagnostics.len() == 1 {
+                    error.kind
+                } else {
+                    crate::model::PollErrorKind::Unknown
+                },
+                message: diagnostic_summary(&diagnostics).unwrap_or_else(|| error.message.clone()),
             }
         } else {
             ObservationView::NoDevice
@@ -341,12 +349,12 @@ impl AppCore {
             _ => None,
         };
         let (status_text, tooltip, icon) =
-            presentation(&observation, self.polling, forecast, diagnostic.as_ref());
+            presentation(&observation, self.polling, forecast, &diagnostics);
         let devices = self.device_choices();
         TrayView {
             polling: self.polling,
             observation,
-            diagnostic,
+            diagnostics,
             status_text,
             tooltip,
             icon,
@@ -372,26 +380,30 @@ impl AppCore {
             })
     }
 
-    fn projected_diagnostic(&self, displayed: Option<&TrackedReading>) -> Option<&PollError> {
-        if !self.config.selected_device_id.is_empty()
-            && let Some(error) = self
+    fn projected_diagnostics(&self, displayed: Option<&TrackedReading>) -> Vec<&PollError> {
+        if !self.config.selected_device_id.is_empty() {
+            let errors: Vec<_> = self
                 .last_errors
                 .iter()
-                .find(|error| error.device_key == self.config.selected_device_id)
-        {
-            return Some(error);
+                .filter(|error| error.device_key == self.config.selected_device_id)
+                .collect();
+            if !errors.is_empty() {
+                return errors;
+            }
         }
 
-        if let Some(displayed) = displayed
-            && let Some(error) = self
+        if let Some(displayed) = displayed {
+            let errors: Vec<_> = self
                 .last_errors
                 .iter()
-                .find(|error| error.device_key == displayed.reading.device_key)
-        {
-            return Some(error);
+                .filter(|error| error.device_key == displayed.reading.device_key)
+                .collect();
+            if !errors.is_empty() {
+                return errors;
+            }
         }
 
-        self.last_errors.first()
+        self.last_errors.iter().collect()
     }
 
     fn available_display_id(&self) -> Option<&str> {
@@ -450,7 +462,7 @@ fn presentation(
     observation: &ObservationView,
     polling: PollActivity,
     forecast: Option<Estimate>,
-    diagnostic: Option<&PollError>,
+    diagnostics: &[PollError],
 ) -> (String, String, TrayIconState) {
     match observation {
         ObservationView::NeverObserved => {
@@ -468,7 +480,7 @@ fn presentation(
                 text.push_str(" - ");
                 text.push_str(&format_estimate(estimate));
             }
-            append_diagnostic(&mut text, diagnostic);
+            append_diagnostics(&mut text, diagnostics);
             let status = if polling == PollActivity::Checking {
                 format!("{text} - refreshing...")
             } else {
@@ -491,7 +503,7 @@ fn presentation(
                 charge_suffix(reading.charge_state),
                 format_age(*age)
             );
-            append_diagnostic(&mut text, diagnostic);
+            append_diagnostics(&mut text, diagnostics);
             (text.clone(), text, TrayIconState::Stale)
         }
         ObservationView::NoDevice => {
@@ -499,18 +511,43 @@ fn presentation(
             (text.clone(), text, TrayIconState::Unknown)
         }
         ObservationView::Failed { scope, kind, .. } => {
-            let text = poll_error_status(*scope, *kind).to_string();
+            let text = diagnostic_summary(diagnostics)
+                .unwrap_or_else(|| poll_error_status(*scope, *kind).to_string());
             (text.clone(), text, TrayIconState::Unknown)
         }
     }
 }
 
-fn append_diagnostic(text: &mut String, diagnostic: Option<&PollError>) {
-    if let Some(error) = diagnostic {
-        text.push_str(" - ");
-        text.push_str(&error.display_name);
-        text.push_str(": ");
-        text.push_str(poll_error_status(error.scope, error.kind));
+fn append_diagnostics(text: &mut String, diagnostics: &[PollError]) {
+    match diagnostics {
+        [] => {}
+        [error] => {
+            text.push_str(" - ");
+            text.push_str(&error.display_name);
+            text.push_str(": ");
+            text.push_str(poll_error_status(error.scope, error.kind));
+        }
+        _ => {
+            if let Some(summary) = diagnostic_summary(diagnostics) {
+                text.push_str(" - ");
+                text.push_str(&summary);
+            }
+        }
+    }
+}
+
+fn diagnostic_summary(diagnostics: &[PollError]) -> Option<String> {
+    match diagnostics {
+        [] => None,
+        [error] => Some(poll_error_status(error.scope, error.kind).to_string()),
+        errors => Some(format!(
+            "Hardware state indeterminate - {}",
+            errors
+                .iter()
+                .map(|error| format!("{}: {}", error.display_name, error.message))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )),
     }
 }
 
@@ -897,7 +934,7 @@ mod tests {
             matches!(update.view.observation, ObservationView::Stale { reading, .. } if reading.device_key == "mouse")
         );
         assert_eq!(
-            update.view.diagnostic.as_ref().map(|error| error.kind),
+            update.view.diagnostics.first().map(|error| error.kind),
             Some(PollErrorKind::Unsupported)
         );
         assert!(
@@ -946,8 +983,8 @@ mod tests {
         assert_eq!(
             update
                 .view
-                .diagnostic
-                .as_ref()
+                .diagnostics
+                .first()
                 .map(|error| error.device_key.as_str()),
             Some("preferred")
         );
@@ -988,9 +1025,55 @@ mod tests {
             "Battery reporting is unsupported by this device"
         );
         assert_eq!(
-            update.view.diagnostic.as_ref().map(|error| error.kind),
+            update.view.diagnostics.first().map(|error| error.kind),
             Some(PollErrorKind::Unsupported)
         );
+    }
+
+    #[test]
+    fn review_mixed_device_evidence_remains_indeterminate_and_visible() {
+        let now = Instant::now();
+        let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
+        let mut unsupported = unsupported_error("mouse");
+        unsupported.message = "one or more battery probes reported unsupported status".to_string();
+
+        let update = core.handle(
+            AppEvent::PollFinished(
+                first,
+                Ok(PollResult {
+                    devices: Vec::new(),
+                    errors: vec![
+                        unsupported,
+                        PollError {
+                            device_key: "mouse".to_string(),
+                            display_name: "Mouse mouse".to_string(),
+                            pid: 1,
+                            scope: PollErrorScope::Device,
+                            kind: PollErrorKind::AccessDenied,
+                            message: "interface access denied".to_string(),
+                        },
+                    ],
+                }),
+            ),
+            now,
+        );
+
+        assert!(matches!(
+            update.view.observation,
+            ObservationView::Failed {
+                kind: PollErrorKind::Unknown,
+                ..
+            }
+        ));
+        assert_eq!(update.view.diagnostics.len(), 2);
+        assert!(
+            update
+                .view
+                .status_text
+                .contains("Hardware state indeterminate")
+        );
+        assert!(update.view.status_text.contains("unsupported status"));
+        assert!(update.view.status_text.contains("access denied"));
     }
 
     #[test]

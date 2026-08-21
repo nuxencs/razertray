@@ -1,5 +1,6 @@
 use crate::config::{self, AppConfig};
 use crate::hid::client;
+use crate::model::{PollError, PollResult};
 use anyhow::{Context, Result};
 use hidapi::HidApi;
 use std::fs::{self, OpenOptions};
@@ -34,9 +35,11 @@ pub fn run_once(output: OnceOutput) -> Result<OnceStatus> {
     }
 
     let mut cache = config::load_or_create_pid_cache()?;
-    let api = HidApi::new().context("failed to initialize hidapi")?;
-
-    let batch = client::poll_devices(&api, &mut cache);
+    let batch = poll_batch_or_diagnostic(
+        HidApi::new()
+            .context("failed to initialize hidapi")
+            .map(|api| client::poll_devices(&api, &mut cache)),
+    );
     if batch.cache_changed {
         config::save_pid_cache(&cache)?;
     }
@@ -96,6 +99,16 @@ fn once_status(result: &crate::model::PollResult) -> OnceStatus {
     } else {
         OnceStatus::Success
     }
+}
+
+fn poll_batch_or_diagnostic(result: Result<client::PollBatch>) -> client::PollBatch {
+    result.unwrap_or_else(|error| client::PollBatch {
+        result: PollResult {
+            devices: Vec::new(),
+            errors: vec![PollError::subsystem(format!("{error:#}"))],
+        },
+        cache_changed: false,
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -242,7 +255,7 @@ fn rotated_log_path(base_path: &Path, index: usize) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OnceStatus, once_status};
+    use super::{OnceStatus, once_status, poll_batch_or_diagnostic};
     use crate::model::{PollError, PollErrorKind, PollErrorScope, PollResult};
 
     #[test]
@@ -261,5 +274,19 @@ mod tests {
 
         assert_eq!(once_status(&result), OnceStatus::PartialFailure);
         assert_eq!(once_status(&PollResult::default()), OnceStatus::NoDevice);
+    }
+
+    #[test]
+    fn review_hid_initialization_failure_has_typed_json_result() {
+        let batch = poll_batch_or_diagnostic(Err(anyhow::anyhow!(
+            "failed to initialize hidapi: access denied"
+        )));
+
+        assert!(!batch.cache_changed);
+        assert_eq!(once_status(&batch.result), OnceStatus::PartialFailure);
+        let json = serde_json::to_value(batch.result).expect("serialize poll result");
+        assert_eq!(json["devices"], serde_json::json!([]));
+        assert_eq!(json["errors"][0]["scope"], "subsystem");
+        assert_eq!(json["errors"][0]["kind"], "access-denied");
     }
 }

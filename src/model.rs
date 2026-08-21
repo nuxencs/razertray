@@ -53,6 +53,28 @@ pub struct PollError {
     pub message: String,
 }
 
+impl PollError {
+    pub(crate) fn subsystem(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let normalized = message.to_ascii_lowercase();
+        let kind = if normalized.contains("access")
+            && (normalized.contains("denied") || normalized.contains("permission"))
+        {
+            PollErrorKind::AccessDenied
+        } else {
+            PollErrorKind::Unknown
+        };
+        Self {
+            device_key: String::new(),
+            display_name: "HID subsystem".to_string(),
+            pid: 0,
+            scope: PollErrorScope::Subsystem,
+            kind,
+            message,
+        }
+    }
+}
+
 pub type PollOutcome = Result<PollResult, PollError>;
 
 #[derive(Clone, Debug, Default, Serialize)]

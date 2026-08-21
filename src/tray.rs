@@ -7,7 +7,7 @@ use crate::config::{self, AlertScope, AppConfig, ConfigRecovery, PidCache, ViewM
 use crate::error_tracker::{ErrorNotice, ErrorTracker};
 use crate::hid::client;
 use crate::icon;
-use crate::model::{PollError, PollErrorKind, PollErrorScope, PollOutcome};
+use crate::model::{PollError, PollOutcome};
 use crate::notify::{self, Notifier};
 use anyhow::{Context, Result};
 use hidapi::HidApi;
@@ -503,8 +503,9 @@ fn spawn_poll_worker(
                             api_init_error = None;
                         }
                         Err(err) => {
-                            let error =
-                                subsystem_error(format!("failed initializing HID access: {err}"));
+                            let error = PollError::subsystem(format!(
+                                "failed initializing HID access: {err}"
+                            ));
                             tracing::warn!("{}", error.message);
                             api_init_error = Some(error);
                         }
@@ -526,13 +527,13 @@ fn spawn_poll_worker(
                             }
                             Ok(batch.result)
                         }
-                        Err(err) => Err(subsystem_error(format!(
+                        Err(err) => Err(PollError::subsystem(format!(
                             "could not refresh HID devices: {err}"
                         ))),
                     },
-                    None => Err(api_init_error.clone().unwrap_or_else(|| {
-                        subsystem_error("HID access is unavailable".to_string())
-                    })),
+                    None => Err(api_init_error
+                        .clone()
+                        .unwrap_or_else(|| PollError::subsystem("HID access is unavailable"))),
                 };
                 let found = outcome
                     .as_ref()
@@ -562,25 +563,6 @@ fn spawn_poll_worker(
     });
 }
 
-fn subsystem_error(message: String) -> PollError {
-    let normalized = message.to_ascii_lowercase();
-    let kind = if normalized.contains("access")
-        && (normalized.contains("denied") || normalized.contains("permission"))
-    {
-        PollErrorKind::AccessDenied
-    } else {
-        PollErrorKind::Unknown
-    };
-    PollError {
-        device_key: String::new(),
-        display_name: "HID subsystem".to_string(),
-        pid: 0,
-        scope: PollErrorScope::Subsystem,
-        kind,
-        message,
-    }
-}
-
 #[cfg(target_os = "windows")]
 fn open_app_folder() -> Result<()> {
     std::process::Command::new("explorer.exe")
@@ -608,16 +590,16 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{subsystem_error, welcome_update};
+    use super::welcome_update;
     use crate::application::AppCore;
     use crate::config::AppConfig;
-    use crate::model::PollErrorKind;
+    use crate::model::{PollError, PollErrorKind};
     use std::time::Instant;
 
     #[test]
     fn subsystem_access_failure_keeps_actionable_kind() {
-        let denied = subsystem_error("HID access denied by Windows".to_string());
-        let unknown = subsystem_error("HID refresh failed".to_string());
+        let denied = PollError::subsystem("HID access denied by Windows");
+        let unknown = PollError::subsystem("HID refresh failed");
 
         assert_eq!(denied.kind, PollErrorKind::AccessDenied);
         assert_eq!(unknown.kind, PollErrorKind::Unknown);

@@ -38,8 +38,17 @@ impl std::error::Error for UnsupportedCommand {}
 
 #[derive(Debug)]
 enum QueryFailure {
-    Unsupported { auxiliary: Vec<anyhow::Error> },
+    Unsupported {
+        evidence: UnsupportedEvidence,
+        auxiliary: Vec<anyhow::Error>,
+    },
     Failed(anyhow::Error),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnsupportedEvidence {
+    Conclusive,
+    Partial,
 }
 
 pub fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollBatch {
@@ -71,14 +80,24 @@ fn record_query_result(
                 result.errors.push(warning);
             }
         }
-        Err(QueryFailure::Unsupported { auxiliary }) => {
+        Err(QueryFailure::Unsupported {
+            evidence,
+            auxiliary,
+        }) => {
             result.errors.push(PollError {
                 device_key: device.key.clone(),
                 display_name: display_name(device),
                 pid: device.pid,
                 scope: PollErrorScope::Device,
                 kind: PollErrorKind::Unsupported,
-                message: "battery status is not supported by this device".to_string(),
+                message: match evidence {
+                    UnsupportedEvidence::Conclusive => {
+                        "battery status is not supported by this device".to_string()
+                    }
+                    UnsupportedEvidence::Partial => {
+                        "one or more battery probes reported unsupported status".to_string()
+                    }
+                },
             });
             result
                 .errors
@@ -187,12 +206,17 @@ fn query_device(
 fn merge_query_failure(failure: QueryFailure, mut auxiliary: Vec<String>) -> QueryFailure {
     match failure {
         QueryFailure::Unsupported {
+            mut evidence,
             auxiliary: mut errors,
         } => {
             if !auxiliary.is_empty() {
+                evidence = UnsupportedEvidence::Partial;
                 errors.push(anyhow::anyhow!(auxiliary.join("; ")));
             }
-            QueryFailure::Unsupported { auxiliary: errors }
+            QueryFailure::Unsupported {
+                evidence,
+                auxiliary: errors,
+            }
         }
         QueryFailure::Failed(err) => {
             auxiliary.push(format_error_chain(&err));
@@ -281,16 +305,6 @@ fn probe_battery_with<T: FeatureTransport>(
         }
     }
 
-    if target_count > 0
-        && states
-            .iter()
-            .all(|state| matches!(state, ProbeState::Unsupported))
-    {
-        return Err(QueryFailure::Unsupported {
-            auxiliary: Vec::new(),
-        });
-    }
-
     let mut failures = Vec::new();
     for (transaction_index, transaction_id) in transaction_ids.iter().copied().enumerate() {
         for (candidate_index, (interface_number, _)) in candidates.iter().enumerate() {
@@ -309,6 +323,24 @@ fn probe_battery_with<T: FeatureTransport>(
     }
     if budget_exhausted {
         failures.push("poll time budget exhausted".to_string());
+    }
+    let unsupported_observed = states
+        .iter()
+        .any(|state| matches!(state, ProbeState::Unsupported));
+    if unsupported_observed {
+        let evidence = if target_count > 0
+            && states
+                .iter()
+                .all(|state| matches!(state, ProbeState::Unsupported))
+        {
+            UnsupportedEvidence::Conclusive
+        } else {
+            UnsupportedEvidence::Partial
+        };
+        return Err(QueryFailure::Unsupported {
+            evidence,
+            auxiliary: failures.into_iter().map(anyhow::Error::msg).collect(),
+        });
     }
     if failures.is_empty() {
         failures.push("no candidate interface produced a battery reading".to_string());
@@ -512,9 +544,9 @@ fn scale_percent(raw: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FeatureTransport, MAX_RETRIES, QueryFailure, classify_error, format_error_chain,
-        merge_query_failure, probe_battery_with, record_query_result, scale_percent,
-        send_request_with, update_cache_after_success,
+        FeatureTransport, MAX_RETRIES, QueryFailure, UnsupportedEvidence, classify_error,
+        format_error_chain, merge_query_failure, probe_battery_with, record_query_result,
+        scale_percent, send_request_with, update_cache_after_success,
     };
     use crate::config::PidCache;
     use crate::hid::protocol::{
@@ -726,6 +758,7 @@ mod tests {
 
         let failure = merge_query_failure(
             QueryFailure::Unsupported {
+                evidence: UnsupportedEvidence::Conclusive,
                 auxiliary: Vec::new(),
             },
             vec!["interface access denied".to_string()],
@@ -737,6 +770,11 @@ mod tests {
         assert_eq!(result.errors[0].kind, PollErrorKind::Unsupported);
         assert_eq!(result.errors[0].device_key, "mouse");
         assert_eq!(result.errors[0].pid, 0xFFFF);
+        assert!(
+            result.errors[0]
+                .message
+                .contains("one or more battery probes")
+        );
         assert_eq!(result.errors[1].kind, PollErrorKind::AccessDenied);
         let json = serde_json::to_value(result).expect("serialize poll result");
         assert_eq!(json["errors"][0]["kind"], "unsupported");
@@ -841,7 +879,51 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(QueryFailure::Unsupported { auxiliary }) if auxiliary.is_empty()
+            Err(QueryFailure::Unsupported {
+                evidence: UnsupportedEvidence::Conclusive,
+                auxiliary,
+            }) if auxiliary.is_empty()
         ));
+    }
+
+    #[test]
+    fn review_hid_preserves_mixed_unsupported_and_timeout_evidence() {
+        let mut replies = vec![Ok(feature_response_with_status(
+            0x1F,
+            0,
+            STATUS_NOT_SUPPORTED,
+        ))];
+        replies.extend(
+            (0..MAX_RETRIES).map(|_| Ok(feature_response_with_status(0x3F, 0, STATUS_NO_RESPONSE))),
+        );
+        let candidates = [(0, FakeTransport::new(replies))];
+
+        let failure = probe_battery_with(
+            &candidates,
+            &[0x1F, 0x3F],
+            Duration::ZERO,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect_err("mixed evidence must not collapse to a generic failure");
+        assert!(matches!(
+            &failure,
+            QueryFailure::Unsupported {
+                evidence: UnsupportedEvidence::Partial,
+                auxiliary,
+            } if !auxiliary.is_empty()
+        ));
+
+        let device = DiscoveredDevice {
+            key: "mouse".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            candidates: Vec::new(),
+        };
+        let mut result = PollResult::default();
+        record_query_result(&mut result, &device, Err(failure));
+
+        assert_eq!(result.errors.len(), 2);
+        assert_eq!(result.errors[0].kind, PollErrorKind::Unsupported);
+        assert_eq!(result.errors[1].kind, PollErrorKind::DeviceUnavailable);
     }
 }
