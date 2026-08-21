@@ -161,7 +161,7 @@ pub struct ConfigLoad {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfigRecovery {
     InvalidFileReset {
-        backup_path: PathBuf,
+        backup_path: Option<PathBuf>,
         parse_error: String,
         persistence_error: Option<String>,
     },
@@ -173,6 +173,9 @@ pub enum ConfigRecovery {
 impl ConfigRecovery {
     pub fn title(&self) -> &'static str {
         match self {
+            Self::InvalidFileReset {
+                backup_path: None, ..
+            } => "Configuration defaults are active",
             Self::InvalidFileReset { .. } => "Configuration was reset",
             Self::ValuesAdjusted { .. } => "Configuration was adjusted",
         }
@@ -181,7 +184,7 @@ impl ConfigRecovery {
     pub fn diagnostic_message(&self) -> String {
         match self {
             Self::InvalidFileReset {
-                backup_path,
+                backup_path: Some(backup_path),
                 parse_error,
                 persistence_error: Some(error),
             } => format!(
@@ -189,12 +192,22 @@ impl ConfigRecovery {
                 backup_path.display()
             ),
             Self::InvalidFileReset {
-                backup_path,
+                backup_path: Some(backup_path),
                 parse_error,
                 persistence_error: None,
             } => format!(
                 "The configuration was invalid and was reset. The old file is {}. Parse error: {parse_error}",
                 backup_path.display()
+            ),
+            Self::InvalidFileReset {
+                backup_path: None,
+                parse_error,
+                persistence_error,
+            } => format!(
+                "The configuration was invalid. Defaults are active for this run, and the original file remains in place. Recovery could not be persisted: {}. Parse error: {parse_error}",
+                persistence_error
+                    .as_deref()
+                    .unwrap_or("unknown recovery error")
             ),
             Self::ValuesAdjusted {
                 persistence_error: Some(error),
@@ -344,6 +357,13 @@ pub fn load_or_create_config() -> Result<ConfigLoad> {
 }
 
 fn load_or_create_config_at(path: &Path) -> Result<ConfigLoad> {
+    load_or_create_config_at_with_quarantine(path, quarantine_invalid_file)
+}
+
+fn load_or_create_config_at_with_quarantine<F>(path: &Path, quarantine: F) -> Result<ConfigLoad>
+where
+    F: FnOnce(&Path) -> Result<PathBuf>,
+{
     #[cfg(target_os = "windows")]
     restore_interrupted_replacement(path)?;
     if !path.exists() {
@@ -360,15 +380,20 @@ fn load_or_create_config_at(path: &Path) -> Result<ConfigLoad> {
     let mut parsed: AppConfig = match toml::from_str(&raw) {
         Ok(config) => config,
         Err(err) => {
-            let backup = quarantine_invalid_file(path)?;
             let config = AppConfig::default();
-            let persistence_error = save_config_at(path, &config)
-                .err()
-                .map(|error| format!("{error:#}"));
+            let (backup_path, persistence_error) = match quarantine(path) {
+                Ok(backup) => (
+                    Some(backup),
+                    save_config_at(path, &config)
+                        .err()
+                        .map(|error| format!("{error:#}")),
+                ),
+                Err(error) => (None, Some(format!("{error:#}"))),
+            };
             return Ok(ConfigLoad {
                 config,
                 recovery: Some(ConfigRecovery::InvalidFileReset {
-                    backup_path: backup,
+                    backup_path,
                     parse_error: err.to_string(),
                     persistence_error,
                 }),
@@ -468,7 +493,8 @@ fn save_pid_cache_at(path: &Path, cache: &PidCache) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, ConfigRecovery, PidCache, load_or_create_config_at, load_or_create_pid_cache_at,
+        AppConfig, ConfigRecovery, PidCache, load_or_create_config_at,
+        load_or_create_config_at_with_quarantine, load_or_create_pid_cache_at,
         load_pid_cache_for_polling_at, replacement_backup_path, restore_interrupted_replacement,
     };
     use crate::model::{PollErrorKind, PollErrorScope};
@@ -599,6 +625,7 @@ welcome_shown = true
                 parse_error,
                 persistence_error,
             } => {
+                let backup_path = backup_path.as_ref().expect("preserved invalid config");
                 assert!(backup_path.exists());
                 assert!(!parse_error.is_empty());
                 assert_eq!(persistence_error, &None);
@@ -656,6 +683,7 @@ welcome_shown = true
         else {
             panic!("expected invalid-file persistence warning")
         };
+        let backup_path = backup_path.as_ref().expect("preserved invalid config");
         assert!(backup_path.exists());
         assert!(!path.exists());
         assert!(error.contains("failed creating"));
@@ -664,6 +692,33 @@ welcome_shown = true
             recovery.notification_message(),
             "Defaults are in use for this run but could not be saved. Open the app folder."
         );
+    }
+
+    #[test]
+    fn review_round_30_quarantine_failure_keeps_original_and_uses_defaults() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("config.toml");
+        fs::write(&path, "not = [valid").expect("write invalid config");
+
+        let loaded = load_or_create_config_at_with_quarantine(&path, |_| {
+            anyhow::bail!("quarantine access denied")
+        })
+        .expect("return safe default config");
+
+        assert_eq!(loaded.config, AppConfig::default());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not = [valid");
+        let recovery = loaded.recovery.expect("typed recovery warning");
+        let ConfigRecovery::InvalidFileReset {
+            backup_path: None,
+            persistence_error: Some(error),
+            ..
+        } = &recovery
+        else {
+            panic!("expected quarantine persistence warning")
+        };
+        assert!(error.contains("quarantine access denied"));
+        assert_eq!(recovery.title(), "Configuration defaults are active");
+        assert!(recovery.diagnostic_message().contains("remains in place"));
     }
 
     #[test]

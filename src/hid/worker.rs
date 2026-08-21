@@ -36,7 +36,7 @@ static REAPER: LazyLock<()> = LazyLock::new(|| {
                 let mut index = workers.len();
                 while index > 0 {
                     index -= 1;
-                    if matches!(workers[index].child.try_wait(), Ok(Some(_))) {
+                    if workers[index].is_complete() {
                         completed.push(workers.swap_remove(index));
                     }
                 }
@@ -113,8 +113,25 @@ impl Drop for WorkerPermit {
 struct RetiredWorker {
     child: Child,
     reader: Option<thread::JoinHandle<()>>,
-    _permit: Option<WorkerPermit>,
-    _tree: Option<process_tree::Owned>,
+    permit: Option<WorkerPermit>,
+    process_tree: Option<process_tree::Owned>,
+}
+
+impl RetiredWorker {
+    fn is_complete(&mut self) -> bool {
+        debug_assert!(self.process_tree.is_none() || self.permit.is_some());
+        let child_exited = matches!(self.child.try_wait(), Ok(Some(_)));
+        let Some(tree) = &self.process_tree else {
+            return child_exited;
+        };
+        match process_tree::is_empty(tree) {
+            Ok(true) => child_exited,
+            Ok(false) | Err(_) => {
+                let _ = process_tree::terminate(tree);
+                false
+            }
+        }
+    }
 }
 
 struct OutputReader {
@@ -146,9 +163,15 @@ impl SupervisedChild {
     }
 
     fn mark_exited(&mut self) {
-        self.child.take();
-        self.permit.take();
-        self.tree.take();
+        let child = self.child.take().expect("supervised child");
+        if self.retain_locally
+            && self
+                .tree
+                .as_ref()
+                .is_some_and(|tree| !matches!(process_tree::is_empty(tree), Ok(true)))
+        {
+            retain_worker(child, None, self.permit.take(), self.tree.take(), false);
+        }
     }
 }
 
@@ -401,23 +424,37 @@ fn read_output_frames(
 }
 
 fn retire_worker(
-    mut child: Child,
+    child: Child,
     reader: Option<thread::JoinHandle<()>>,
     permit: Option<WorkerPermit>,
     tree: Option<process_tree::Owned>,
 ) {
+    retain_worker(child, reader, permit, tree, true);
+}
+
+fn retain_worker(
+    mut child: Child,
+    reader: Option<thread::JoinHandle<()>>,
+    permit: Option<WorkerPermit>,
+    tree: Option<process_tree::Owned>,
+    terminate: bool,
+) {
     if let Some(tree) = &tree {
-        process_tree::terminate(tree);
+        if terminate {
+            let _ = process_tree::terminate(tree);
+        }
     }
-    let _ = child.kill();
+    if terminate {
+        let _ = child.kill();
+    }
     RETIRED_WORKERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(RetiredWorker {
             child,
             reader,
-            _permit: permit,
-            _tree: tree,
+            permit,
+            process_tree: tree,
         });
     LazyLock::force(&REAPER);
 }
@@ -545,8 +582,9 @@ mod process_tree {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
     };
 
     pub(super) type Owned = Arc<Job>;
@@ -596,10 +634,33 @@ mod process_tree {
         Ok(Some(job))
     }
 
-    pub(super) fn terminate(job: &Owned) {
-        unsafe {
-            TerminateJobObject(job.handle, 124);
+    pub(super) fn is_empty(job: &Owned) -> Result<bool> {
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let queried = unsafe {
+            QueryInformationJobObject(
+                job.handle,
+                JobObjectBasicAccountingInformation,
+                &mut accounting as *mut _ as *mut c_void,
+                std::mem::size_of_val(&accounting)
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+                ptr::null_mut(),
+            )
+        };
+        if queried == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed querying HID process tree");
         }
+        Ok(accounting.ActiveProcesses == 0)
+    }
+
+    pub(super) fn terminate(job: &Owned) -> Result<()> {
+        let terminated = unsafe { TerminateJobObject(job.handle, 124) };
+        if terminated == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed terminating HID process tree");
+        }
+        Ok(())
     }
 
     pub(super) fn shutdown(timeout: Duration) {
@@ -611,18 +672,15 @@ mod process_tree {
             active.retain(|job| job.strong_count() > 0);
             jobs
         };
-        for job in &jobs {
-            terminate(job);
-        }
-        drop(jobs);
-
         let deadline = Instant::now() + timeout;
         loop {
-            let active = ACTIVE_JOBS
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .any(|job| job.strong_count() > 0);
+            let active = jobs.iter().any(|job| match is_empty(job) {
+                Ok(true) => false,
+                Ok(false) | Err(_) => {
+                    let _ = terminate(job);
+                    true
+                }
+            });
             if !active || Instant::now() >= deadline {
                 return;
             }
@@ -649,7 +707,13 @@ mod process_tree {
         Ok(None)
     }
 
-    pub(super) fn terminate(_job: &Owned) {}
+    pub(super) fn is_empty(_job: &Owned) -> Result<bool> {
+        Ok(true)
+    }
+
+    pub(super) fn terminate(_job: &Owned) -> Result<()> {
+        Ok(())
+    }
 
     pub(super) fn shutdown(_timeout: Duration) {}
 }
@@ -660,6 +724,10 @@ mod tests {
         INITIAL_POLL_TIMEOUT, STATUS_POLL_INTERVAL, WorkerFrame, WorkerPermit, WorkerReply,
         supervise_child, write_frame,
     };
+    #[cfg(windows)]
+    use super::RetiredWorker;
+    #[cfg(windows)]
+    use std::io::{Read, Write};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -755,11 +823,12 @@ mod tests {
     #[test]
     fn review_round_29_process_tree_shutdown_terminates_worker() {
         let mut child = child_test("hid::worker::tests::review_round_27_timeout_child");
-        let _tree = super::process_tree::assign(&child)
+        let tree = super::process_tree::assign(&child)
             .expect("create process tree")
             .expect("Windows process tree");
         let started = Instant::now();
 
+        assert!(!super::process_tree::is_empty(&tree).expect("query active worker"));
         super::process_tree::shutdown(Duration::from_millis(100));
 
         assert!(started.elapsed() < Duration::from_millis(250));
@@ -774,6 +843,72 @@ mod tests {
             );
             std::thread::sleep(STATUS_POLL_INTERVAL);
         }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if super::process_tree::is_empty(&tree).expect("query terminated worker") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process tree retained active workers"
+            );
+            std::thread::sleep(STATUS_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn review_round_30_retired_worker_waits_for_descendants() {
+        let mut child = child_test("hid::worker::tests::review_round_30_descendant_parent");
+        let tree = super::process_tree::assign(&child)
+            .expect("create process tree")
+            .expect("Windows process tree");
+        child
+            .stdin
+            .take()
+            .expect("parent stdin")
+            .write_all(&[1])
+            .expect("release parent");
+        child.wait().expect("parent exits");
+        let mut retired = RetiredWorker {
+            child,
+            reader: None,
+            permit: Some(WorkerPermit::acquire().expect("worker capacity")),
+            process_tree: Some(tree),
+        };
+
+        assert!(!retired.is_complete());
+        let tree = retired
+            .process_tree
+            .as_ref()
+            .expect("retained process tree");
+        super::process_tree::terminate(tree).expect("terminate descendants");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !retired.is_complete() {
+            assert!(Instant::now() < deadline, "descendant survived termination");
+            std::thread::sleep(STATUS_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn review_round_30_descendant_parent() {
+        let mut token = [0];
+        std::io::stdin()
+            .read_exact(&mut token)
+            .expect("wait for process-tree assignment");
+        Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "hid::worker::tests::review_round_27_timeout_child",
+                "--ignored",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start descendant");
     }
 
     #[test]

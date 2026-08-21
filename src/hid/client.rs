@@ -115,7 +115,7 @@ fn record_query_result(
             result.devices.push(state);
             result.errors.extend(warnings);
         }
-        Ok((_, warnings)) => result.errors.extend(warnings),
+        Ok((_, warnings)) => result.errors.extend(ambiguous_probe_warnings(warnings)),
         Err(QueryFailure::Unsupported {
             mut evidence,
             auxiliary,
@@ -222,24 +222,27 @@ fn query_device(
     let battery_percent = scale_percent(battery_raw);
     let mut warnings =
         successful_probe_warnings(device, interface_failures, candidate_plan.omitted);
-    let (charge_state, charge_warnings) =
-        if known.is_some_and(|support| !support.supports_charging_status) {
-            (ChargeState::Unsupported, Vec::new())
-        } else {
-            prioritize_probe_candidate(&mut transports, candidate_index);
-            let charge_plan = charge_probe_plan(&transports, device.interface_grouping);
-            let charge_deadline = Instant::now()
-                + probe_budget(charge_plan.candidates.len(), response_wait, Duration::ZERO);
-            let charge_probe = probe_request_with(
-                charge_plan.candidates,
-                &[transaction_id],
-                build_charging_request,
-                response_wait,
-                charge_deadline,
-            )
-            .map_err(|failure| mark_unsupported_incomplete(failure, charge_plan.omitted));
-            charge_query_result(device, charge_probe)
-        };
+    let (charge_state, charge_warnings) = if known
+        .is_some_and(|support| !support.supports_charging_status)
+    {
+        (ChargeState::Unsupported, Vec::new())
+    } else {
+        prioritize_probe_candidate(&mut transports, candidate_index);
+        let charge_plan = charge_probe_plan(&transports, device.interface_grouping);
+        let charge_deadline = Instant::now()
+            + probe_budget(charge_plan.candidates.len(), response_wait, Duration::ZERO);
+        let charge_probe = probe_request_with(
+            charge_plan.candidates,
+            &[transaction_id],
+            build_charging_request,
+            response_wait,
+            charge_deadline,
+        )
+        .map_err(|failure| {
+            mark_unsupported_incomplete(failure, candidate_plan.omitted > 0 || charge_plan.omitted)
+        });
+        charge_query_result(device, charge_probe)
+    };
     warnings.extend(charge_warnings);
 
     Ok((
@@ -254,6 +257,18 @@ fn query_device(
         },
         warnings,
     ))
+}
+
+fn ambiguous_probe_warnings(warnings: Vec<PollError>) -> Vec<PollError> {
+    warnings
+        .into_iter()
+        .map(|mut warning| {
+            if warning.scope == PollErrorScope::Interface {
+                warning.scope = PollErrorScope::ProbeCoverage;
+            }
+            warning
+        })
+        .collect()
 }
 
 fn successful_probe_warnings(
@@ -1661,14 +1676,23 @@ mod tests {
                     charge_state: crate::model::ChargeState::Unavailable,
                     observed_at: None,
                 },
-                Vec::new(),
+                vec![crate::model::PollError {
+                    device_key: device.key.clone(),
+                    display_name: display_name(&device),
+                    pid: device.pid,
+                    scope: PollErrorScope::Interface,
+                    component: None,
+                    kind: PollErrorKind::AccessDenied,
+                    message: "fallback interface was used during probing".to_string(),
+                }],
             )),
         );
 
         assert!(result.devices.is_empty());
-        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors.len(), 2);
         assert_eq!(result.errors[0].device_key, "00BF");
         assert_eq!(result.errors[0].kind, PollErrorKind::AmbiguousIdentity);
+        assert_eq!(result.errors[1].scope, PollErrorScope::ProbeCoverage);
         assert_eq!(
             result.errors[0].display_name,
             "Razer Mouse (identity ambiguous)"
@@ -1676,6 +1700,36 @@ mod tests {
         let json = serde_json::to_value(result).expect("serialize ambiguous result");
         assert_eq!(json["devices"], serde_json::json!([]));
         assert_eq!(json["errors"][0]["kind"], "ambiguous-identity");
+        assert_eq!(json["errors"][1]["scope"], "probe-coverage");
+    }
+
+    #[test]
+    fn review_round_30_charge_truncation_keeps_unsupported_partial() {
+        let battery_candidates = [0, 1, 2, 3, 4];
+        let candidate_plan = candidate_probe_plan(&battery_candidates);
+        let charge_plan =
+            charge_probe_plan(candidate_plan.candidates, InterfaceGrouping::VerifiedDevice);
+        let failure = mark_unsupported_incomplete(
+            QueryFailure::Unsupported {
+                evidence: UnsupportedEvidence::Conclusive,
+                auxiliary: Vec::new(),
+            },
+            candidate_plan.omitted > 0 || charge_plan.omitted,
+        );
+        let device = DiscoveredDevice {
+            key: "mouse".to_string(),
+            pid: 0xFFFF,
+            product_name: "Razer Mouse".to_string(),
+            interface_grouping: InterfaceGrouping::VerifiedDevice,
+            candidates: Vec::new(),
+        };
+
+        let (state, warnings) = charge_query_result(&device, Err(failure));
+
+        assert_eq!(candidate_plan.omitted, 1);
+        assert!(!charge_plan.omitted);
+        assert_eq!(state, crate::model::ChargeState::Unavailable);
+        assert_eq!(warnings[0].kind, PollErrorKind::PartialUnsupported);
     }
 
     #[test]
