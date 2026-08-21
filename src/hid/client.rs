@@ -20,6 +20,7 @@ const MAX_RETRIES: usize = 5;
 const DEVICE_POLL_BUDGET: Duration = Duration::from_secs(8);
 const FEATURE_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const FEATURE_IO_ALLOWANCE: Duration = Duration::from_millis(250);
+const PROBE_SCHEDULING_ALLOWANCE: Duration = Duration::from_millis(250);
 const MAX_PROBE_BUDGET: Duration = Duration::from_secs(16);
 const SEND_DELAY: Duration = Duration::from_millis(60);
 const RETRY_DELAY: Duration = Duration::from_millis(400);
@@ -58,6 +59,8 @@ struct ProbeSuccess {
     interface_failures: Vec<anyhow::Error>,
 }
 
+// Retain the direct in-process entry point for focused HID callers.
+#[allow(dead_code)]
 pub fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollBatch {
     let discovered = scan_devices(api);
     poll_discovered_devices(discovered, pid_cache)
@@ -361,6 +364,7 @@ fn charge_query_result(
     }
 }
 
+#[cfg(test)]
 fn merge_query_failure(failure: QueryFailure, mut auxiliary: Vec<anyhow::Error>) -> QueryFailure {
     match failure {
         QueryFailure::Unsupported {
@@ -637,6 +641,7 @@ fn probe_budget(
     let target_count = u32::try_from(target_count).unwrap_or(u32::MAX);
     let reserved = minimum_operation_timeout(response_wait)
         .checked_mul(target_count)
+        .and_then(|duration| duration.checked_add(PROBE_SCHEDULING_ALLOWANCE))
         .unwrap_or(MAX_PROBE_BUDGET);
     minimum_budget.max(reserved).min(MAX_PROBE_BUDGET)
 }
@@ -1401,13 +1406,19 @@ mod tests {
                 )
             })
             .collect();
+        let transaction_ids = [0x1F, 0x3F, 0xFF];
 
         let success = probe_request_with(
             &candidates,
-            &[0x1F, 0x3F, 0xFF],
+            &transaction_ids,
             build_battery_request,
             Duration::ZERO,
-            Instant::now() + Duration::from_secs(1),
+            Instant::now()
+                + probe_budget(
+                    candidates.len() * transaction_ids.len(),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                ),
         )
         .expect("0xFF fallback should succeed before any retry");
 
@@ -1469,13 +1480,19 @@ mod tests {
             (0, FakeTransport::new(unsupported_replies())),
             (1, FakeTransport::new(unsupported_replies())),
         ];
+        let transaction_ids = [0x1F, 0x3F, 0xFF];
 
         let result = probe_request_with(
             &candidates,
-            &[0x1F, 0x3F, 0xFF],
+            &transaction_ids,
             build_battery_request,
             Duration::ZERO,
-            Instant::now() + Duration::from_secs(1),
+            Instant::now()
+                + probe_budget(
+                    candidates.len() * transaction_ids.len(),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                ),
         );
 
         assert!(matches!(

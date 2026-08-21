@@ -123,14 +123,15 @@ impl ErrorTracker {
                 } else {
                     successful_device_ids.contains(&key.incident.device_key)
                 };
-            if let Some(active) = self.active.remove(&key) {
-                if recovered && recovered_incidents.insert(key.incident) {
-                    notices.push(ErrorNotice::Recovered {
-                        display_name: active.error.display_name,
-                        scope: active.error.scope,
-                        component: active.error.component,
-                    });
-                }
+            if let Some(active) = self.active.remove(&key)
+                && recovered
+                && recovered_incidents.insert(key.incident)
+            {
+                notices.push(ErrorNotice::Recovered {
+                    display_name: active.error.display_name,
+                    scope: active.error.scope,
+                    component: active.error.component,
+                });
             }
         }
 

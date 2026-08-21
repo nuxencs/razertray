@@ -75,8 +75,9 @@ welcome_shown = true
 Unsafe numeric values are clamped to supported limits. The adjusted values stay
 active for the current run if the normalized file cannot be saved, and the
 recovery notification points to `config.toml` for review. If the file cannot be
-parsed, razertray preserves it as `config.invalid.<time>.<pid>.toml` and creates
-a valid default file.
+parsed, razertray tries to preserve it as `config.invalid.<time>.<pid>.toml` and
+create a valid default file. If either recovery step fails, safe defaults remain
+active for the current run and the notification identifies what needs review.
 
 Other files in the app data folder:
 
@@ -109,7 +110,7 @@ razertray.exe --diagnose
 Exit codes:
 
 - `0`: one or more devices were read and no polling error occurred
-- `1`: no readable battery device was found
+- `1`: polling completed without errors, but found no readable battery device
 - `2`: a partial or fatal failure occurred, or an argument was invalid
 
 ## Low-battery alerts

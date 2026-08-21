@@ -180,7 +180,7 @@ impl Drop for WorkerPermit {
 struct RetiredWorker {
     child: Child,
     reader: Option<thread::JoinHandle<()>>,
-    permit: Option<WorkerPermit>,
+    _permit: Option<WorkerPermit>,
     process_tree: Option<process_tree::Owned>,
 }
 
@@ -228,6 +228,8 @@ impl SupervisedChild {
         self.child.as_mut().expect("supervised child")
     }
 
+    // `try_wait` reaped the child before this method receives it.
+    #[allow(clippy::zombie_processes)]
     fn mark_exited(&mut self) {
         let child = self.child.take().expect("supervised child");
         if self.retain_locally
@@ -329,9 +331,8 @@ pub(crate) fn exchange_feature(
         },
         timeout,
     )
-    .map_err(|error| {
-        record_stalled_request_from_error(&request_key, &error);
-        error
+    .inspect_err(|error| {
+        record_stalled_request_from_error(&request_key, error);
     })
     .context("HID feature operation unavailable")?;
     let (count, received) = match reply {
@@ -586,10 +587,10 @@ fn retain_worker(
     tree: Option<process_tree::Owned>,
     terminate: bool,
 ) {
-    if let Some(tree) = &tree {
-        if terminate {
-            let _ = process_tree::terminate(tree);
-        }
+    if let Some(tree) = &tree
+        && terminate
+    {
+        let _ = process_tree::terminate(tree);
     }
     if terminate {
         let _ = child.kill();
@@ -600,7 +601,7 @@ fn retain_worker(
         .push(RetiredWorker {
             child,
             reader,
-            permit,
+            _permit: permit,
             process_tree: tree,
         });
     LazyLock::force(&REAPER);
@@ -1087,7 +1088,7 @@ mod tests {
         let mut retired = RetiredWorker {
             child,
             reader: None,
-            permit: Some(WorkerPermit::acquire(WorkerCapacity::Request).expect("worker capacity")),
+            _permit: Some(WorkerPermit::acquire(WorkerCapacity::Request).expect("worker capacity")),
             process_tree: Some(tree),
         };
 
@@ -1107,6 +1108,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     #[ignore]
+    #[allow(clippy::zombie_processes)]
     fn review_round_30_descendant_parent() {
         let mut token = [0];
         std::io::stdin()
