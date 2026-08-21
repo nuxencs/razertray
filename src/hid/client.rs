@@ -38,7 +38,7 @@ impl std::error::Error for UnsupportedCommand {}
 
 #[derive(Debug)]
 enum QueryFailure {
-    Unsupported,
+    Unsupported { auxiliary: Vec<anyhow::Error> },
     Failed(anyhow::Error),
 }
 
@@ -71,14 +71,19 @@ fn record_query_result(
                 result.errors.push(warning);
             }
         }
-        Err(QueryFailure::Unsupported) => result.errors.push(PollError {
-            device_key: device.key.clone(),
-            display_name: display_name(device),
-            pid: device.pid,
-            scope: PollErrorScope::Device,
-            kind: PollErrorKind::Unsupported,
-            message: "battery status is not supported by this device".to_string(),
-        }),
+        Err(QueryFailure::Unsupported { auxiliary }) => {
+            result.errors.push(PollError {
+                device_key: device.key.clone(),
+                display_name: display_name(device),
+                pid: device.pid,
+                scope: PollErrorScope::Device,
+                kind: PollErrorKind::Unsupported,
+                message: "battery status is not supported by this device".to_string(),
+            });
+            result
+                .errors
+                .extend(auxiliary.into_iter().map(|err| poll_error(device, err)));
+        }
         Err(QueryFailure::Failed(err)) => result.errors.push(poll_error(&device, err)),
     }
 }
@@ -127,18 +132,7 @@ fn query_device(
             if cached.is_some() {
                 *cache_changed |= pid_cache.remove(device.pid);
             }
-            return match failure {
-                QueryFailure::Unsupported if failures.is_empty() => Err(QueryFailure::Unsupported),
-                QueryFailure::Unsupported => {
-                    failures
-                        .push("opened interfaces reported unsupported battery status".to_string());
-                    Err(QueryFailure::Failed(anyhow::anyhow!(failures.join("; "))))
-                }
-                QueryFailure::Failed(err) => {
-                    failures.push(format_error_chain(&err));
-                    Err(QueryFailure::Failed(anyhow::anyhow!(failures.join("; "))))
-                }
-            };
+            return Err(merge_query_failure(failure, failures));
         }
     };
 
@@ -188,6 +182,23 @@ fn query_device(
         },
         warning,
     ))
+}
+
+fn merge_query_failure(failure: QueryFailure, mut auxiliary: Vec<String>) -> QueryFailure {
+    match failure {
+        QueryFailure::Unsupported {
+            auxiliary: mut errors,
+        } => {
+            if !auxiliary.is_empty() {
+                errors.push(anyhow::anyhow!(auxiliary.join("; ")));
+            }
+            QueryFailure::Unsupported { auxiliary: errors }
+        }
+        QueryFailure::Failed(err) => {
+            auxiliary.push(format_error_chain(&err));
+            QueryFailure::Failed(anyhow::anyhow!(auxiliary.join("; ")))
+        }
+    }
 }
 
 fn battery_transaction_ids(
@@ -275,7 +286,9 @@ fn probe_battery_with<T: FeatureTransport>(
             .iter()
             .all(|state| matches!(state, ProbeState::Unsupported))
     {
-        return Err(QueryFailure::Unsupported);
+        return Err(QueryFailure::Unsupported {
+            auxiliary: Vec::new(),
+        });
     }
 
     let mut failures = Vec::new();
@@ -500,8 +513,8 @@ fn scale_percent(raw: u8) -> u8 {
 mod tests {
     use super::{
         FeatureTransport, MAX_RETRIES, QueryFailure, classify_error, format_error_chain,
-        probe_battery_with, record_query_result, scale_percent, send_request_with,
-        update_cache_after_success,
+        merge_query_failure, probe_battery_with, record_query_result, scale_percent,
+        send_request_with, update_cache_after_success,
     };
     use crate::config::PidCache;
     use crate::hid::protocol::{
@@ -702,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_query_is_preserved_in_poll_result() {
+    fn review_unsupported_query_preserves_auxiliary_diagnostic() {
         let device = DiscoveredDevice {
             key: "mouse".to_string(),
             pid: 0xFFFF,
@@ -711,16 +724,24 @@ mod tests {
         };
         let mut result = PollResult::default();
 
-        record_query_result(&mut result, &device, Err(QueryFailure::Unsupported));
+        let failure = merge_query_failure(
+            QueryFailure::Unsupported {
+                auxiliary: Vec::new(),
+            },
+            vec!["interface access denied".to_string()],
+        );
+        record_query_result(&mut result, &device, Err(failure));
 
-        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors.len(), 2);
         assert_eq!(result.errors[0].scope, PollErrorScope::Device);
         assert_eq!(result.errors[0].kind, PollErrorKind::Unsupported);
         assert_eq!(result.errors[0].device_key, "mouse");
         assert_eq!(result.errors[0].pid, 0xFFFF);
+        assert_eq!(result.errors[1].kind, PollErrorKind::AccessDenied);
         let json = serde_json::to_value(result).expect("serialize poll result");
         assert_eq!(json["errors"][0]["kind"], "unsupported");
         assert_eq!(json["errors"][0]["scope"], "device");
+        assert_eq!(json["errors"][1]["kind"], "access-denied");
     }
 
     #[test]
@@ -818,6 +839,9 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
         );
 
-        assert!(matches!(result, Err(QueryFailure::Unsupported)));
+        assert!(matches!(
+            result,
+            Err(QueryFailure::Unsupported { auxiliary }) if auxiliary.is_empty()
+        ));
     }
 }

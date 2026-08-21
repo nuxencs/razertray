@@ -31,6 +31,7 @@ pub enum ObservationView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TrayIconState {
     Unknown,
+    Stale,
     Battery {
         percent: u8,
         charge_state: ChargeState,
@@ -491,14 +492,7 @@ fn presentation(
                 format_age(*age)
             );
             append_diagnostic(&mut text, diagnostic);
-            (
-                text.clone(),
-                text,
-                TrayIconState::Battery {
-                    percent: reading.battery_percent,
-                    charge_state: reading.charge_state,
-                },
-            )
+            (text.clone(), text, TrayIconState::Stale)
         }
         ObservationView::NoDevice => {
             let text = "No battery-capable Razer device found".to_string();
@@ -581,7 +575,7 @@ fn format_age(age: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppCore, AppEvent, Command, ObservationView, PollActivity};
+    use super::{AppCore, AppEvent, Command, ObservationView, PollActivity, TrayIconState};
     use crate::config::AppConfig;
     use crate::model::{
         BatteryState, ChargeState, PollError, PollErrorKind, PollErrorScope, PollResult,
@@ -706,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn last_reading_becomes_stale_when_no_fallback_is_available() {
+    fn review_last_reading_becomes_stale_when_no_fallback_is_available() {
         let now = Instant::now();
         let (mut core, first, _) = AppCore::new(AppConfig::default(), now);
         core.handle(
@@ -730,6 +724,7 @@ mod tests {
             update.view.observation,
             ObservationView::Stale { age, .. } if age == Duration::from_secs(120)
         ));
+        assert_eq!(update.view.icon, TrayIconState::Stale);
     }
 
     #[test]

@@ -10,7 +10,8 @@ SHA-256 checksum.
 `release-device-map-merge.yml` creates a version tag after the automated
 device-map pull request merges, then calls the same release workflow directly.
 The direct call is required because tags pushed with `GITHUB_TOKEN` do not start
-another workflow run.
+another workflow run. A rerun resumes an existing tag only when that tag points
+to the same merge commit. A tag at any other commit stops the workflow.
 
 ## Generated notes
 

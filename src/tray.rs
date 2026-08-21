@@ -448,7 +448,7 @@ fn apply_projection(
 ) -> Result<()> {
     menu.apply_view(view)?;
     let next_icon = match view.icon {
-        TrayIconState::Unknown => icon::neutral_icon()?,
+        TrayIconState::Unknown | TrayIconState::Stale => icon::neutral_icon()?,
         TrayIconState::Battery {
             percent,
             charge_state,

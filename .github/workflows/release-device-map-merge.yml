@@ -36,18 +36,28 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
-      - name: Ensure tag does not already exist
+      - name: Resolve existing tag
+        id: tag_state
         shell: bash
         run: |
           set -euo pipefail
           tag="${{ steps.version.outputs.tag }}"
 
           if git ls-remote --tags origin "refs/tags/$tag" | grep -q .; then
-            echo "::error::Tag '$tag' already exists. Refusing duplicate release."
-            exit 1
+            git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+            tagged_commit=$(git rev-list -n 1 "$tag")
+            merge_commit=$(git rev-parse HEAD)
+            if [ "$tagged_commit" != "$merge_commit" ]; then
+              echo "::error::Tag '$tag' points to $tagged_commit, expected $merge_commit."
+              exit 1
+            fi
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create and push tag
+        if: steps.tag_state.outputs.exists != 'true'
         shell: bash
         run: |
           set -euo pipefail

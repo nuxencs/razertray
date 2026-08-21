@@ -124,7 +124,8 @@ keyboards can also appear. Known products use names and protocol details from
 the community [OpenRazer](https://openrazer.github.io/) device database.
 
 Unknown Razer products are probed with a bounded set of interfaces and
-transaction IDs. Unsupported devices are omitted.
+transaction IDs. Unsupported devices are excluded from readable-device entries
+and retained as typed diagnostics in JSON, diagnostic output, and tray status.
 
 ## Limitations
 
