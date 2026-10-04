@@ -5,6 +5,9 @@ use crate::model::BatteryState;
 use anyhow::{Context, Result};
 use tray_icon::Icon;
 
+#[cfg(test)]
+mod preview;
+
 type Rgba = [u8; 4];
 
 /// Edge length of the battery glyph. Windows shows tray icons at 16x16 px at 100% scale.
