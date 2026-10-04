@@ -32,8 +32,8 @@ pick which one the icon tracks.
    there's no installer.
 2. Run it. It starts in the system tray with no main window and keeps working
    in the background.
-3. By default it sets itself to start automatically when you log in to Windows.
-   You can turn this off any time from the tray menu.
+3. To start it automatically when you log in to Windows, turn on
+   **Start at login** in the tray menu. It is off by default.
 
 Quick check from a terminal (works without opening the tray):
 
@@ -48,13 +48,15 @@ handy for confirming your mouse is picked up.
 
 Right-click the icon for the menu:
 
-- **Status line** — the watched device, its battery percentage, and `(charging)`
+- **Status line**: the watched device, its battery percentage, and `(charging)`
   if it's plugged in (or "No supported Razer devices" if none are found)
-- **Select Device** — lists every Razer device found, each with its name,
+- **Select Device**: lists every Razer device found, each with its name,
   battery percentage and charge state, with a checkmark on the one being tracked
-- **Refresh now** — check the battery immediately
-- **Start at login** — toggle starting automatically with Windows
-- **Exit** — close the app and remove the icon
+- **Refresh now**: check the battery immediately
+- **Show percentage as text**: show the percentage as colored digits instead of
+  the battery icon
+- **Start at login**: toggle starting automatically with Windows
+- **Exit**: close the app and remove the icon
 
 The icon itself is a small battery that fills up and changes color:
 **blue** while charging, **red** at 15% or below, **orange** up to 35%, and
@@ -136,6 +138,15 @@ Build on Windows (MSVC toolchain + Visual Studio Build Tools):
 ```bash
 cargo build --release --target x86_64-pc-windows-msvc
 # -> target/x86_64-pc-windows-msvc/release/razertray.exe
+```
+
+Pull requests must pass the same checks as CI:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo audit
 ```
 
 The device support map (`src/device_map.rs`) is generated from a local OpenRazer
