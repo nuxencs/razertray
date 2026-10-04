@@ -66,16 +66,20 @@ jobs:
         run: cargo build --release --target x86_64-pc-windows-msvc
 
       - name: Prepare release assets
-        shell: pwsh
+        shell: bash
         run: |
-          $exe = "target/x86_64-pc-windows-msvc/release/razertray.exe"
-          if (-not (Test-Path $exe)) {
-            throw "Expected binary not found at $exe"
-          }
+          set -euo pipefail
+          exe="target/x86_64-pc-windows-msvc/release/razertray.exe"
+          if [ ! -f "$exe" ]; then
+            echo "::error::Expected binary not found at $exe"
+            exit 1
+          fi
 
-          Copy-Item $exe razertray.exe
-          $hash = (Get-FileHash razertray.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  razertray.exe" | Set-Content SHA256SUMS.txt
+          cp "$exe" razertray.exe
+          # printf writes LF line endings, so `sha256sum -c` works on every OS.
+          hash=$(sha256sum razertray.exe | cut -d' ' -f1)
+          printf '%s  razertray.exe\n' "$hash" > SHA256SUMS.txt
+          sha256sum --check --strict SHA256SUMS.txt
 
       - name: Determine release notes range
         id: release_notes
