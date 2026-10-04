@@ -1,0 +1,2 @@
+# Keep the default list ("..") and add project names.
+doc-valid-idents = ["AppUserModelId", "OpenRazer", "PowerShell", ".."]

@@ -24,9 +24,7 @@ jobs:
           python-version: "3.x"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+        run: rustup toolchain install
 
       - name: Install cargo-release
         run: cargo install cargo-release --locked

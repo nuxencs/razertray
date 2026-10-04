@@ -1,3 +1,3 @@
-pub mod client;
-pub mod protocol;
-pub mod scanner;
+pub(crate) mod client;
+pub(crate) mod protocol;
+pub(crate) mod scanner;

@@ -1,0 +1,9 @@
+# Pinned so that a new Rust release cannot break CI with new clippy lints.
+# Bump the version on purpose, and fix new lint findings in the same change.
+# CI installs this toolchain with `rustup toolchain install`.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+# Lets clippy check the Windows-only code from macOS and Linux.
+targets = ["x86_64-pc-windows-msvc"]

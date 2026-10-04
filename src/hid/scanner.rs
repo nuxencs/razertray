@@ -1,120 +1,82 @@
+//! Finds connected Razer devices and picks one HID interface per device.
+
+use crate::model::{DeviceKey, non_empty};
 use hidapi::HidApi;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::ffi::CString;
 
-pub const RAZER_VID: u16 = 0x1532;
+/// Razer's USB vendor ID.
+const RAZER_VID: u16 = 0x1532;
+/// HID usage page "Generic Desktop".
+const USAGE_PAGE_GENERIC_DESKTOP: u16 = 0x01;
+/// HID usage "Mouse" on the Generic Desktop page.
+const USAGE_MOUSE: u16 = 0x02;
 
+/// One Razer device, reduced to the HID interface that answers battery requests.
 #[derive(Clone, Debug)]
-pub struct DiscoveredDevice {
-    pub key: String,
-    pub pid: u16,
-    pub path: CString,
-    pub product_name: String,
-    pub interface_number: i32,
-    pub usage_page: u16,
-    pub usage: u16,
-    pub priority_score: u8,
+pub(crate) struct DiscoveredDevice {
+    pub(crate) key: DeviceKey,
+    pub(crate) pid: u16,
+    pub(crate) path: CString,
+    pub(crate) product_name: String,
+    /// Lower is better. See [`interface_rank`].
+    rank: u8,
 }
 
-pub fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
-    let mut best_by_key: std::collections::BTreeMap<String, DiscoveredDevice> =
-        std::collections::BTreeMap::new();
+/// Lists Razer devices with one entry per [`DeviceKey`], best interface first.
+pub(crate) fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
+    let mut best_by_key: BTreeMap<DeviceKey, DiscoveredDevice> = BTreeMap::new();
 
     for dev in api.device_list().filter(|d| d.vendor_id() == RAZER_VID) {
-        let path = dev.path().to_owned();
-        let key = dedupe_key(dev.product_id(), dev.serial_number());
-
+        let pid = dev.product_id();
         let discovered = DiscoveredDevice {
-            key: key.clone(),
-            pid: dev.product_id(),
-            path,
-            product_name: non_empty_text(dev.product_string())
-                .unwrap_or_else(|| format!("Razer Device {:04X}", dev.product_id())),
-            interface_number: dev.interface_number(),
-            usage_page: dev.usage_page(),
-            usage: dev.usage(),
-            priority_score: candidate_score(dev.interface_number(), dev.usage_page(), dev.usage()),
+            key: DeviceKey::new(pid, dev.serial_number()),
+            pid,
+            path: dev.path().to_owned(),
+            product_name: non_empty(dev.product_string())
+                .map_or_else(|| format!("Razer Device {pid:04X}"), str::to_owned),
+            rank: interface_rank(dev.interface_number(), dev.usage_page(), dev.usage()),
         };
 
-        match best_by_key.entry(key) {
-            std::collections::btree_map::Entry::Occupied(mut e) => {
-                if discovered.priority_score < e.get().priority_score {
+        match best_by_key.entry(discovered.key.clone()) {
+            Entry::Occupied(mut e) => {
+                if discovered.rank < e.get().rank {
                     e.insert(discovered);
                 }
             }
-            std::collections::btree_map::Entry::Vacant(e) => {
+            Entry::Vacant(e) => {
                 e.insert(discovered);
             }
         }
     }
 
     let mut out: Vec<DiscoveredDevice> = best_by_key.into_values().collect();
-    out.sort_by(|a, b| {
-        a.priority_score
-            .cmp(&b.priority_score)
-            .then_with(|| a.pid.cmp(&b.pid))
-            .then_with(|| a.key.cmp(&b.key))
-    });
+    out.sort_by(|a, b| (a.rank, a.pid, &a.key).cmp(&(b.rank, b.pid, &b.key)));
     out
 }
 
-fn non_empty_text(value: Option<&str>) -> Option<String> {
-    value.and_then(|s| {
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
-fn dedupe_key(pid: u16, serial_number: Option<&str>) -> String {
-    if let Some(serial) = non_empty_text(serial_number) {
-        format!("{pid:04X}:{serial}")
-    } else {
-        format!("{pid:04X}")
-    }
-}
-
-fn candidate_score(interface_number: i32, usage_page: u16, usage: u16) -> u8 {
-    if usage_page == 0x01 && usage == 0x02 && interface_number == 0 {
-        0
-    } else if usage_page == 0x01 && usage == 0x02 {
-        1
-    } else {
-        2
+/// Ranks a HID interface. The mouse interface 0 is where OpenRazer sends
+/// mouse commands, so it comes first, then any other mouse interface.
+fn interface_rank(interface_number: i32, usage_page: u16, usage: u16) -> u8 {
+    let is_mouse = usage_page == USAGE_PAGE_GENERIC_DESKTOP && usage == USAGE_MOUSE;
+    match (is_mouse, interface_number) {
+        (true, 0) => 0,
+        (true, _) => 1,
+        (false, _) => 2,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{candidate_score, dedupe_key, non_empty_text};
+    use super::{USAGE_MOUSE, USAGE_PAGE_GENERIC_DESKTOP, interface_rank};
 
     #[test]
-    fn interface_priority_is_ordered() {
-        assert!(candidate_score(0, 0x01, 0x02) < candidate_score(1, 0x01, 0x02));
-        assert!(candidate_score(1, 0x01, 0x02) < candidate_score(1, 0xFF, 0xFF));
-    }
-
-    #[test]
-    fn dedupe_key_uses_serial_when_available() {
-        assert_eq!(dedupe_key(0x00BF, Some("ABC123")), "00BF:ABC123");
-        assert_eq!(dedupe_key(0x00BF, Some("   ")), "00BF");
-        assert_eq!(dedupe_key(0x00BF, None), "00BF");
-    }
-
-    #[test]
-    fn non_empty_text_trims_and_filters_empty() {
-        assert_eq!(
-            non_empty_text(Some("DeathAdder V4 Pro")),
-            Some("DeathAdder V4 Pro".into())
-        );
-        assert_eq!(
-            non_empty_text(Some("  DeathAdder V4 Pro  ")),
-            Some("DeathAdder V4 Pro".into())
-        );
-        assert_eq!(non_empty_text(Some("")), None);
-        assert_eq!(non_empty_text(Some("   ")), None);
-        assert_eq!(non_empty_text(None), None);
+    fn mouse_interface_zero_ranks_first() {
+        let mouse0 = interface_rank(0, USAGE_PAGE_GENERIC_DESKTOP, USAGE_MOUSE);
+        let mouse1 = interface_rank(1, USAGE_PAGE_GENERIC_DESKTOP, USAGE_MOUSE);
+        let vendor0 = interface_rank(0, 0xFF00, 0x01);
+        assert!(mouse0 < mouse1);
+        assert!(mouse1 < vendor0);
     }
 }

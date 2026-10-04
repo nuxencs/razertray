@@ -1,36 +1,47 @@
+//! Reads battery level and charging state from every connected Razer device.
+
 use crate::config::PidCache;
 use crate::device_map;
-use crate::hid::protocol::{
-    FEATURE_REPORT_LENGTH, RazerReport, STATUS_BUSY, STATUS_FAILURE, STATUS_NO_RESPONSE,
-    STATUS_NOT_SUPPORTED, STATUS_SUCCESSFUL, build_battery_request, build_charging_request,
-    expected_response_matches, feature_report_payload,
-};
+use crate::hid::protocol::{Command, FEATURE_REPORT_LENGTH, REPORT_LENGTH, RazerReport, Status};
 use crate::hid::scanner::{DiscoveredDevice, scan_devices};
-use crate::model::{BatteryState, PollResult};
+use crate::model::{BatteryState, Percent, PollFailure, PollResult};
 use anyhow::{Context, Result, bail};
 use hidapi::{HidApi, HidDevice};
 use std::thread;
 use std::time::Duration;
+use tracing::{Level, event};
 
-const MAX_RETRIES: usize = 6;
-const SEND_DELAY: Duration = Duration::from_millis(60);
+/// Attempts per request while the device answers Busy or Timeout.
+const MAX_ATTEMPTS: usize = 6;
+/// Wait between sending a request and reading the response. About twice
+/// OpenRazer's 31 ms for newer wireless receivers
+/// (`RAZER_NEW_MOUSE_RECEIVER_WAIT_US`). Shorter waits get more Busy answers.
+const RESPONSE_DELAY: Duration = Duration::from_millis(60);
+/// Extra wait after a Busy or Timeout answer, before the next attempt. The
+/// worst case per request is `MAX_ATTEMPTS * (RESPONSE_DELAY + RETRY_DELAY)`.
 const RETRY_DELAY: Duration = Duration::from_millis(400);
+/// Transaction IDs to try for devices that are not in the device map, in the
+/// order OpenRazer's mouse driver uses them.
+const PROBE_TRANSACTION_IDS: [u8; 3] = [0x1F, 0x3F, 0xFF];
 
-pub fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollResult {
-    let discovered = scan_devices(api);
+/// Polls every connected Razer device. Probed transaction IDs go into `pid_cache`.
+pub(crate) fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollResult {
     let mut result = PollResult::default();
 
-    for device in discovered {
+    for device in scan_devices(api) {
         match query_device(api, &device, pid_cache) {
             Ok(state) => result.devices.push(state),
-            Err(err) => result.errors.push(format!(
-                "{} ({:04X}): {err}",
-                device.product_name, device.pid
-            )),
+            Err(error) => result.failures.push(PollFailure {
+                name: device.product_name,
+                pid: device.pid,
+                error,
+            }),
         }
     }
 
-    result.sort_devices();
+    result
+        .devices
+        .sort_by(|a, b| (&a.name, a.pid, &a.key).cmp(&(&b.name, b.pid, &b.key)));
     result
 }
 
@@ -40,133 +51,108 @@ fn query_device(
     pid_cache: &mut PidCache,
 ) -> Result<BatteryState> {
     let known = device_map::known_device_support(device.pid);
-    let mut handle = api
+    let handle = api
         .open_path(device.path.as_c_str())
         .with_context(|| format!("failed opening path for {:04X}", device.pid))?;
 
     let transaction_id = match known {
         Some(support) => support.transaction_id,
-        None => match pid_cache.get(device.pid) {
-            Some(cached) => cached,
-            None => {
-                let probed = probe_transaction_id(&mut handle, device.pid)?;
-                pid_cache.set(device.pid, probed);
+        None => {
+            if let Some(cached) = pid_cache.get(device.pid) {
+                cached
+            } else {
+                let probed = probe_transaction_id(&handle, device.pid)?;
+                pid_cache.insert(device.pid, probed);
                 probed
             }
-        },
-    };
-
-    let battery_report = send_request(&mut handle, build_battery_request(transaction_id))?;
-    let battery_percent = scale_percent(battery_report.arguments[1]);
-
-    let supports_charging_status = match known {
-        Some(support) => support.supports_charging_status,
-        None => true,
-    };
-
-    let is_charging = if supports_charging_status {
-        match send_request(&mut handle, build_charging_request(transaction_id)) {
-            Ok(report) => report.arguments[1] > 0,
-            Err(_) => false,
         }
-    } else {
-        false
     };
 
-    let display_name = known
-        .map(|support| support.name.to_string())
-        .unwrap_or_else(|| device.product_name.clone());
+    let battery = send_request(
+        &handle,
+        RazerReport::request(Command::BATTERY_LEVEL, transaction_id),
+    )?;
+
+    // Unknown devices may still report charging; a failed request reads as "not charging".
+    let supports_charging_status = known.is_none_or(|support| support.supports_charging_status);
+    let charging = supports_charging_status
+        && match send_request(
+            &handle,
+            RazerReport::request(Command::CHARGING_STATUS, transaction_id),
+        ) {
+            Ok(report) => report.value() > 0,
+            Err(err) => {
+                event!(
+                    name: "device.charging.failure",
+                    Level::DEBUG,
+                    device.pid = %format_args!("{:04X}", device.pid),
+                    exception.message = %format_args!("{err:#}"),
+                    "no charging status from {{device.pid}}, assuming not charging: {{exception.message}}",
+                );
+                false
+            }
+        };
 
     Ok(BatteryState {
-        device_key: device.key.clone(),
-        display_name,
+        key: device.key.clone(),
+        name: known.map_or_else(
+            || device.product_name.clone(),
+            |support| support.name.to_owned(),
+        ),
         pid: device.pid,
-        battery_percent,
-        is_charging,
-        supports_charging_status,
+        percent: Percent::from_raw(battery.value()),
+        charging,
     })
 }
 
-fn probe_transaction_id(handle: &mut HidDevice, pid: u16) -> Result<u8> {
-    // OpenRazer mouse drivers use this transaction-id probe order for battery requests.
-    for tx in [0x1F_u8, 0x3F_u8, 0xFF_u8] {
-        if send_request(handle, build_battery_request(tx)).is_ok() {
-            return Ok(tx);
-        }
-    }
-
-    bail!("unable to determine transaction id for {:04X}", pid)
+fn probe_transaction_id(handle: &HidDevice, pid: u16) -> Result<u8> {
+    PROBE_TRANSACTION_IDS
+        .into_iter()
+        .find(|&tx| send_request(handle, RazerReport::request(Command::BATTERY_LEVEL, tx)).is_ok())
+        .with_context(|| format!("unable to determine transaction id for {pid:04X}"))
 }
 
-fn send_request(handle: &mut HidDevice, request: RazerReport) -> Result<RazerReport> {
-    let request_payload = feature_report_payload(&request);
+fn send_request(handle: &HidDevice, request: RazerReport) -> Result<RazerReport> {
+    let payload = request.to_feature_report();
 
-    for attempt in 0..MAX_RETRIES {
+    let mut attempt = 1;
+    loop {
         handle
-            .send_feature_report(&request_payload)
+            .send_feature_report(&payload)
             .context("send_feature_report failed")?;
 
-        thread::sleep(SEND_DELAY);
+        thread::sleep(RESPONSE_DELAY);
 
-        let mut response_buffer = [0u8; FEATURE_REPORT_LENGTH];
-        response_buffer[0] = 0x00;
-
+        // Byte 0 is the report ID (0) that hidapi expects on input.
+        let mut buffer = [0u8; FEATURE_REPORT_LENGTH];
         let count = handle
-            .get_feature_report(&mut response_buffer)
+            .get_feature_report(&mut buffer)
             .context("get_feature_report failed")?;
-
         if count != FEATURE_REPORT_LENGTH {
-            bail!("expected {} bytes, got {count}", FEATURE_REPORT_LENGTH);
+            bail!("expected {FEATURE_REPORT_LENGTH} bytes, got {count}");
         }
 
-        let response = RazerReport::from_bytes(&response_buffer[1..])?;
-
-        if !response.is_valid_crc() {
+        let body: &[u8; REPORT_LENGTH] = buffer[1..]
+            .try_into()
+            .expect("FEATURE_REPORT_LENGTH is REPORT_LENGTH + 1");
+        let response = RazerReport::from_bytes(body);
+        if !response.has_valid_crc() {
             bail!("invalid response crc");
         }
-
-        if !expected_response_matches(&request, &response) {
+        if !response.answers(&request) {
             bail!("response did not match request");
         }
 
-        match response.status {
-            STATUS_SUCCESSFUL => return Ok(response),
-            STATUS_BUSY | STATUS_NO_RESPONSE if attempt + 1 < MAX_RETRIES => {
+        match response.status()? {
+            Status::Successful => return Ok(response),
+            Status::Busy | Status::Timeout if attempt < MAX_ATTEMPTS => {
                 thread::sleep(RETRY_DELAY);
+                attempt += 1;
             }
-            STATUS_FAILURE => bail!("device returned STATUS_FAILURE"),
-            STATUS_NOT_SUPPORTED => bail!("device returned STATUS_NOT_SUPPORTED"),
-            STATUS_BUSY | STATUS_NO_RESPONSE => {
-                bail!("device stayed busy/unresponsive after retries")
+            status @ (Status::Busy | Status::Timeout) => {
+                bail!("device still answered {status:?} after {MAX_ATTEMPTS} attempts")
             }
-            other => bail!("unexpected status: 0x{other:02X}"),
+            status => bail!("device answered {status:?}"),
         }
-    }
-
-    bail!("request exhausted retries")
-}
-
-fn scale_percent(raw: u8) -> u8 {
-    // Match OpenRazer's user-facing conversion, which truncates: the daemon
-    // computes (raw / 255) * 100 as a float and pylib applies int() to it
-    // (floor), so a raw of 254 reads as 99%, not 100%.
-    (raw as u16 * 100 / 255) as u8
-}
-
-#[cfg(test)]
-mod tests {
-    use super::scale_percent;
-
-    #[test]
-    fn scaling_truncates_like_reference() {
-        // OpenRazer floors the percentage (int((raw / 255) * 100)); these
-        // include the boundary cases where rounding would disagree (127, 254).
-        assert_eq!(scale_percent(0), 0);
-        assert_eq!(scale_percent(1), 0);
-        assert_eq!(scale_percent(127), 49);
-        assert_eq!(scale_percent(128), 50);
-        assert_eq!(scale_percent(191), 74);
-        assert_eq!(scale_percent(254), 99);
-        assert_eq!(scale_percent(255), 100);
     }
 }
