@@ -1,4 +1,4 @@
-use crate::config::{self, AppConfig};
+use crate::config::{self, AppConfig, Loaded};
 use crate::hid::client;
 use anyhow::{Context, Result};
 use hidapi::HidApi;
@@ -12,10 +12,15 @@ const LOG_FILES_TO_KEEP: usize = 3;
 const MAX_LOG_FILE_BYTES: u64 = 1_048_576;
 
 pub fn run_once() -> Result<()> {
-    let cfg = config::load_or_create_config()?;
-    init_logging(&cfg);
-
-    let mut cache = config::load_or_create_pid_cache()?;
+    let loaded = load_config();
+    if let Some(problem) = &loaded.problem {
+        eprintln!("warning: {problem:#}");
+    }
+    let cache = config::load_pid_cache();
+    if let Some(problem) = &cache.problem {
+        tracing::warn!("{problem:#}");
+    }
+    let mut cache = cache.value;
     let api = HidApi::new().context("failed to initialize hidapi")?;
 
     let result = client::poll_devices(&api, &mut cache);
@@ -49,9 +54,7 @@ pub fn run_once() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 pub fn run_tray() -> Result<()> {
-    let cfg = config::load_or_create_config()?;
-    init_logging(&cfg);
-    crate::tray::run_tray_app(cfg)
+    crate::tray::run_tray_app(load_config().value)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -59,9 +62,24 @@ pub fn run_tray() -> Result<()> {
     anyhow::bail!("tray mode is only supported on Windows")
 }
 
+/// Loads the config and starts logging, then logs any config problem.
+///
+/// Never fails: a broken config must not stop the tray app, which has no
+/// console to report the error on.
+fn load_config() -> Loaded<AppConfig> {
+    let loaded = config::load_config();
+    init_logging(&loaded.value);
+    if let Some(problem) = &loaded.problem {
+        tracing::warn!("{problem:#}");
+    }
+    loaded
+}
+
 fn init_logging(cfg: &AppConfig) {
-    let filter =
-        EnvFilter::try_new(cfg.log_level.clone()).unwrap_or_else(|_| EnvFilter::new("info"));
+    let (filter, filter_err) = match EnvFilter::try_new(&cfg.log_level) {
+        Ok(filter) => (filter, None),
+        Err(err) => (EnvFilter::new("info"), Some(err)),
+    };
     let log_path = config::log_path();
     if let Some(parent) = log_path.parent()
         && let Err(err) = fs::create_dir_all(parent)
@@ -95,6 +113,13 @@ fn init_logging(cfg: &AppConfig) {
         tracing::warn!(
             "failed to open log file {}, using stderr",
             log_path.display()
+        );
+    }
+
+    if let Some(err) = filter_err {
+        tracing::warn!(
+            "invalid log_level {:?}, using \"info\": {err}",
+            cfg.log_level
         );
     }
 }

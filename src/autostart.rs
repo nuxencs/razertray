@@ -13,15 +13,21 @@ const RUN_VALUE_NAME: &str = APP_ID;
 
 #[cfg(target_os = "windows")]
 pub fn is_enabled() -> Result<bool> {
+    use std::io::ErrorKind;
     use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key = hkcu
-        .open_subkey_with_flags(RUN_KEY_PATH, KEY_READ)
-        .context("failed to open Run key")?;
-    let value: Result<String, _> = key.get_value(RUN_VALUE_NAME);
-    Ok(value.is_ok())
+    let key = match hkcu.open_subkey_with_flags(RUN_KEY_PATH, KEY_READ) {
+        Ok(key) => key,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).context("failed to open Run key"),
+    };
+    match key.get_raw_value(RUN_VALUE_NAME) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).context("failed reading Run key value"),
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -31,6 +37,8 @@ pub fn is_enabled() -> Result<bool> {
 
 #[cfg(target_os = "windows")]
 pub fn set_enabled(exe_path: &Path, enabled: bool) -> Result<()> {
+    use std::ffi::OsString;
+    use std::io::ErrorKind;
     use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
 
@@ -40,10 +48,19 @@ pub fn set_enabled(exe_path: &Path, enabled: bool) -> Result<()> {
         .context("failed to create/open Run key")?;
 
     if enabled {
-        key.set_value(RUN_VALUE_NAME, &exe_path.display().to_string())
+        // Quoted: Windows splits an unquoted Run command at the first space,
+        // so a path such as `C:\Program Files\...` would not start.
+        let mut command = OsString::from("\"");
+        command.push(exe_path);
+        command.push("\"");
+        key.set_value(RUN_VALUE_NAME, &command)
             .context("failed writing Run key value")?;
     } else {
-        let _ = key.delete_value(RUN_VALUE_NAME);
+        match key.delete_value(RUN_VALUE_NAME) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err).context("failed deleting Run key value"),
+        }
     }
 
     Ok(())

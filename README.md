@@ -99,6 +99,11 @@ autostart = false                 # start with Windows (toggle from the tray men
 log_level = "info"                # detail level for the log file
 ```
 
+If razertray cannot read `config.toml` (for example after a typo), it still
+starts with the default settings. It renames the broken file to
+`config.toml.invalid` and writes the reason to the log, so you can fix the file
+and rename it back.
+
 Other files in the same `%APPDATA%\razertray\` folder:
 
 - `pid_cache.toml` — remembers how to talk to devices it had to probe

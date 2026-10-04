@@ -37,12 +37,16 @@ impl Notifier {
             return false;
         }
 
-        if send_toast_low_battery(state).is_ok() {
-            self.last_sent.insert(state.device_key.clone(), now);
-            return true;
+        match send_toast_low_battery(state) {
+            Ok(()) => {
+                self.last_sent.insert(state.device_key.clone(), now);
+                true
+            }
+            Err(err) => {
+                tracing::warn!("failed showing low-battery notification: {err:#}");
+                false
+            }
         }
-
-        false
     }
 }
 

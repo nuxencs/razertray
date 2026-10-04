@@ -134,9 +134,16 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
         tracing::warn!("failed to apply autostart setting: {err}");
     }
 
-    let autostart_enabled = autostart::is_enabled().unwrap_or(cfg.autostart);
+    let autostart_enabled = autostart::is_enabled().unwrap_or_else(|err| {
+        tracing::warn!("failed reading autostart state: {err:#}");
+        cfg.autostart
+    });
 
-    let cache = config::load_or_create_pid_cache().unwrap_or_else(|_| PidCache::default());
+    let cache = config::load_pid_cache();
+    if let Some(problem) = &cache.problem {
+        tracing::warn!("{problem:#}");
+    }
+    let cache = cache.value;
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -390,7 +397,9 @@ fn spawn_poll_worker(
 
             let poll_result = match api.as_mut() {
                 Some(a) => {
-                    let _ = a.refresh_devices();
+                    if let Err(err) = a.refresh_devices() {
+                        tracing::warn!("failed refreshing hid device list: {err}");
+                    }
                     client::poll_devices(a, &mut cache)
                 }
                 None => PollResult {

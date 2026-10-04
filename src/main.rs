@@ -8,12 +8,10 @@ use anyhow::Result;
 /// or autostart).
 #[cfg(windows)]
 fn attach_parent_console() {
-    // kernel32 is always linked on Windows; declare the one call we need.
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn AttachConsole(dw_process_id: u32) -> i32;
-    }
-    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF; // (DWORD)-1
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+
+    // SAFETY: AttachConsole takes a plain process ID and no pointers. Failure
+    // (no parent console) only returns FALSE, which needs no handling here.
     unsafe {
         AttachConsole(ATTACH_PARENT_PROCESS);
     }

@@ -67,7 +67,13 @@ fn query_device(
     let is_charging = if supports_charging_status {
         match send_request(&mut handle, build_charging_request(transaction_id)) {
             Ok(report) => report.arguments[1] > 0,
-            Err(_) => false,
+            Err(err) => {
+                tracing::debug!(
+                    "charging status request failed for {:04X}: {err:#}",
+                    device.pid
+                );
+                false
+            }
         }
     } else {
         false

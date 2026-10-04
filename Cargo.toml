@@ -23,3 +23,7 @@ tag = false
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.8.1"
 winreg = "0.55.0"
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+
+[dev-dependencies]
+tempfile = "3"
