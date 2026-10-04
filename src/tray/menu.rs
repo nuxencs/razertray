@@ -117,7 +117,10 @@ impl TrayMenu {
 
         for device in devices {
             let checked = Some(&device.key) == selected;
-            let item = CheckMenuItem::new(device_label(device), true, checked, None);
+            // Stable ID per device: polls rebuild the list, possibly while the
+            // menu is open, and a click on a replaced item must still resolve.
+            let id = format!("device:{}", device.key);
+            let item = CheckMenuItem::with_id(id, device_label(device), true, checked, None);
             self.devices_submenu.append(&item)?;
             self.devices.push((item, device.key.clone()));
         }
