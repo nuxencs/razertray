@@ -18,9 +18,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
+        run: rustup toolchain install
 
       - name: Validate tag matches Cargo version
         shell: bash

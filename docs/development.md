@@ -29,9 +29,21 @@ Most of the tray code compiles only for Windows. On macOS or Linux, also run
 clippy for the Windows target:
 
 ```bash
-rustup target add x86_64-pc-windows-msvc
 cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 ```
+
+## Rust version
+
+`rust-toolchain.toml` pins the Rust version, with clippy, rustfmt and the
+Windows target. rustup installs it on the first `cargo` command in the
+repository, and CI installs it with `rustup toolchain install`.
+
+The pin keeps CI stable: a new Rust release cannot add clippy lints that fail
+an unchanged branch. To move to a newer Rust version:
+
+1. Change `channel` in `rust-toolchain.toml`.
+2. Run all [checks](#checks), on both targets.
+3. Fix the new lint findings in the same pull request.
 
 ## Device list
 
