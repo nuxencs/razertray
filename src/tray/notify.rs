@@ -64,6 +64,7 @@ impl Notifier {
     }
 
     #[cfg(not(target_os = "windows"))]
+    #[expect(clippy::unused_self, reason = "same signature as the Windows version")]
     fn show_toast(&self, _device: &BatteryState) -> anyhow::Result<()> {
         anyhow::bail!("notifications are only supported on Windows")
     }

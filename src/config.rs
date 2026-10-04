@@ -142,6 +142,7 @@ mod empty_is_none {
     use crate::model::DeviceKey;
     use serde::{Deserialize, Deserializer, Serializer};
 
+    #[expect(clippy::ref_option, reason = "serde `with` requires this signature")]
     pub(super) fn serialize<S: Serializer>(
         key: &Option<DeviceKey>,
         serializer: S,
