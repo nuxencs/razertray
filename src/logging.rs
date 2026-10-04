@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
+use tracing::{Level, event};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -30,14 +31,29 @@ pub(crate) fn init(cfg: &AppConfig) {
         }
         Err(err) => {
             let _ = builder.try_init();
-            tracing::warn!("failed to open log file, using stderr: {err}");
+            event!(
+                name: "log.open.failure",
+                Level::WARN,
+                exception.message = %format_args!("{err:#}"),
+                "cannot open the log file, logging to stderr: {{exception.message}}",
+            );
         }
     }
 
+    event!(
+        name: "app.start",
+        Level::INFO,
+        service.version = env!("CARGO_PKG_VERSION"),
+        "razertray {{service.version}} started"
+    );
+
     if let Some(err) = filter_err {
-        tracing::warn!(
-            "invalid log_level {:?}, using \"info\": {err}",
-            cfg.log_level
+        event!(
+            name: "log.filter.invalid",
+            Level::WARN,
+            config.log_level = %cfg.log_level,
+            exception.message = %format_args!("{err:#}"),
+            "invalid log_level {{config.log_level}}, using \"info\": {{exception.message}}",
         );
     }
 }

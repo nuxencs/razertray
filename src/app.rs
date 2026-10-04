@@ -5,6 +5,7 @@ use crate::hid::client;
 use crate::logging;
 use anyhow::{Context, Result};
 use hidapi::HidApi;
+use tracing::{Level, event};
 
 /// Prints one battery reading per connected Razer device, then returns.
 ///
@@ -76,7 +77,12 @@ pub fn run_tray() -> Result<()> {
 pub(crate) fn load_pid_cache() -> PidCache {
     let loaded = PidCache::load();
     if let Some(problem) = &loaded.problem {
-        tracing::warn!("{problem:#}");
+        event!(
+            name: "pid_cache.load.failure",
+            Level::WARN,
+            exception.message = %format_args!("{problem:#}"),
+            "pid cache not usable: {{exception.message}}"
+        );
     }
     loaded.value
 }
@@ -89,7 +95,12 @@ fn load_config() -> Loaded<AppConfig> {
     let loaded = AppConfig::load();
     logging::init(&loaded.value);
     if let Some(problem) = &loaded.problem {
-        tracing::warn!("{problem:#}");
+        event!(
+            name: "config.load.failure",
+            Level::WARN,
+            exception.message = %format_args!("{problem:#}"),
+            "config not usable: {{exception.message}}",
+        );
     }
     loaded
 }

@@ -3,6 +3,7 @@
 use crate::model::{BatteryState, DeviceKey};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use tracing::{Level, event};
 
 /// Sends at most one low-battery toast per device per cooldown.
 #[derive(Debug)]
@@ -37,8 +38,22 @@ impl Notifier {
         match self.show_toast(device) {
             Ok(()) => {
                 self.last_sent.insert(device.key.clone(), now);
+                event!(
+                    name: "notify.toast.success",
+                    Level::INFO,
+                    device.name = %device.name,
+                    battery.percent = device.percent.get(),
+                    "low-battery toast shown for {{device.name}} at {{battery.percent}}%",
+                );
             }
-            Err(err) => tracing::warn!("failed showing low-battery notification: {err:#}"),
+            Err(err) => {
+                event!(
+                    name: "notify.toast.failure",
+                    Level::WARN,
+                    exception.message = %format_args!("{err:#}"),
+                    "cannot show the low-battery toast: {{exception.message}}",
+                );
+            }
         }
     }
 
@@ -78,8 +93,11 @@ impl Notifier {
         self.app_id.get_or_init(|| match register_app_id() {
             Ok(()) => crate::APP_ID,
             Err(err) => {
-                tracing::warn!(
-                    "failed registering toast AUMID, falling back to PowerShell sender: {err:#}"
+                event!(
+                    name: "notify.app_id.failure",
+                    Level::WARN,
+                    exception.message = %format_args!("{err:#}"),
+                    "cannot register the toast sender, using the PowerShell sender: {{exception.message}}",
                 );
                 Toast::POWERSHELL_APP_ID
             }
@@ -107,7 +125,12 @@ fn register_app_id() -> anyhow::Result<()> {
     if let Ok(exe_path) = std::env::current_exe()
         && let Err(err) = key.set_value("IconUri", &exe_path.as_os_str())
     {
-        tracing::debug!("failed writing IconUri for toast AUMID: {err}");
+        event!(
+            name: "notify.app_id_icon.failure",
+            Level::DEBUG,
+            exception.message = %err,
+            "cannot set the toast sender icon: {{exception.message}}",
+        );
     }
 
     Ok(())

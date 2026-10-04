@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use hidapi::{HidApi, HidDevice};
 use std::thread;
 use std::time::Duration;
+use tracing::{Level, event};
 
 /// Attempts per request while the device answers Busy or Timeout.
 const MAX_ATTEMPTS: usize = 6;
@@ -81,9 +82,12 @@ fn query_device(
         ) {
             Ok(report) => report.value() > 0,
             Err(err) => {
-                tracing::debug!(
-                    "charging status request failed for {:04X}: {err:#}",
-                    device.pid
+                event!(
+                    name: "device.charging.failure",
+                    Level::DEBUG,
+                    device.pid = %format_args!("{:04X}", device.pid),
+                    exception.message = %format_args!("{err:#}"),
+                    "no charging status from {{device.pid}}, assuming not charging: {{exception.message}}",
                 );
                 false
             }

@@ -9,6 +9,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 use tao::event_loop::EventLoopProxy;
+use tracing::{Level, event};
 
 /// First retry delay after a poll that finds no device. It doubles on each
 /// further empty poll, up to the poll interval.
@@ -64,7 +65,14 @@ fn poll_loop(
         if api.is_none() {
             match HidApi::new() {
                 Ok(new_api) => api = Some(new_api),
-                Err(err) => tracing::warn!("failed initializing hidapi: {err}"),
+                Err(err) => {
+                    event!(
+                        name: "hidapi.init.failure",
+                        Level::WARN,
+                        exception.message = %err,
+                        "cannot start hidapi: {{exception.message}}",
+                    );
+                }
             }
         }
 
@@ -72,7 +80,12 @@ fn poll_loop(
         let result = match api.as_mut() {
             Some(api) => {
                 if let Err(err) = api.refresh_devices() {
-                    tracing::warn!("failed refreshing hid device list: {err}");
+                    event!(
+                        name: "hidapi.refresh.failure",
+                        Level::WARN,
+                        exception.message = %err,
+                        "cannot refresh the HID device list: {{exception.message}}",
+                    );
                 }
                 client::poll_devices(api, &mut cache)
             }
@@ -83,7 +96,12 @@ fn poll_loop(
         if cache != cache_before
             && let Err(err) = cache.save()
         {
-            tracing::warn!("failed saving pid cache: {err:#}");
+            event!(
+                name: "pid_cache.save.failure",
+                Level::WARN,
+                exception.message = %format_args!("{err:#}"),
+                "cannot save the pid cache: {{exception.message}}",
+            );
         }
 
         let wait = if result.devices.is_empty() {

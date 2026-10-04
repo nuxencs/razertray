@@ -18,6 +18,7 @@ use readings::{PollUpdate, Readings};
 use std::path::{Path, PathBuf};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tracing::{Level, event};
 use tray_icon::menu::{MenuEvent, MenuId};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 use worker::Worker;
@@ -36,7 +37,14 @@ pub(crate) fn run(mut cfg: AppConfig) -> Result<()> {
     // Show the real state in the menu, in case applying the setting failed.
     match autostart::is_enabled() {
         Ok(enabled) => cfg.autostart = enabled,
-        Err(err) => tracing::warn!("failed reading autostart state: {err:#}"),
+        Err(err) => {
+            event!(
+                name: "autostart.read.failure",
+                Level::WARN,
+                exception.message = %format_args!("{err:#}"),
+                "cannot read the autostart state: {{exception.message}}",
+            );
+        }
     }
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
@@ -126,12 +134,23 @@ impl TrayApp {
 
     fn on_poll(&mut self, result: PollResult) {
         for failure in &result.failures {
-            tracing::warn!("poll error: {failure}");
+            event!(
+                name: "poll.device.failure",
+                Level::WARN,
+                device.name = %failure.name,
+                device.pid = %format_args!("{:04X}", failure.pid),
+                exception.message = %format_args!("{:#}", failure.error),
+                "no reading from {{device.name}}: {{exception.message}}",
+            );
         }
 
         match self.readings.apply_poll(result.devices) {
             PollUpdate::Kept => {
-                tracing::debug!("empty poll counted as a short gap; keeping last reading");
+                event!(
+                    name: "poll.gap.kept",
+                    Level::DEBUG,
+                    "empty poll counted as a short gap, keeping the last reading",
+                );
             }
             PollUpdate::Replaced { selection_changed } => {
                 if selection_changed {
@@ -142,7 +161,12 @@ impl TrayApp {
                     .menu
                     .set_devices(self.readings.devices(), self.readings.selected_key())
                 {
-                    tracing::warn!("failed rebuilding menu: {err:#}");
+                    event!(
+                        name: "menu.update.failure",
+                        Level::WARN,
+                        exception.message = %format_args!("{err:#}"),
+                        "cannot update the device menu: {{exception.message}}",
+                    );
                 }
                 self.refresh_icon();
                 for device in self.readings.devices() {
@@ -154,7 +178,12 @@ impl TrayApp {
 
     fn save_config(&self) {
         if let Err(err) = self.cfg.save() {
-            tracing::warn!("failed saving config: {err:#}");
+            event!(
+                name: "config.save.failure",
+                Level::WARN,
+                exception.message = %format_args!("{err:#}"),
+                "cannot save the config: {{exception.message}}",
+            );
         }
     }
 
@@ -168,7 +197,12 @@ impl TrayApp {
             .and_then(|icon| Ok(self.icon.set_icon(Some(icon))?))
             .and_then(|()| Ok(self.icon.set_tooltip(Some(&status))?));
         if let Err(err) = result {
-            tracing::warn!("failed updating tray icon: {err:#}");
+            event!(
+                name: "tray.icon.failure",
+                Level::WARN,
+                exception.message = %format_args!("{err:#}"),
+                "cannot update the tray icon: {{exception.message}}",
+            );
         }
     }
 }
@@ -186,6 +220,11 @@ fn apply_autostart(exe_path: &Path, enabled: bool) {
         autostart::disable()
     };
     if let Err(err) = result {
-        tracing::warn!("failed applying autostart setting: {err:#}");
+        event!(
+            name: "autostart.apply.failure",
+            Level::WARN,
+            exception.message = %format_args!("{err:#}"),
+            "cannot apply the autostart setting: {{exception.message}}",
+        );
     }
 }
