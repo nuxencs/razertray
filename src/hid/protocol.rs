@@ -1,26 +1,26 @@
 use anyhow::{Result, bail};
 
-pub const REPORT_LENGTH: usize = 90;
-pub const FEATURE_REPORT_LENGTH: usize = 91;
+pub(crate) const REPORT_LENGTH: usize = 90;
+pub(crate) const FEATURE_REPORT_LENGTH: usize = 91;
 
-pub const STATUS_BUSY: u8 = 0x01;
-pub const STATUS_SUCCESSFUL: u8 = 0x02;
-pub const STATUS_FAILURE: u8 = 0x03;
-pub const STATUS_NO_RESPONSE: u8 = 0x04;
-pub const STATUS_NOT_SUPPORTED: u8 = 0x05;
+pub(crate) const STATUS_BUSY: u8 = 0x01;
+pub(crate) const STATUS_SUCCESSFUL: u8 = 0x02;
+pub(crate) const STATUS_FAILURE: u8 = 0x03;
+pub(crate) const STATUS_NO_RESPONSE: u8 = 0x04;
+pub(crate) const STATUS_NOT_SUPPORTED: u8 = 0x05;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RazerReport {
-    pub status: u8,
-    pub transaction_id: u8,
-    pub remaining_packets: u16,
-    pub protocol_type: u8,
-    pub data_size: u8,
-    pub command_class: u8,
-    pub command_id: u8,
-    pub arguments: [u8; 80],
-    pub crc: u8,
-    pub reserved: u8,
+pub(crate) struct RazerReport {
+    pub(crate) status: u8,
+    pub(crate) transaction_id: u8,
+    pub(crate) remaining_packets: u16,
+    pub(crate) protocol_type: u8,
+    pub(crate) data_size: u8,
+    pub(crate) command_class: u8,
+    pub(crate) command_id: u8,
+    pub(crate) arguments: [u8; 80],
+    pub(crate) crc: u8,
+    pub(crate) reserved: u8,
 }
 
 impl Default for RazerReport {
@@ -41,7 +41,7 @@ impl Default for RazerReport {
 }
 
 impl RazerReport {
-    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+    pub(crate) fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() != REPORT_LENGTH {
             bail!("expected {REPORT_LENGTH} bytes, got {}", data.len());
         }
@@ -63,7 +63,7 @@ impl RazerReport {
         })
     }
 
-    pub fn to_bytes(&self) -> [u8; REPORT_LENGTH] {
+    pub(crate) fn to_bytes(self) -> [u8; REPORT_LENGTH] {
         let mut out = [0u8; REPORT_LENGTH];
         out[0] = self.status;
         out[1] = self.transaction_id;
@@ -78,25 +78,25 @@ impl RazerReport {
         out
     }
 
-    pub fn calculate_crc(&self) -> u8 {
+    pub(crate) fn calculate_crc(&self) -> u8 {
         let bytes = self.to_bytes();
         bytes[2..88].iter().fold(0u8, |crc, byte| crc ^ byte)
     }
 
-    pub fn is_valid_crc(&self) -> bool {
+    pub(crate) fn is_valid_crc(&self) -> bool {
         self.calculate_crc() == self.crc
     }
 }
 
-pub fn build_battery_request(transaction_id: u8) -> RazerReport {
+pub(crate) fn build_battery_request(transaction_id: u8) -> RazerReport {
     build_request(transaction_id, 0x07, 0x80, 0x02)
 }
 
-pub fn build_charging_request(transaction_id: u8) -> RazerReport {
+pub(crate) fn build_charging_request(transaction_id: u8) -> RazerReport {
     build_request(transaction_id, 0x07, 0x84, 0x02)
 }
 
-pub fn build_request(
+pub(crate) fn build_request(
     transaction_id: u8,
     command_class: u8,
     command_id: u8,
@@ -116,13 +116,13 @@ pub fn build_request(
     }
 }
 
-pub fn expected_response_matches(request: &RazerReport, response: &RazerReport) -> bool {
+pub(crate) fn expected_response_matches(request: &RazerReport, response: &RazerReport) -> bool {
     response.remaining_packets == request.remaining_packets
         && response.command_class == request.command_class
         && response.command_id == request.command_id
 }
 
-pub fn feature_report_payload(report: &RazerReport) -> [u8; FEATURE_REPORT_LENGTH] {
+pub(crate) fn feature_report_payload(report: &RazerReport) -> [u8; FEATURE_REPORT_LENGTH] {
     let mut payload = [0u8; FEATURE_REPORT_LENGTH];
     let mut request = *report;
     request.crc = request.calculate_crc();

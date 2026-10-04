@@ -5,18 +5,18 @@ const SIZE: usize = 16;
 /// Text icons render at higher resolution so the downscaled digits stay crisp.
 const TEXT_SIZE: usize = 32;
 
-pub fn neutral_icon() -> Result<Icon> {
+pub(crate) fn neutral_icon() -> Result<Icon> {
     build_icon(None, false)
 }
 
-pub fn battery_icon(percent: u8, charging: bool) -> Result<Icon> {
+pub(crate) fn battery_icon(percent: u8, charging: bool) -> Result<Icon> {
     build_icon(Some(percent), charging)
 }
 
 /// Render the battery percentage as text (the digits themselves are the icon).
 /// Used by the "show percentage as text" view mode. Digits are colored by
 /// level and given a dark outline so they read on light or dark taskbars.
-pub fn text_icon(percent: u8, charging: bool) -> Result<Icon> {
+pub(crate) fn text_icon(percent: u8, charging: bool) -> Result<Icon> {
     let mut pixels = vec![0u8; TEXT_SIZE * TEXT_SIZE * 4];
     let label = percent.min(100).to_string();
     draw_number(&mut pixels, &label, level_color(percent, charging));

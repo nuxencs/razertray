@@ -8,16 +8,16 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct AppConfig {
-    pub poll_interval_seconds: u64,
-    pub low_battery_threshold: u8,
-    pub low_battery_cooldown_minutes: u64,
-    pub selected_device_id: String,
-    pub autostart: bool,
-    pub log_level: String,
+pub(crate) struct AppConfig {
+    pub(crate) poll_interval_seconds: u64,
+    pub(crate) low_battery_threshold: u8,
+    pub(crate) low_battery_cooldown_minutes: u64,
+    pub(crate) selected_device_id: String,
+    pub(crate) autostart: bool,
+    pub(crate) log_level: String,
     /// Tray display style: "icon" (battery glyph) or "text" (percentage number).
     #[serde(default = "default_view_mode")]
-    pub view_mode: String,
+    pub(crate) view_mode: String,
 }
 
 fn default_view_mode() -> String {
@@ -27,7 +27,7 @@ fn default_view_mode() -> String {
 impl AppConfig {
     /// True when the tray should render the percentage as text instead of the
     /// battery icon.
-    pub fn text_mode(&self) -> bool {
+    pub(crate) fn text_mode(&self) -> bool {
         self.view_mode.eq_ignore_ascii_case("text")
     }
 }
@@ -47,23 +47,23 @@ impl Default for AppConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct PidCache {
-    pub transaction_ids: BTreeMap<String, u8>,
+pub(crate) struct PidCache {
+    pub(crate) transaction_ids: BTreeMap<String, u8>,
 }
 
 impl PidCache {
-    pub fn get(&self, pid: u16) -> Option<u8> {
+    pub(crate) fn get(&self, pid: u16) -> Option<u8> {
         let key = format!("{:04X}", pid);
         self.transaction_ids.get(&key).copied()
     }
 
-    pub fn set(&mut self, pid: u16, transaction_id: u8) {
+    pub(crate) fn set(&mut self, pid: u16, transaction_id: u8) {
         let key = format!("{:04X}", pid);
         self.transaction_ids.insert(key, transaction_id);
     }
 }
 
-pub fn app_data_dir() -> PathBuf {
+pub(crate) fn app_data_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         if let Some(appdata) = std::env::var_os("APPDATA") {
@@ -79,15 +79,15 @@ pub fn app_data_dir() -> PathBuf {
     PathBuf::from(".").join(APP_ID)
 }
 
-pub fn config_path() -> PathBuf {
+pub(crate) fn config_path() -> PathBuf {
     app_data_dir().join("config.toml")
 }
 
-pub fn pid_cache_path() -> PathBuf {
+pub(crate) fn pid_cache_path() -> PathBuf {
     app_data_dir().join("pid_cache.toml")
 }
 
-pub fn log_path() -> PathBuf {
+pub(crate) fn log_path() -> PathBuf {
     app_data_dir().join(format!("{APP_ID}.log"))
 }
 
@@ -131,10 +131,10 @@ fn file_label(path: &Path) -> std::path::Display<'_> {
 
 /// A loaded settings file, plus the problem that forced a fallback to defaults.
 #[derive(Debug)]
-pub struct Loaded<T> {
-    pub value: T,
+pub(crate) struct Loaded<T> {
+    pub(crate) value: T,
     /// Set when the file existed but could not be used. The caller logs it.
-    pub problem: Option<anyhow::Error>,
+    pub(crate) problem: Option<anyhow::Error>,
 }
 
 /// Loads `path`, or creates it with defaults when it does not exist.
@@ -200,19 +200,19 @@ fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_atomic(path, raw.as_bytes())
 }
 
-pub fn load_config() -> Loaded<AppConfig> {
+pub(crate) fn load_config() -> Loaded<AppConfig> {
     load_or_create(&config_path())
 }
 
-pub fn save_config(cfg: &AppConfig) -> Result<()> {
+pub(crate) fn save_config(cfg: &AppConfig) -> Result<()> {
     save(&config_path(), cfg)
 }
 
-pub fn load_pid_cache() -> Loaded<PidCache> {
+pub(crate) fn load_pid_cache() -> Loaded<PidCache> {
     load_or_create(&pid_cache_path())
 }
 
-pub fn save_pid_cache(cache: &PidCache) -> Result<()> {
+pub(crate) fn save_pid_cache(cache: &PidCache) -> Result<()> {
     save(&pid_cache_path(), cache)
 }
 

@@ -24,8 +24,8 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         attach_parent_console();
 
-        return razertray::app::run_once();
+        return razertray::run_once();
     }
 
-    razertray::app::run_tray()
+    razertray::run_tray()
 }

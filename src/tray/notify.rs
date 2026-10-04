@@ -2,14 +2,14 @@ use crate::model::BatteryState;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-pub struct Notifier {
+pub(crate) struct Notifier {
     threshold: u8,
     cooldown: Duration,
     last_sent: HashMap<String, Instant>,
 }
 
 impl Notifier {
-    pub fn new(threshold: u8, cooldown_minutes: u64) -> Self {
+    pub(crate) fn new(threshold: u8, cooldown_minutes: u64) -> Self {
         Self {
             threshold,
             cooldown: Duration::from_secs(cooldown_minutes.saturating_mul(60)),
@@ -31,7 +31,7 @@ impl Notifier {
         true
     }
 
-    pub fn maybe_notify_low_battery(&mut self, state: &BatteryState) -> bool {
+    pub(crate) fn maybe_notify_low_battery(&mut self, state: &BatteryState) -> bool {
         let now = Instant::now();
         if !self.should_notify(state, now) {
             return false;
@@ -135,7 +135,6 @@ mod tests {
             pid: 0x0072,
             battery_percent: 10,
             is_charging: true,
-            supports_charging_status: true,
         };
 
         assert!(!notifier.maybe_notify_low_battery(&state));
@@ -149,7 +148,6 @@ mod tests {
             pid: 0x0072,
             battery_percent: 10,
             is_charging: false,
-            supports_charging_status: true,
         };
 
         assert_eq!(low_battery_title(&state), "Test Mouse: 10%");
@@ -164,7 +162,6 @@ mod tests {
             pid: 0x0072,
             battery_percent: 10,
             is_charging: false,
-            supports_charging_status: true,
         };
 
         let now = Instant::now();

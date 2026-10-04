@@ -131,7 +131,7 @@ impl MenuHandles {
     }
 }
 
-pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
+pub(crate) fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     let exe_path = std::env::current_exe().context("failed resolving executable path")?;
     if let Err(err) = autostart::set_enabled(&exe_path, cfg.autostart) {
         tracing::warn!("failed to apply autostart setting: {err}");
@@ -462,7 +462,6 @@ mod tests {
             pid: 0x0001,
             battery_percent: 50,
             is_charging: false,
-            supports_charging_status: true,
         }
     }
 

@@ -12,7 +12,7 @@ const RUN_KEY_PATH: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
 const RUN_VALUE_NAME: &str = APP_ID;
 
 #[cfg(target_os = "windows")]
-pub fn is_enabled() -> Result<bool> {
+pub(crate) fn is_enabled() -> Result<bool> {
     use std::io::ErrorKind;
     use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
@@ -31,12 +31,12 @@ pub fn is_enabled() -> Result<bool> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn is_enabled() -> Result<bool> {
+pub(crate) fn is_enabled() -> Result<bool> {
     Ok(false)
 }
 
 #[cfg(target_os = "windows")]
-pub fn set_enabled(exe_path: &Path, enabled: bool) -> Result<()> {
+pub(crate) fn set_enabled(exe_path: &Path, enabled: bool) -> Result<()> {
     use std::ffi::OsString;
     use std::io::ErrorKind;
     use winreg::RegKey;
@@ -67,6 +67,6 @@ pub fn set_enabled(exe_path: &Path, enabled: bool) -> Result<()> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn set_enabled(_exe_path: &Path, _enabled: bool) -> Result<()> {
+pub(crate) fn set_enabled(_exe_path: &Path, _enabled: bool) -> Result<()> {
     Ok(())
 }

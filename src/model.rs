@@ -1,21 +1,20 @@
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BatteryState {
-    pub device_key: String,
-    pub display_name: String,
-    pub pid: u16,
-    pub battery_percent: u8,
-    pub is_charging: bool,
-    pub supports_charging_status: bool,
+pub(crate) struct BatteryState {
+    pub(crate) device_key: String,
+    pub(crate) display_name: String,
+    pub(crate) pid: u16,
+    pub(crate) battery_percent: u8,
+    pub(crate) is_charging: bool,
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct PollResult {
-    pub devices: Vec<BatteryState>,
-    pub errors: Vec<String>,
+pub(crate) struct PollResult {
+    pub(crate) devices: Vec<BatteryState>,
+    pub(crate) errors: Vec<String>,
 }
 
 impl PollResult {
-    pub fn sort_devices(&mut self) {
+    pub(crate) fn sort_devices(&mut self) {
         self.devices.sort_by(|a, b| {
             a.display_name
                 .cmp(&b.display_name)

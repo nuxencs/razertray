@@ -16,7 +16,7 @@ const MAX_RETRIES: usize = 6;
 const SEND_DELAY: Duration = Duration::from_millis(60);
 const RETRY_DELAY: Duration = Duration::from_millis(400);
 
-pub fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollResult {
+pub(crate) fn poll_devices(api: &HidApi, pid_cache: &mut PidCache) -> PollResult {
     let discovered = scan_devices(api);
     let mut result = PollResult::default();
 
@@ -89,7 +89,6 @@ fn query_device(
         pid: device.pid,
         battery_percent,
         is_charging,
-        supports_charging_status,
     })
 }
 

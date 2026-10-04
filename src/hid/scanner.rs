@@ -1,21 +1,18 @@
 use hidapi::HidApi;
 use std::ffi::CString;
 
-pub const RAZER_VID: u16 = 0x1532;
+pub(crate) const RAZER_VID: u16 = 0x1532;
 
 #[derive(Clone, Debug)]
-pub struct DiscoveredDevice {
-    pub key: String,
-    pub pid: u16,
-    pub path: CString,
-    pub product_name: String,
-    pub interface_number: i32,
-    pub usage_page: u16,
-    pub usage: u16,
-    pub priority_score: u8,
+pub(crate) struct DiscoveredDevice {
+    pub(crate) key: String,
+    pub(crate) pid: u16,
+    pub(crate) path: CString,
+    pub(crate) product_name: String,
+    pub(crate) priority_score: u8,
 }
 
-pub fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
+pub(crate) fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
     let mut best_by_key: std::collections::BTreeMap<String, DiscoveredDevice> =
         std::collections::BTreeMap::new();
 
@@ -29,9 +26,6 @@ pub fn scan_devices(api: &HidApi) -> Vec<DiscoveredDevice> {
             path,
             product_name: non_empty_text(dev.product_string())
                 .unwrap_or_else(|| format!("Razer Device {:04X}", dev.product_id())),
-            interface_number: dev.interface_number(),
-            usage_page: dev.usage_page(),
-            usage: dev.usage(),
             priority_score: candidate_score(dev.interface_number(), dev.usage_page(), dev.usage()),
         };
 
