@@ -144,7 +144,7 @@ mod tests {
                 selection_changed: true
             }
         );
-        assert!(readings.devices().is_empty());
+        assert_eq!(readings.devices(), []);
         assert_eq!(readings.selected_key(), None);
     }
 

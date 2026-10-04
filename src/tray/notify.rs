@@ -147,7 +147,7 @@ mod tests {
     use crate::model::{BatteryState, DeviceKey, Percent};
     use std::time::{Duration, Instant};
 
-    const COOLDOWN: Duration = Duration::from_secs(2 * 60 * 60);
+    const COOLDOWN: Duration = Duration::from_hours(2);
 
     fn device(percent: u8, charging: bool) -> BatteryState {
         BatteryState {

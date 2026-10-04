@@ -63,7 +63,12 @@ impl Canvas {
 
     #[cfg(test)]
     fn count(&self, rgba: Rgba) -> usize {
-        self.pixels.chunks_exact(4).filter(|px| *px == rgba).count()
+        self.pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|&&px| px == rgba)
+            .count()
     }
 
     fn into_icon(self) -> Result<Icon> {
