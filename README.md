@@ -97,6 +97,7 @@ low_battery_cooldown_minutes = 120  # minimum gap between repeat warnings
 selected_device_id = ""           # which device to watch (set from the menu)
 autostart = false                 # start with Windows (toggle from the tray menu)
 log_level = "info"                # detail level for the log file
+view_mode = "icon"                # "icon" (battery) or "text" (percentage digits)
 ```
 
 If razertray cannot read `config.toml` (for example after a typo), it still

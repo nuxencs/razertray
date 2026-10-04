@@ -1,4 +1,4 @@
-use crate::config::{self, AppConfig, Loaded};
+use crate::config::{self, AppConfig, Loaded, PidCache};
 use crate::hid::client;
 use anyhow::{Context, Result};
 use hidapi::HidApi;
@@ -11,55 +11,76 @@ use tracing_subscriber::fmt::writer::MakeWriter;
 const LOG_FILES_TO_KEEP: usize = 3;
 const MAX_LOG_FILE_BYTES: u64 = 1_048_576;
 
+/// Prints one battery reading per connected Razer device, then returns.
+///
+/// # Errors
+///
+/// Returns an error when hidapi cannot start or the pid cache cannot be saved.
+/// Devices that fail to answer are listed on stderr and are not an error.
 pub fn run_once() -> Result<()> {
     let loaded = load_config();
     if let Some(problem) = &loaded.problem {
         eprintln!("warning: {problem:#}");
     }
-    let cache = config::load_pid_cache();
-    if let Some(problem) = &cache.problem {
-        tracing::warn!("{problem:#}");
-    }
-    let mut cache = cache.value;
+    let mut cache = load_pid_cache();
     let api = HidApi::new().context("failed to initialize hidapi")?;
 
     let result = client::poll_devices(&api, &mut cache);
-    config::save_pid_cache(&cache)?;
+    cache.save()?;
 
     if result.devices.is_empty() {
         println!("No supported Razer devices found.");
-    } else {
-        for dev in &result.devices {
-            let charging = if dev.is_charging {
-                "charging"
-            } else {
-                "not-charging"
-            };
-            println!(
-                "{} pid=0x{:04X} battery={}% {}",
-                dev.display_name, dev.pid, dev.battery_percent, charging
-            );
-        }
+    }
+    for dev in &result.devices {
+        let charging = if dev.charging {
+            "charging"
+        } else {
+            "not-charging"
+        };
+        println!(
+            "{} pid=0x{:04X} battery={} {charging}",
+            dev.name, dev.pid, dev.percent
+        );
     }
 
-    if !result.errors.is_empty() {
+    if !result.failures.is_empty() {
         eprintln!("Errors:");
-        for err in result.errors {
-            eprintln!("- {err}");
+        for failure in &result.failures {
+            eprintln!("- {failure}");
         }
     }
 
     Ok(())
 }
 
+/// Runs the tray app until the user picks "Exit". Windows only.
+///
+/// # Errors
+///
+/// Returns an error when the tray icon or menu cannot be created, and always
+/// on other platforms.
 #[cfg(target_os = "windows")]
 pub fn run_tray() -> Result<()> {
-    crate::tray::run_tray_app(load_config().value)
+    crate::tray::run(load_config().value)
 }
 
+/// Runs the tray app until the user picks "Exit". Windows only.
+///
+/// # Errors
+///
+/// Always returns an error on this platform.
 #[cfg(not(target_os = "windows"))]
 pub fn run_tray() -> Result<()> {
     anyhow::bail!("tray mode is only supported on Windows")
+}
+
+/// Loads the pid cache. A problem with the file is logged; the cache is rebuilt by probing.
+pub(crate) fn load_pid_cache() -> PidCache {
+    let loaded = PidCache::load();
+    if let Some(problem) = &loaded.problem {
+        tracing::warn!("{problem:#}");
+    }
+    loaded.value
 }
 
 /// Loads the config and starts logging, then logs any config problem.
@@ -67,7 +88,7 @@ pub fn run_tray() -> Result<()> {
 /// Never fails: a broken config must not stop the tray app, which has no
 /// console to report the error on.
 fn load_config() -> Loaded<AppConfig> {
-    let loaded = config::load_config();
+    let loaded = AppConfig::load();
     init_logging(&loaded.value);
     if let Some(problem) = &loaded.problem {
         tracing::warn!("{problem:#}");

@@ -1,34 +1,55 @@
+//! Settings in `config.toml` and the transaction-ID cache in `pid_cache.toml`.
+
 use crate::APP_ID;
+use crate::model::DeviceKey;
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::time::Duration;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Shortest poll interval. Each poll sends HID requests to every Razer
+/// device, so a smaller value only adds USB traffic and wakes the mouse.
+const MIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// User settings. The field names are the `config.toml` keys documented in the README.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub(crate) struct AppConfig {
     pub(crate) poll_interval_seconds: u64,
     pub(crate) low_battery_threshold: u8,
     pub(crate) low_battery_cooldown_minutes: u64,
-    pub(crate) selected_device_id: String,
+    /// Stored as `""` when no device is selected, as in v0.2.0.
+    #[serde(rename = "selected_device_id", with = "empty_is_none")]
+    pub(crate) selected_device: Option<DeviceKey>,
     pub(crate) autostart: bool,
+    /// A `tracing` filter directive, such as `info` or `razertray=debug`.
     pub(crate) log_level: String,
-    /// Tray display style: "icon" (battery glyph) or "text" (percentage number).
-    #[serde(default = "default_view_mode")]
-    pub(crate) view_mode: String,
-}
-
-fn default_view_mode() -> String {
-    "icon".to_string()
+    #[serde(default)]
+    pub(crate) view_mode: ViewMode,
 }
 
 impl AppConfig {
-    /// True when the tray should render the percentage as text instead of the
-    /// battery icon.
-    pub(crate) fn text_mode(&self) -> bool {
-        self.view_mode.eq_ignore_ascii_case("text")
+    /// Loads `config.toml`, creating it with defaults when it does not exist.
+    pub(crate) fn load() -> Loaded<Self> {
+        load_or_create(&config_path())
+    }
+
+    pub(crate) fn save(&self) -> Result<()> {
+        save(&config_path(), self)
+    }
+
+    /// The poll interval, raised to at least [`MIN_POLL_INTERVAL`].
+    pub(crate) fn poll_interval(&self) -> Duration {
+        Duration::from_secs(self.poll_interval_seconds).max(MIN_POLL_INTERVAL)
+    }
+
+    pub(crate) fn low_battery_cooldown(&self) -> Duration {
+        Duration::from_secs(self.low_battery_cooldown_minutes.saturating_mul(60))
     }
 }
 
@@ -38,32 +59,133 @@ impl Default for AppConfig {
             poll_interval_seconds: 60,
             low_battery_threshold: 15,
             low_battery_cooldown_minutes: 120,
-            selected_device_id: String::new(),
+            selected_device: None,
             autostart: false,
-            log_level: "info".to_string(),
-            view_mode: default_view_mode(),
+            log_level: "info".to_owned(),
+            view_mode: ViewMode::default(),
         }
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// How the tray icon shows the battery level.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub(crate) enum ViewMode {
+    /// A battery glyph that fills up and changes color.
+    #[default]
+    Icon,
+    /// The percentage as digits.
+    Text,
+}
+
+impl ViewMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Icon => "icon",
+            Self::Text => "text",
+        }
+    }
+}
+
+impl fmt::Display for ViewMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Case-insensitive, because v0.2.0 accepted any case.
+impl FromStr for ViewMode {
+    type Err = ParseViewModeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("icon") {
+            Ok(Self::Icon)
+        } else if s.eq_ignore_ascii_case("text") {
+            Ok(Self::Text)
+        } else {
+            Err(ParseViewModeError(s.to_owned()))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ViewMode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for ViewMode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// A `view_mode` value other than `icon` or `text`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ParseViewModeError(String);
+
+impl fmt::Display for ParseViewModeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid view mode {:?}, expected \"icon\" or \"text\"",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ParseViewModeError {}
+
+/// Serde adapter: `None` is stored as an empty string.
+mod empty_is_none {
+    use crate::model::DeviceKey;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        key: &Option<DeviceKey>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(key.as_ref().map_or("", DeviceKey::as_str))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<DeviceKey>, D::Error> {
+        let key = Option::<DeviceKey>::deserialize(deserializer)?;
+        Ok(key.filter(|key| !key.as_str().is_empty()))
+    }
+}
+
+/// Transaction IDs found by probing devices that are not in the device map.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub(crate) struct PidCache {
-    pub(crate) transaction_ids: BTreeMap<String, u8>,
+    /// Keyed by product ID as 4 hex digits; TOML keys must be strings.
+    transaction_ids: BTreeMap<String, u8>,
 }
 
 impl PidCache {
-    pub(crate) fn get(&self, pid: u16) -> Option<u8> {
-        let key = format!("{:04X}", pid);
-        self.transaction_ids.get(&key).copied()
+    /// Loads `pid_cache.toml`, creating it when it does not exist.
+    pub(crate) fn load() -> Loaded<Self> {
+        load_or_create(&pid_cache_path())
     }
 
-    pub(crate) fn set(&mut self, pid: u16, transaction_id: u8) {
-        let key = format!("{:04X}", pid);
-        self.transaction_ids.insert(key, transaction_id);
+    pub(crate) fn save(&self) -> Result<()> {
+        save(&pid_cache_path(), self)
+    }
+
+    pub(crate) fn get(&self, pid: u16) -> Option<u8> {
+        self.transaction_ids.get(&format!("{pid:04X}")).copied()
+    }
+
+    /// Stores the ID for `pid` and returns the previous one, as `HashMap::insert` does.
+    pub(crate) fn insert(&mut self, pid: u16, transaction_id: u8) -> Option<u8> {
+        self.transaction_ids
+            .insert(format!("{pid:04X}"), transaction_id)
     }
 }
 
-pub(crate) fn app_data_dir() -> PathBuf {
+fn data_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         if let Some(appdata) = std::env::var_os("APPDATA") {
@@ -79,16 +201,16 @@ pub(crate) fn app_data_dir() -> PathBuf {
     PathBuf::from(".").join(APP_ID)
 }
 
-pub(crate) fn config_path() -> PathBuf {
-    app_data_dir().join("config.toml")
+fn config_path() -> PathBuf {
+    data_dir().join("config.toml")
 }
 
-pub(crate) fn pid_cache_path() -> PathBuf {
-    app_data_dir().join("pid_cache.toml")
+fn pid_cache_path() -> PathBuf {
+    data_dir().join("pid_cache.toml")
 }
 
 pub(crate) fn log_path() -> PathBuf {
-    app_data_dir().join(format!("{APP_ID}.log"))
+    data_dir().join(format!("{APP_ID}.log"))
 }
 
 fn write_atomic(path: &Path, raw: &[u8]) -> Result<()> {
@@ -102,14 +224,7 @@ fn write_atomic(path: &Path, raw: &[u8]) -> Result<()> {
         .to_string_lossy();
 
     let tmp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    {
-        let mut tmp = fs::File::create(&tmp_path)
-            .with_context(|| format!("failed creating {}", file_label(&tmp_path)))?;
-        tmp.write_all(raw)
-            .with_context(|| format!("failed writing {}", file_label(&tmp_path)))?;
-        tmp.sync_all()
-            .with_context(|| format!("failed syncing {}", file_label(&tmp_path)))?;
-    }
+    write_synced(&tmp_path, raw)?;
 
     #[cfg(target_os = "windows")]
     if path.exists() {
@@ -124,8 +239,17 @@ fn write_atomic(path: &Path, raw: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn write_synced(path: &Path, raw: &[u8]) -> Result<()> {
+    let mut file =
+        fs::File::create(path).with_context(|| format!("failed creating {}", file_label(path)))?;
+    file.write_all(raw)
+        .with_context(|| format!("failed writing {}", file_label(path)))?;
+    file.sync_all()
+        .with_context(|| format!("failed syncing {}", file_label(path)))
+}
+
 /// File name only, so errors and logs do not leak the user's home directory.
-fn file_label(path: &Path) -> std::path::Display<'_> {
+pub(crate) fn file_label(path: &Path) -> std::path::Display<'_> {
     Path::new(path.file_name().unwrap_or(path.as_os_str())).display()
 }
 
@@ -200,52 +324,12 @@ fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_atomic(path, raw.as_bytes())
 }
 
-pub(crate) fn load_config() -> Loaded<AppConfig> {
-    load_or_create(&config_path())
-}
-
-pub(crate) fn save_config(cfg: &AppConfig) -> Result<()> {
-    save(&config_path(), cfg)
-}
-
-pub(crate) fn load_pid_cache() -> Loaded<PidCache> {
-    load_or_create(&pid_cache_path())
-}
-
-pub(crate) fn save_pid_cache(cache: &PidCache) -> Result<()> {
-    save(&pid_cache_path(), cache)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, PidCache, load_or_create};
+    use super::{AppConfig, PidCache, ViewMode, load_or_create};
+    use crate::model::DeviceKey;
     use std::fs;
-
-    #[test]
-    fn pid_cache_get_set_roundtrip() {
-        let mut cache = PidCache::default();
-        assert_eq!(cache.get(0x1532), None);
-        cache.set(0x1532, 0x3F);
-        assert_eq!(cache.get(0x1532), Some(0x3F));
-    }
-
-    #[test]
-    fn config_toml_roundtrip() {
-        let cfg = AppConfig::default();
-        let raw = toml::to_string_pretty(&cfg).expect("serialize default config");
-        let parsed: AppConfig = toml::from_str(&raw).expect("parse config");
-
-        assert_eq!(parsed.poll_interval_seconds, cfg.poll_interval_seconds);
-        assert_eq!(parsed.low_battery_threshold, cfg.low_battery_threshold);
-        assert_eq!(
-            parsed.low_battery_cooldown_minutes,
-            cfg.low_battery_cooldown_minutes
-        );
-        assert_eq!(parsed.selected_device_id, cfg.selected_device_id);
-        assert_eq!(parsed.autostart, cfg.autostart);
-        assert_eq!(parsed.log_level, cfg.log_level);
-        assert_eq!(parsed.view_mode, cfg.view_mode);
-    }
+    use std::time::Duration;
 
     /// Settings block from the v0.2.0 README; existing user files look like this.
     const V0_2_0_CONFIG: &str = r#"
@@ -257,14 +341,70 @@ autostart = false                 # start with Windows (toggle from the tray men
 log_level = "info"                # detail level for the log file
 "#;
 
-    #[test]
-    fn v0_2_0_config_still_parses() {
-        let parsed: AppConfig = toml::from_str(V0_2_0_CONFIG).expect("parse v0.2.0 config");
-        assert!(!parsed.text_mode());
+    fn parse(raw: &str) -> AppConfig {
+        toml::from_str(raw).expect("parse config")
+    }
 
-        let text_mode: AppConfig =
-            toml::from_str(&format!("{V0_2_0_CONFIG}view_mode = \"Text\"\n")).expect("parse");
-        assert!(text_mode.text_mode());
+    #[test]
+    fn v0_2_0_config_parses_to_defaults() {
+        assert_eq!(parse(V0_2_0_CONFIG), AppConfig::default());
+    }
+
+    #[test]
+    fn view_mode_is_case_insensitive_like_v0_2_0() {
+        let cfg = parse(&format!("{V0_2_0_CONFIG}view_mode = \"Text\"\n"));
+        assert_eq!(cfg.view_mode, ViewMode::Text);
+
+        let invalid = toml::from_str::<AppConfig>(&format!("{V0_2_0_CONFIG}view_mode = \"big\"\n"))
+            .expect_err("unknown view mode");
+        assert!(
+            invalid.to_string().contains("invalid view mode"),
+            "{invalid}"
+        );
+    }
+
+    #[test]
+    fn selected_device_roundtrips_and_empty_means_none() {
+        let mut cfg = AppConfig::default();
+        let raw = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(raw.contains("selected_device_id = \"\""), "{raw}");
+        assert_eq!(parse(&raw), cfg);
+
+        cfg.selected_device = Some(DeviceKey::new(0x00B6, Some("XYZ")));
+        cfg.view_mode = ViewMode::Text;
+        let raw = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(raw.contains("selected_device_id = \"00B6:XYZ\""), "{raw}");
+        assert_eq!(parse(&raw), cfg);
+    }
+
+    #[test]
+    fn poll_interval_has_a_floor() {
+        let interval = |poll_interval_seconds| {
+            AppConfig {
+                poll_interval_seconds,
+                ..AppConfig::default()
+            }
+            .poll_interval()
+        };
+        assert_eq!(interval(1), Duration::from_secs(5));
+        assert_eq!(interval(90), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn pid_cache_insert_returns_previous_id() {
+        let mut cache = PidCache::default();
+        assert_eq!(cache.insert(0x00B6, 0x1F), None);
+        assert_eq!(cache.insert(0x00B6, 0x3F), Some(0x1F));
+        assert_eq!(cache.get(0x00B6), Some(0x3F));
+        assert_eq!(cache.get(0x00B7), None);
+    }
+
+    #[test]
+    fn pid_cache_file_format_is_stable() {
+        let mut cache = PidCache::default();
+        cache.insert(0x00B6, 0x1F);
+        let raw = toml::to_string_pretty(&cache).expect("serialize");
+        assert_eq!(raw, "[transaction_ids]\n00B6 = 31\n");
     }
 
     #[test]
@@ -298,7 +438,7 @@ log_level = "info"                # detail level for the log file
             !problem.contains(&*dir.path().to_string_lossy()),
             "{problem}"
         );
-        assert_eq!(loaded.value.poll_interval_seconds, 60);
+        assert_eq!(loaded.value, AppConfig::default());
         // The user's file survives, and later saves go to a fresh default file.
         assert_eq!(
             fs::read_to_string(dir.path().join("config.toml.invalid")).expect("backup"),
