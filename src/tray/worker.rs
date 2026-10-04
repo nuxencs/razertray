@@ -68,6 +68,7 @@ fn poll_loop(
             }
         }
 
+        let cache_before = cache.clone();
         let result = match api.as_mut() {
             Some(api) => {
                 if let Err(err) = api.refresh_devices() {
@@ -78,7 +79,10 @@ fn poll_loop(
             None => PollResult::default(),
         };
 
-        if let Err(err) = cache.save() {
+        // The cache only changes when a new device was probed.
+        if cache != cache_before
+            && let Err(err) = cache.save()
+        {
             tracing::warn!("failed saving pid cache: {err:#}");
         }
 

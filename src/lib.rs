@@ -10,6 +10,7 @@ mod app;
 mod config;
 mod device_map;
 mod hid;
+mod logging;
 mod model;
 #[cfg_attr(
     not(windows),
