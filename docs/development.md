@@ -46,7 +46,7 @@ rustfmt src/device_map.rs
 The `update-device-map` workflow does this every week and opens a pull request
 when the list changes.
 
-## README image
+## Icon image in the docs
 
 `docs/assets/tray-icons.svg` is drawn from the real icon pixels. A test fails
 when the icon code changes and the image does not. To draw the image again:

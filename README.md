@@ -2,10 +2,6 @@
 
 <p align="center">Your wireless Razer mouse's battery level in the Windows tray, without Razer Synapse.</p>
 
-<div align="center">
-  <img src="docs/assets/tray-icons.svg" alt="The tray icons razertray draws: a battery that fills and changes color with the charge level, and an optional view that shows the percentage as colored digits" width="100%">
-</div>
-
 ## Documentation
 
 - [Installation](docs/installation.md): download, first start, start at login,

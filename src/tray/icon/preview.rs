@@ -1,4 +1,4 @@
-//! Keeps `docs/assets/tray-icons.svg`, the README image, in sync with the icons.
+//! Keeps `docs/assets/tray-icons.svg`, the icon image in the docs, in sync with the icons.
 //!
 //! The image is drawn from the real icon pixels. After a change to the icon
 //! drawing, run `UPDATE_ICON_PREVIEW=1 cargo test icon_preview` to redraw it.
