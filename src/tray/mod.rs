@@ -1,10 +1,7 @@
 use crate::APP_ID;
-use crate::autostart;
 use crate::config::{self, AppConfig, PidCache};
 use crate::hid::client;
-use crate::icon;
 use crate::model::{BatteryState, PollResult};
-use crate::notify::Notifier;
 use anyhow::{Context, Result};
 use hidapi::HidApi;
 use std::sync::mpsc;
@@ -14,6 +11,12 @@ use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+mod autostart;
+mod icon;
+mod notify;
+
+use notify::Notifier;
 
 #[derive(Debug, Clone)]
 enum UserEvent {
