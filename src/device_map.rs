@@ -466,6 +466,20 @@ pub const KNOWN_DEVICE_SUPPORT: &[DeviceSupport] = &[
         symbol: "USB_DEVICE_ID_RAZER_BASILISK_V3_PRO_35K_PHANTOM_GREEN_EDITION_WIRELESS",
         name: "Razer Basilisk V3 Pro 35k Phantom Green Edition Wireless",
     },
+    DeviceSupport {
+        pid: 0x00DA,
+        transaction_id: 0x1F,
+        supports_charging_status: true,
+        symbol: "USB_DEVICE_ID_RAZER_COBRA_HYPERSPEED_WIRED",
+        name: "Razer Cobra Hyperspeed Wired",
+    },
+    DeviceSupport {
+        pid: 0x00DB,
+        transaction_id: 0x1F,
+        supports_charging_status: true,
+        symbol: "USB_DEVICE_ID_RAZER_COBRA_HYPERSPEED_WIRELESS",
+        name: "Razer Cobra Hyperspeed Wireless",
+    },
 ];
 
 pub fn known_device_support(pid: u16) -> Option<&'static DeviceSupport> {
