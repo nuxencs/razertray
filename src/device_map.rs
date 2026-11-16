@@ -466,6 +466,55 @@ pub const KNOWN_DEVICE_SUPPORT: &[DeviceSupport] = &[
         symbol: "USB_DEVICE_ID_RAZER_BASILISK_V3_PRO_35K_PHANTOM_GREEN_EDITION_WIRELESS",
         name: "Razer Basilisk V3 Pro 35k Phantom Green Edition Wireless",
     },
+    DeviceSupport {
+        pid: 0x00DA,
+        transaction_id: 0x1F,
+        supports_charging_status: true,
+        symbol: "USB_DEVICE_ID_RAZER_COBRA_HYPERSPEED_WIRED",
+        name: "Razer Cobra Hyperspeed Wired",
+    },
+    DeviceSupport {
+        pid: 0x00DB,
+        transaction_id: 0x1F,
+        supports_charging_status: true,
+        symbol: "USB_DEVICE_ID_RAZER_COBRA_HYPERSPEED_WIRELESS",
+        name: "Razer Cobra Hyperspeed Wireless",
+    },
+    DeviceSupport {
+        pid: 0x00DE,
+        transaction_id: 0x1F,
+        supports_charging_status: true,
+        symbol: "USB_DEVICE_ID_RAZER_VIPER_V3_PRO_SE_WIRED",
+        name: "Razer Viper V3 Pro Se Wired",
+    },
+    DeviceSupport {
+        pid: 0x00DF,
+        transaction_id: 0x1F,
+        supports_charging_status: true,
+        symbol: "USB_DEVICE_ID_RAZER_VIPER_V3_PRO_SE_WIRELESS",
+        name: "Razer Viper V3 Pro Se Wireless",
+    },
+    DeviceSupport {
+        pid: 0x00E0,
+        transaction_id: 0x1F,
+        supports_charging_status: false,
+        symbol: "USB_DEVICE_ID_RAZER_OROCHI_V2_2026_RECEIVER",
+        name: "Razer Orochi V2 2026 Receiver",
+    },
+    DeviceSupport {
+        pid: 0x00E5,
+        transaction_id: 0x1F,
+        supports_charging_status: true,
+        symbol: "USB_DEVICE_ID_RAZER_VIPER_V4_PRO_WIRED",
+        name: "Razer Viper V4 Pro Wired",
+    },
+    DeviceSupport {
+        pid: 0x00E6,
+        transaction_id: 0x1F,
+        supports_charging_status: true,
+        symbol: "USB_DEVICE_ID_RAZER_VIPER_V4_PRO_WIRELESS",
+        name: "Razer Viper V4 Pro Wireless",
+    },
 ];
 
 pub fn known_device_support(pid: u16) -> Option<&'static DeviceSupport> {
